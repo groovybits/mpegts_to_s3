@@ -213,9 +213,10 @@ impl ManualSegmenter {
         let hour = now.format("%H").to_string();
         let timestamp = now.format("%Y%m%d-%H%M%S").to_string();
         // same naming style as FFmpeg:
-        //  e.g. "hls/2025/01/14/23/segment_20250114-234519_0000.ts"
+        //  e.g. "ts/2025/01/14/23/segment_20250114-234519_0000.ts"
         let filename = format!("segment_{}__{:04}.ts", timestamp, index);
-        Path::new(&year)
+        Path::new(&self.output_dir)
+            .join(&year)
             .join(&month)
             .join(&day)
             .join(&hour)
