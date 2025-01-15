@@ -100,7 +100,7 @@ struct ManualSegmenter {
 
 impl ManualSegmenter {
     fn new(output_dir: &str) -> Self {
-        let playlist_path = Path::new(output_dir).join("index.m3u8");
+        let playlist_path = Path::new("").join("index.m3u8");
         Self {
             output_dir: output_dir.to_string(),
             current_ts_file: None,
