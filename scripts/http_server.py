@@ -62,6 +62,9 @@ class HLSHandler(SimpleHTTPRequestHandler):
                 self.send_response(206)  # Partial Content
                 self.send_header('Content-Type', 'video/mp2t')
                 self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'public, max-age=31536000')
+                self.send_header('Pragma', 'public')
+                self.send_header('Expires', '31536000')
                 self.send_header('Content-Length', str(chunk_size))
                 self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
                 self.end_headers()
@@ -86,7 +89,10 @@ class HLSHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
         self.send_header('Access-Control-Allow-Origin', '*')
-        # You could add Cache-Control headers here if you want
+        # Cache-Control headers here
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
         self.end_headers()
 
     def send_ts_headers(self, local_path=None):
@@ -94,6 +100,10 @@ class HLSHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'video/mp2t')
         self.send_header('Access-Control-Allow-Origin', '*')
+        # Cache-Control headers here, cache the files for a year
+        self.send_header('Cache-Control', 'public, max-age=31536000')
+        self.send_header('Pragma', 'public')
+        self.send_header('Expires', '31536000')
         if local_path:
             file_size = os.path.getsize(local_path)
             self.send_header('Content-Length', str(file_size))
