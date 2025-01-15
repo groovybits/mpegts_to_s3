@@ -211,7 +211,7 @@ impl MpegTsTableCache {
 
 /// Simple time-based segmenter for MPEG-TS packets.
 /// Rotates segments every `SEGMENT_DURATION_SECONDS`.
-const SEGMENT_DURATION_SECONDS: u64 = 2;
+const SEGMENT_DURATION_SECONDS: u64 = 10;
 
 struct ManualSegmenter {
     output_dir: String,
