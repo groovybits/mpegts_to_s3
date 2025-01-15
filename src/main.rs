@@ -199,7 +199,7 @@ impl ManualSegmenter {
             .open(&self.playlist_path)?;
         writeln!(f, "#EXTINF:{:.6},", duration)?;
         // On the next line, put the relative path
-        writeln!(f, "{}", segment_path.to_string_lossy())?;
+        writeln!(f, "{}/{}", self.output_dir, segment_path.to_string_lossy())?;
         Ok(())
     }
 
