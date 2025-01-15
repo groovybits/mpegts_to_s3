@@ -245,8 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg("-hls_segment_filename").arg(&hls_segment_filename)
         .arg(&m3u8_output)
         .stdin(Stdio::piped())
-        //.stdout(Stdio::null())
-        //.stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
 
     // *** Take ownership of stdin so we can call ffmpeg_child.try_wait() freely
