@@ -95,7 +95,7 @@ struct MpegTsTableCache {
 
 impl MpegTsTableCache {
     /// Store the entire 188-byte PAT packet, parse out the first PMT PID.
-    /// Real production code should handle multiple TS packets for the PAT section,
+    /// TODO: FIXME should handle multiple TS packets for the PAT section,
     /// CRC checks, multi-program scenarios, etc.
     fn update_pat(&mut self, pkt: &[u8]) {
         // Must be exactly one TS packet of 188 bytes
