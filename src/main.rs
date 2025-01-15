@@ -33,6 +33,53 @@ use tokio::time::sleep;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
+use get_if_addrs::get_if_addrs;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+/// Attempt to join `multicast_addr` + `port` on the given `interface_name`.
+/// Returns the socket keeping it in scope (which keeps IGMP membership active).
+pub fn join_multicast_on_iface(
+    multicast_addr: &str,
+    port: u16,
+    interface_name: &str,
+) -> Result<Socket, Box<dyn std::error::Error>> {
+    // 1) Parse the multicast group
+    let group_v4: Ipv4Addr = multicast_addr.parse()?;
+
+    // 2) Find the local IPv4 for the interface_name
+    let local_iface_ip = find_ipv4_for_interface(interface_name)?;
+
+    // 3) Create a UDP socket and bind to 0.0.0.0:port
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+
+    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    sock.bind(&bind_addr.into())?;
+
+    // 4) Join the multicast group (group_v4) on that local interface IP
+    sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
+
+    println!(
+        "Joined multicast group {} on interface {}, local IP: {}, port {}",
+        multicast_addr, interface_name, local_iface_ip, port
+    );
+    Ok(sock)
+}
+
+/// Finds the first IPv4 address of `interface_name`.
+fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+    let ifaces = get_if_addrs()?;
+    for iface in ifaces {
+        if iface.name == interface_name {
+            if let IpAddr::V4(ipv4) = iface.ip() {
+                return Ok(ipv4);
+            }
+        }
+    }
+    Err(format!("No IPv4 found for interface '{}'", interface_name).into())
+}
+
 struct FileTracker {
     uploaded_files: HashSet<String>,
     max_age: Duration,
@@ -570,6 +617,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
     });
+
+    // Join multicast group on the specified interface
+    if let Ok(_sock) = join_multicast_on_iface(filter_ip, filter_port, interface) {
+        // Keep the socket in scope.
+    } else {
+        eprintln!("Failed to join multicast group or find interface IP!");
+    }
 
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
