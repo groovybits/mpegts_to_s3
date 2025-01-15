@@ -30,12 +30,20 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::sleep;
-
-// ------------- HELPER STRUCTS & FUNCS -------------
-
 use get_if_addrs::get_if_addrs;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+// ------------- HELPER STRUCTS & FUNCS -------------
+
+/// Simple time-based segmenter for MPEG-TS packets.
+/// Rotates segments every `SEGMENT_DURATION_SECONDS`.
+fn get_segment_duration_seconds() -> u64 {
+    std::env::var("SEGMENT_DURATION_SECONDS")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse()
+        .unwrap_or(10)
+}
 
 /// Attempt to join `multicast_addr` + `port` on the given `interface_name`.
 /// Returns the socket keeping it in scope (which keeps IGMP membership active).
@@ -256,10 +264,6 @@ impl MpegTsTableCache {
 
 // ------------- MANUAL SEGMENTER -------------
 
-/// Simple time-based segmenter for MPEG-TS packets.
-/// Rotates segments every `SEGMENT_DURATION_SECONDS`.
-const SEGMENT_DURATION_SECONDS: u64 = 10;
-
 struct ManualSegmenter {
     output_dir: String,
     current_ts_file: Option<BufWriter<fs::File>>,
@@ -307,7 +311,8 @@ impl ManualSegmenter {
         }
 
         let elapsed = self.current_segment_start.elapsed().as_secs_f64();
-        if elapsed >= SEGMENT_DURATION_SECONDS as f64 {
+        let segment_duration = get_segment_duration_seconds() as f64;
+        if elapsed >= segment_duration as f64 {
             self.close_current_segment_file()?;
             self.open_new_segment_file()?;
         }
@@ -321,7 +326,7 @@ impl ManualSegmenter {
     /// Close the current .ts file, finalize it, and update the .m3u8
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         if self.current_ts_file.is_some() {
-            let duration = SEGMENT_DURATION_SECONDS as f64;
+            let duration = get_segment_duration_seconds() as f64;
             let segment_path = self.current_segment_path(self.segment_index + 1);
             self.current_ts_file.take(); // drop the writer
 
@@ -369,9 +374,11 @@ impl ManualSegmenter {
             .truncate(true)
             .open(&self.playlist_path)?;
 
+        let segment_duration = get_segment_duration_seconds();
+
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", SEGMENT_DURATION_SECONDS + 1)?;
+        writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
         writeln!(f, "#EXT-X-MEDIA-SEQUENCE:0")?;
         Ok(())
     }
