@@ -16,8 +16,8 @@ scripts/minio_server.py & # background, uses ./data/ for storage
 
 # Create hls subdir for index.m3u8 serving
 mkdir hls && cd hls 
-# Run Python HTTP Server port 3001
-scripts/http_server.py &  # background
+# Run Python HTTP Server port 3001 from ./hls/ directory
+../scripts/http_server.py &  # background, serves the current directory
 
 # Run Rust mpegts_to_s3 collecting in ts/ directory
 # as year/month/day/hour/segment{data}.ts 2 second segments
