@@ -8,16 +8,17 @@ This Rust application captures MPEG-TS UDP multicast streams, segments them, and
 git clone https://github.com/groovybits/mpegts_to_s3.git
 cd mpegts_to_s3
 
+# Build Rust mpegts_to_s3 program
+cargo build --release
+
 # Start MinIO Server on 127.0.0.1:9000 from a container w/podman
-scripts/minio_server.py & # background
+scripts/minio_server.py & # background, uses ./data/ for storage
 
 # Create hls subdir for index.m3u8 serving
 mkdir hls && cd hls 
 # Run Python HTTP Server port 3001
 scripts/http_server.py &  # background
 
-# Build Rust mpegts_to_s3 program
-cargo build --release
 # Run Rust mpegts_to_s3 collecting in ts/ directory
 # as year/month/day/hour/segment{data}.ts 2 second segments
 ../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
