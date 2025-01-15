@@ -21,7 +21,7 @@ cargo build --release
 # Run Rust mpegts_to_s3 collecting in ts/ directory
 # as year/month/day/hour/segment{data}.ts 2 second segments
 ../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
-    -o ts -n net1 --manual_segment --inject_pat_pmt
+    -o ts -n net1 --manual_segment
 
 # From another computer playback
 mpv -i http://192.168.130.93:3001/index.m3u8 
