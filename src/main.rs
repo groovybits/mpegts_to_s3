@@ -215,8 +215,7 @@ impl ManualSegmenter {
         // same naming style as FFmpeg:
         //  e.g. "ts/2025/01/14/23/segment_20250114-234519_0000.ts"
         let filename = format!("segment_{}__{:04}.ts", timestamp, index);
-        Path::new(&self.output_dir)
-            .join(&year)
+        Path::new(&year)
             .join(&month)
             .join(&day)
             .join(&hour)
