@@ -275,7 +275,7 @@ impl ManualSegmenter {
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         if self.current_ts_file.is_some() {
             let duration = SEGMENT_DURATION_SECONDS as f64;
-            let segment_path = self.current_segment_path(self.segment_index);
+            let segment_path = self.current_segment_path(self.segment_index + 1);
             self.current_ts_file.take(); // drop the writer
 
             self.append_m3u8_entry(&segment_path, duration)?;
