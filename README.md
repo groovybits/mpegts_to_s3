@@ -20,8 +20,9 @@ mkdir hls && cd hls
 ../scripts/http_server.py &  # background, serves the current directory
 
 # Run Rust mpegts_to_s3 collecting in ts/ directory
-# as year/month/day/hour/segment{data}.ts 2 second segments
-../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
+# as ts/year/month/day/hour/segment_YYYYMMDD-HHMMSS__0000.ts 10 second segments
+SEGMENT_DURATION_SECONDS=10 \
+  ../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
     -o ts -n net1 --manual_segment
 
 # From another computer playback
