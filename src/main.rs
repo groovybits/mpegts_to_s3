@@ -1,3 +1,13 @@
+/* 
+ * mpegts_to_s3
+ *
+ * This program captures MPEG-TS packets from a UDP multicast stream, writes them to a pipe
+ * that FFmpeg reads from, and then uploads the resulting HLS segments to an S3 bucket.
+ *   
+ * Chris Kennedy 2025 Jan 15 PoC for MpegTS to S3 with Ramdisk rewrite in Rust of
+ *      the concept from: https://github.com/danielsobrado/ffmpeg-s3/tree/main
+ *
+ */
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::config::Credentials;

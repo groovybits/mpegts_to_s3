@@ -3,12 +3,25 @@
 This Rust application captures MPEG-TS UDP multicast streams, segments them, and uploads the segments to MinIO storage.
 
 ```bash
-cargo build
-mkdir hls
-cd hls
-
 # Capture udp://227.1.1.102:4102 from network interface net1 with segments in ./ts/ directory and upload to MinIO/S3
-../target/debug/mpegts_to_s3 -i 227.1.1.102 -p 4102 -o ts -n net1
+git clone https://github.com/groovybits/mpegts_to_s3.git
+cd mpegts_to_s3
+
+# Start MinIO Server on 127.0.0.1:9000 from a container w/podman
+scripts/minio_server.py & # background
+
+# Create hls subdir for index.m3u8 serving
+mkdir hls && cd hls 
+# Run Python HTTP Server port 3001
+scripts/http_server.py &  # background
+
+# Build Rust mpegts_to_s3 program
+cargo build --release
+# Run Rust mpegts_to_s3 collecting in ts/ directory as year/month/day/hour/segment{data}.ts 2 second segments
+../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 -o ts -n net1
+
+# From another computer playback
+mpv -i http://192.168.130.93:3001/index.m3u8 
 ```
 
 ## Prerequisites
@@ -20,30 +33,23 @@ cd hls
 
 ## Configuration
 
-1. Start your MinIO server locally:
-   ```bash
-   scripts/minio_server.sh
-   ```
+```bash
+PCAP capture -> FFmpeg HLS -> Directory Watch -> S3 Upload
 
-2. Update the application:
-   - Change your MinIO endpoint (`http://127.0.0.1:9000`) via the command line args.
-   - Adjust the bucket name and other configurations as needed via command line args.
+Usage: mpegts_to_s3 [OPTIONS]
 
-3. Optional setup RAM disk `/mnt/ramdisk` using [scripts/ramdisk_manager.py](scripts/ramdisk_manager.py):
-   ```bash
-   scripts/ramdisk_manager.py -h
-   ```
-
-## Build and Run
-
-1. Build the application:
-   ```bash
-   cargo build --release
-   ```
-
-2. Run the application with elevated privileges for pcap:
-   ```bash
-   sudo ./target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 -o ts -n net1
-   ```
+Options:
+  -e, --endpoint <endpoint>      S3-compatible endpoint [default: http://127.0.0.1:9000]
+  -r, --region <region>          S3 region [default: us-west-2]
+  -b, --bucket <bucket>          S3 bucket name [default: ltnhls]
+  -i, --udp_ip <udp_ip>          UDP multicast IP to filter [default: 227.1.1.102]
+  -p, --udp_port <udp_port>      UDP port to filter [default: 4102]
+  -n, --interface <interface>    Network interface for pcap [default: net1]
+  -t, --timeout <timeout>        Capture timeout in milliseconds [default: 1000]
+  -o, --output_dir <output_dir>  Local dir for FFmpeg HLS output (could be a RAM disk) [default: hls]
+      --remove_local             Remove local .ts/.m3u8 after uploading to S3?
+  -h, --help                     Print help
+  -V, --version                  Print version
+```
 
 - Monitor uploads in MinIO's web interface or your S3-compatible client.
