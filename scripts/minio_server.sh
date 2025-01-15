@@ -1,5 +1,7 @@
 #!/bin/sh
 
+# SSH Tunnel to Minio Server through 127.0.0.1:9001
+# See scripts/minio_tunnel.sh
 mkdir -p data
 
 podman stop s3minio 2>/dev/null
