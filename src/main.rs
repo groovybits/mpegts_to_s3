@@ -9,6 +9,7 @@
  *
  * Chris Kennedy 2025 Jan 15
  */
+
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -83,6 +84,129 @@ async fn ensure_bucket_exists(
     }
 }
 
+// --------------------- MpegTsTableCache ---------------------
+
+#[derive(Default)]
+struct MpegTsTableCache {
+    latest_pat: Option<[u8; 188]>,
+    latest_pmt: Option<[u8; 188]>,
+    pmt_pid: Option<u16>,
+}
+
+impl MpegTsTableCache {
+    /// Store the entire 188-byte PAT packet, parse out the first PMT PID.
+    /// Real production code should handle multiple TS packets for the PAT section,
+    /// CRC checks, multi-program scenarios, etc.
+    fn update_pat(&mut self, pkt: &[u8]) {
+        // Must be exactly one TS packet of 188 bytes
+        if pkt.len() != 188 {
+            return;
+        }
+
+        // Keep a copy of the raw packet
+        let mut arr = [0u8; 188];
+        arr.copy_from_slice(pkt);
+        self.latest_pat = Some(arr);
+
+        // --- 1) Parse TS header (first 4 bytes) ---
+        let transport_error_indicator = (pkt[1] & 0x80) != 0;
+        if transport_error_indicator {
+            // If error bit is set, ignore
+            return;
+        }
+        let adaptation_control = (pkt[3] >> 4) & 0x3;
+        // b11 means “adaptation + payload”, b01 means “payload only”
+
+        let mut payload_offset = 4; // after TS header
+
+        // --- 2) If there's an adaptation field, skip it ---
+        if adaptation_control == 0b10 || adaptation_control == 0b11 {
+            let adaptation_length = pkt[payload_offset] as usize;
+            payload_offset += 1; // skip length byte
+            if payload_offset + adaptation_length > 188 {
+                // corrupt
+                return;
+            }
+            payload_offset += adaptation_length;
+        }
+
+        // If there's no payload, we can't parse further
+        if payload_offset >= 188 {
+            return;
+        }
+
+        // --- 3) Pointer field (1 byte) ---
+        let pointer_field = pkt[payload_offset] as usize;
+        payload_offset += 1;
+        if payload_offset + pointer_field >= 188 {
+            // corrupt or incomplete
+            return;
+        }
+        payload_offset += pointer_field;
+
+        if payload_offset + 8 > 188 {
+            // at least 8 bytes needed for a minimal section header
+            return;
+        }
+
+        // --- 4) Now we should be at the start of the PAT section ---
+        let table_id = pkt[payload_offset];
+        if table_id != 0x00 {
+            // 0x00 = PAT
+            return;
+        }
+
+        let section_length =
+            u16::from_be_bytes([pkt[payload_offset + 1] & 0x0F, pkt[payload_offset + 2]]);
+
+        // safety check
+        if (section_length as usize) > 1021 {
+            return;
+        }
+
+        // Program loop
+        let _transport_stream_id =
+            u16::from_be_bytes([pkt[payload_offset + 3], pkt[payload_offset + 4]]);
+        let _version_number = (pkt[payload_offset + 5] & 0x3E) >> 1; // prefix with underscore to avoid warnings
+        let mut program_info_offset = payload_offset + 8;
+
+        let pat_section_end = payload_offset + 3 + (section_length as usize);
+        while program_info_offset + 4 <= pat_section_end.saturating_sub(4) {
+            let program_number =
+                u16::from_be_bytes([pkt[program_info_offset], pkt[program_info_offset + 1]]);
+            let pid_hi = pkt[program_info_offset + 2] & 0x1F;
+            let pid_lo = pkt[program_info_offset + 3];
+            let pmt_pid = ((pid_hi as u16) << 8) | (pid_lo as u16);
+
+            if program_number != 0 {
+                self.pmt_pid = Some(pmt_pid);
+                break;
+            }
+            program_info_offset += 4;
+        }
+    }
+
+    /// Store the entire 188-byte PMT packet in `latest_pmt`.
+    fn update_pmt(&mut self, pkt: &[u8]) {
+        if pkt.len() == 188 {
+            let mut arr = [0u8; 188];
+            arr.copy_from_slice(pkt);
+            self.latest_pmt = Some(arr);
+        }
+    }
+
+    /// Write PAT + PMT if we have them
+    fn write_tables<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        if let Some(ref pat) = self.latest_pat {
+            writer.write_all(pat)?;
+        }
+        if let Some(ref pmt) = self.latest_pmt {
+            writer.write_all(pmt)?;
+        }
+        Ok(())
+    }
+}
+
 // ------------- MANUAL SEGMENTER -------------
 
 /// Simple time-based segmenter for MPEG-TS packets.
@@ -96,6 +220,10 @@ struct ManualSegmenter {
     segment_index: u64,
     playlist_path: PathBuf,
     m3u8_initialized: bool,
+
+    // optional reference to table cache (only used if user wants to inject PAT/PMT)
+    pat_pmt_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
+    inject_pat_pmt: bool,
 }
 
 impl ManualSegmenter {
@@ -108,7 +236,21 @@ impl ManualSegmenter {
             segment_index: 0,
             playlist_path,
             m3u8_initialized: false,
+
+            pat_pmt_cache: None,
+            inject_pat_pmt: false,
         }
+    }
+
+    /// For convenience, set the optional table cache + boolean
+    fn with_pat_pmt(
+        mut self,
+        table_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
+        inject: bool,
+    ) -> Self {
+        self.pat_pmt_cache = table_cache;
+        self.inject_pat_pmt = inject;
+        self
     }
 
     /// Write TS data to the “current segment,” rotating if necessary.
@@ -117,15 +259,12 @@ impl ManualSegmenter {
             self.open_new_segment_file()?;
         }
 
-        // If we've been writing to the current segment for longer than SEGMENT_DURATION_SECONDS,
-        // rotate to a new file. (We do this purely by wall-clock time.)
         let elapsed = self.current_segment_start.elapsed().as_secs_f64();
         if elapsed >= SEGMENT_DURATION_SECONDS as f64 {
             self.close_current_segment_file()?;
             self.open_new_segment_file()?;
         }
 
-        // Append data
         if let Some(file) = self.current_ts_file.as_mut() {
             file.write_all(data)?;
         }
@@ -135,12 +274,10 @@ impl ManualSegmenter {
     /// Close the current .ts file, finalize it, and update the .m3u8
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         if self.current_ts_file.is_some() {
-            // We consider the entire time “SEGMENT_DURATION_SECONDS”
             let duration = SEGMENT_DURATION_SECONDS as f64;
             let segment_path = self.current_segment_path(self.segment_index);
             self.current_ts_file.take(); // drop the writer
 
-            // Update the playlist with an #EXTINF entry for the just-finished segment
             self.append_m3u8_entry(&segment_path, duration)?;
             self.segment_index += 1;
         }
@@ -153,15 +290,23 @@ impl ManualSegmenter {
         let segment_path = self.current_segment_path(self.segment_index);
         let full_path = Path::new(&self.output_dir).join(&segment_path);
 
-        // Ensure subdirectories exist
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let file = fs::File::create(&full_path)?;
-        self.current_ts_file = Some(BufWriter::new(file));
+        let mut writer = BufWriter::new(file);
 
-        // If m3u8 isn't inited, write boilerplate
+        // If the user wants to inject PAT/PMT, do so now
+        if self.inject_pat_pmt {
+            if let Some(cache) = &self.pat_pmt_cache {
+                let cache = cache.lock().unwrap();
+                cache.write_tables(&mut writer)?;
+            }
+        }
+
+        self.current_ts_file = Some(writer);
+
         if !self.m3u8_initialized {
             self.init_m3u8()?;
             self.m3u8_initialized = true;
@@ -177,11 +322,6 @@ impl ManualSegmenter {
             .truncate(true)
             .open(&self.playlist_path)?;
 
-        // Minimal playlist example:
-        // #EXTM3U
-        // #EXT-X-VERSION:3
-        // #EXT-X-TARGETDURATION:3
-        // #EXT-X-MEDIA-SEQUENCE:0
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
         writeln!(f, "#EXT-X-TARGETDURATION:{}", SEGMENT_DURATION_SECONDS + 1)?;
@@ -191,19 +331,16 @@ impl ManualSegmenter {
 
     /// Append an #EXTINF line + segment URI to the .m3u8
     fn append_m3u8_entry(&self, segment_path: &Path, duration: f64) -> std::io::Result<()> {
-        // Just open in append mode
         let mut f = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open(&self.playlist_path)?;
         writeln!(f, "#EXTINF:{:.6},", duration)?;
-        // On the next line, put the relative path
         writeln!(f, "{}/{}", self.output_dir, segment_path.to_string_lossy())?;
         Ok(())
     }
 
-    /// Compute the subpath for the Nth segment with date expansions (year/month/day/hour).
     fn current_segment_path(&self, index: u64) -> PathBuf {
         use chrono::Local;
         let now = Local::now();
@@ -212,8 +349,6 @@ impl ManualSegmenter {
         let day = now.format("%d").to_string();
         let hour = now.format("%H").to_string();
         let timestamp = now.format("%Y%m%d-%H%M%S").to_string();
-        // same naming style as FFmpeg:
-        //  e.g. "ts/2025/01/14/23/segment_20250114-234519_0000.ts"
         let filename = format!("segment_{}__{:04}.ts", timestamp, index);
         Path::new(&year)
             .join(&month)
@@ -224,7 +359,6 @@ impl ManualSegmenter {
 }
 
 impl Drop for ManualSegmenter {
-    /// Ensure we cleanly close the last segment if still open.
     fn drop(&mut self) {
         let _ = self.close_current_segment_file();
     }
@@ -233,9 +367,6 @@ impl Drop for ManualSegmenter {
 // ------------- MAIN -------------
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // --------------------------------------------------------------------
-    // 1) Parse CLI
-    // --------------------------------------------------------------------
     let matches = ClapCommand::new("mpegts_to_s3")
         .version("1.0")
         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
@@ -307,6 +438,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("Perform manual TS segmentation + .m3u8 generation (no FFmpeg).")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("inject_pat_pmt")
+                .long("inject_pat_pmt")
+                .help("If using manual segmentation, prepend the latest PAT & PMT to each segment.")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
@@ -319,35 +456,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
     let manual_segment = matches.get_flag("manual_segment");
+    let inject_pat_pmt = matches.get_flag("inject_pat_pmt");
 
     info!(
-        "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-          interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}",
-        endpoint,
-        region_name,
-        bucket,
-        filter_ip,
-        filter_port,
-        interface,
-        timeout,
-        output_dir,
-        remove_local,
-        manual_segment
-    );
+         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
+          interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, inject_pat_pmt={}",
+         endpoint,
+         region_name,
+         bucket,
+         filter_ip,
+         filter_port,
+         interface,
+         timeout,
+         output_dir,
+         remove_local,
+         manual_segment,
+         inject_pat_pmt
+     );
 
     fs::create_dir_all(output_dir)?;
 
-    // --------------------------------------------------------------------
-    // 2) Initialize S3 Client
-    // --------------------------------------------------------------------
     info!("Initializing S3 client with endpoint: {}", endpoint);
-    let creds = Credentials::new(
-        "minioadmin", // access key
-        "minioadmin", // secret key
-        None,         // session token
-        None,         // expiry
-        "dummy",      // provider name
-    );
+    let creds = Credentials::new("minioadmin", "minioadmin", None, None, "dummy");
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(region_name.clone()))
@@ -363,9 +493,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_bucket_exists(&s3_client, bucket).await?;
 
-    // --------------------------------------------------------------------
-    // 3) Directory Watcher
-    // --------------------------------------------------------------------
     info!("Starting directory watcher on: {}", output_dir);
     let (watch_tx, watch_rx) = channel();
     let watch_dir = output_dir.to_string();
@@ -375,9 +502,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --------------------------------------------------------------------
-    // 4) Possibly spawn FFmpeg (if NOT manual_segment)
-    // --------------------------------------------------------------------
     let (mut ffmpeg_child, mut ffmpeg_stdin_buf) = if !manual_segment {
         // FFmpeg-based HLS
         let hls_segment_filename =
@@ -427,13 +551,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         (Some(child), Some(buf))
     } else {
-        // Manual segmentation
         (None, None)
     };
 
-    // --------------------------------------------------------------------
-    // 5) Launch an async task to watch new/modified files -> upload S3
-    // --------------------------------------------------------------------
+    // Create MpegTsTableCache if we might use it
+    let table_cache = Arc::new(Mutex::new(MpegTsTableCache::default()));
+
     let s3_client_clone = s3_client.clone();
     let bucket_clone = bucket.clone();
     let output_dir_clone = output_dir.clone();
@@ -448,12 +571,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     });
 
-    // --------------------------------------------------------------------
-    // 6) Start capturing with pcap
-    // --------------------------------------------------------------------
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
-        .buffer_size(8 * 1024 * 1024) // 8MB buffer
+        .buffer_size(8 * 1024 * 1024)
         .snaplen(65535)
         .timeout(100)
         .timeout(timeout)
@@ -467,15 +587,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interface, filter_ip, filter_port, output_dir
     );
 
-    // If in manual mode, create the segmenter
     let mut manual_segmenter = if manual_segment {
-        Some(ManualSegmenter::new(output_dir))
+        let seg = ManualSegmenter::new(output_dir)
+            .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt);
+        Some(seg)
     } else {
         None
     };
 
     loop {
-        // (a) If FFmpeg is active, check if it exited
         if let Some(child) = ffmpeg_child.as_mut() {
             if let Some(exit_status) = child.try_wait()? {
                 eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -483,11 +603,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // (b) Grab next pcap packet
         let packet = match cap.next_packet() {
             Ok(pkt) => pkt,
             Err(_) => {
-                // Possibly a timeout
                 if let Some(child) = ffmpeg_child.as_mut() {
                     if let Some(exit_status) = child.try_wait()? {
                         eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -498,16 +616,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // (c) Extract the TS payload
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
-            // (d) If NOT manual_segment, feed data to FFmpeg
+            if manual_segment && inject_pat_pmt {
+                let pkt_count = ts_payload.len() / 188;
+                let mut cache = table_cache.lock().unwrap();
+                for i in 0..pkt_count {
+                    let pkt = &ts_payload[i * 188..(i + 1) * 188];
+                    let pid = ((pkt[1] as u16 & 0x1F) << 8) | (pkt[2] as u16);
+                    if pid == 0 {
+                        cache.update_pat(pkt);
+                    } else if let Some(pp) = cache.pmt_pid {
+                        if pid == pp {
+                            cache.update_pmt(pkt);
+                        }
+                    }
+                }
+            }
+
             if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
                 if let Err(e) = buf.write_all(ts_payload) {
                     eprintln!("Error feeding data to FFmpeg: {:?}", e);
                     break;
                 }
             }
-            // (e) If manual_segment, feed data to ManualSegmenter
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload) {
                     eprintln!("Error writing manual TS segment: {:?}", e);
@@ -517,11 +648,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // --------------------------------------------------------------------
-    // 7) Done capturing. Clean up
-    // --------------------------------------------------------------------
-
-    // If we had FFmpeg, flush & close ffmpeg stdin
     if let Some(mut buf) = ffmpeg_stdin_buf.take() {
         let _ = buf.flush();
         drop(buf);
@@ -536,12 +662,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // If manual segmenter was used, let it drop (closing last file)
     drop(manual_segmenter);
 
-    // Wait for background upload thread
     let _ = upload_task.await?;
-    // Wait for watcher thread
     let _ = watch_thread.join();
 
     println!("Exiting normally.");
@@ -592,14 +715,12 @@ async fn handle_file_events(
                             let path_str = path.to_string_lossy().to_string();
                             let tracker_clone = Arc::clone(&tracker);
 
-                            // Check if file was already uploaded or is too old
                             let should_upload = {
                                 let tracker = tracker_clone.lock().unwrap();
                                 !tracker.is_uploaded(&path_str) && !tracker.is_too_old(&path)
                             };
 
                             if should_upload {
-                                // Wait a bit so writer is done
                                 sleep(Duration::from_millis(300)).await;
                                 if let Ok(()) = upload_file_to_s3(
                                     &s3_client,
@@ -642,7 +763,6 @@ async fn upload_file_to_s3(
         key_str
     );
 
-    // Add retry logic
     let mut retries = 3;
     while retries > 0 {
         match s3_client
@@ -678,9 +798,6 @@ async fn upload_file_to_s3(
     Ok(())
 }
 
-/// Strips the `base_dir` prefix from `full_path`.
-/// e.g. if `full_path = hls/2025/01/14/23/segment_20250114-234519_0000.ts`
-/// and `base_dir = "hls"`, returns `2025/01/14/23/segment_20250114-234519_0000.ts`.
 fn strip_base_dir<'a>(
     full_path: &'a Path,
     base_dir: &str,
@@ -703,10 +820,9 @@ fn extract_mpegts_payload<'a>(
     }
     let ethertype = u16::from_be_bytes([data[12], data[13]]);
     if ethertype != 0x0800 {
-        return None; // not IPv4
+        return None;
     }
 
-    // IP
     let ip_version_ihl = data[14];
     let ip_version = ip_version_ihl >> 4;
     if ip_version != 4 {
@@ -720,7 +836,7 @@ fn extract_mpegts_payload<'a>(
 
     let protocol = data[23];
     if protocol != 17 {
-        return None; // not UDP
+        return None;
     }
 
     let ip_dst_addr = &data[30..34];
@@ -752,8 +868,6 @@ fn extract_mpegts_payload<'a>(
         return None;
     }
 
-    // If it's RTP carrying TS, we typically see 0x80 at [0] and TS sync (0x47) at [12].
-    // If it's raw TS, we expect 0x47 at [0].
     let (ts_payload, is_rtp) = if payload[0] == 0x80 && payload.len() > 12 && payload[12] == 0x47 {
         (&payload[12..], true)
     } else if payload[0] == 0x47 {
@@ -772,21 +886,18 @@ fn extract_mpegts_payload<'a>(
         debug!("RTP packet found with TS payload size {}", ts_payload.len());
     }
 
-    // Validate TS packet alignment (188-byte packets)
     if ts_payload.len() < 188 {
         warn!("Short TS packet found of size {}", ts_payload.len());
         return None;
     }
 
-    // # of complete TS packets
     let num_packets = ts_payload.len() / 188;
     let aligned_len = num_packets * 188;
 
-    // Verify sync bytes
     for i in 0..num_packets {
         if ts_payload[i * 188] != 0x47 {
             warn!("Misaligned TS packet found at offset {}", i * 188);
-            return None; // misaligned
+            return None;
         }
     }
     Some(&ts_payload[..aligned_len])
