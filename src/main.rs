@@ -123,7 +123,7 @@ impl HourlyIndexCreator {
     /// Then, optionally upload that `.m3u8` to S3 so remote playback can see it.
     async fn write_hourly_index(&self, hour_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         // For an hour like `2025/01/15/11`, we'll put `hourly_index.m3u8` there
-        let local_dir = std::path::Path::new("hls").join(hour_dir);
+        let local_dir = Path::new(hour_dir);
         let index_path = local_dir.join("hourly_index.m3u8");
 
         fs::create_dir_all(&local_dir)?;
@@ -161,8 +161,8 @@ impl HourlyIndexCreator {
         self.upload_local_file_to_s3(&index_path, &index_key)
             .await?;
 
-        let final_url = format!("s3://{}/{}", self.bucket, index_key);
-        self.rewrite_urls_log(hour_dir, &final_url)?;
+        let signed_url = self.presign_get_url(&index_key).await?;
+        self.rewrite_urls_log(hour_dir, &signed_url)?;
 
         Ok(())
     }
@@ -179,7 +179,7 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Add new line, e.g. "Hour 2025/01/15/11 => https://..."
+        // Add new line with the signed URL
         lines.push(format!("Hour {} => {}", hour_dir, final_url));
 
         // rewrite the file from scratch
