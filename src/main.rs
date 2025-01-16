@@ -75,7 +75,6 @@ pub struct HourlyIndexCreator {
 
     // Keyed by "YYYY/mm/dd/HH" => a vector of segment entries
     hour_map: std::collections::HashMap<String, Vec<HourlyIndexEntry>>,
-    hour_urls: HashSet<String>,
 }
 
 impl HourlyIndexCreator {
@@ -92,7 +91,6 @@ impl HourlyIndexCreator {
             generate_unsigned_urls,
             endpoint,
             hour_map: std::collections::HashMap::new(),
-            hour_urls: HashSet::new(),
         }
     }
 
@@ -178,33 +176,27 @@ impl HourlyIndexCreator {
         let log_path = Path::new(output_dir).join("urls.log");
         let mut lines = vec![];
 
-        // Check if we've already processed this hour
-        if !self.hour_urls.contains(hour_dir) {
-            // Add to our tracking set
-            self.hour_urls.insert(hour_dir.to_string());
-
-            // Read existing lines that don't match current hour
-            if log_path.exists() {
-                let old = fs::read_to_string(&log_path)?;
-                for ln in old.lines() {
-                    if !ln.starts_with(&format!("Hour {} =>", hour_dir)) {
-                        lines.push(ln.to_string());
-                    }
+        // Read existing lines that don't match current hour
+        if log_path.exists() {
+            let old = fs::read_to_string(&log_path)?;
+            for ln in old.lines() {
+                if !ln.starts_with(&format!("Hour {} =>", hour_dir)) {
+                    lines.push(ln.to_string());
                 }
             }
+        }
 
-            // Add the new line for current hour
-            lines.push(format!("Hour {} => {}", hour_dir, final_url));
+        // Add the new line for current hour
+        lines.push(format!("Hour {} => {}", hour_dir, final_url));
 
-            // Write all lines back
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(log_path)?;
-            for ln in &lines {
-                writeln!(f, "{}", ln)?;
-            }
+        // Write all lines back
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)?;
+        for ln in &lines {
+            writeln!(f, "{}", ln)?;
         }
 
         Ok(())
