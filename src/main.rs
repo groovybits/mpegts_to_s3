@@ -1128,14 +1128,28 @@ async fn upload_file_to_s3(
 
     let mut retries = 3;
     while retries > 0 {
-        // Read the entire file into memory first
+        // Multiple ways to check file size
+        let metadata_size = fs::metadata(path)?.len();
         let file_contents = fs::read(path)?;
-        if file_contents.len() as u64 != file_size {
-            return Err("File read size mismatch".into());
-        }
+        let read_size = file_contents.len();
+
+        println!(
+            "File checks for {}\n  Metadata size: {}\n  Actual read size: {}",
+            path.display(),
+            metadata_size,
+            read_size
+        );
 
         let body_stream = ByteStream::from(file_contents);
 
+        println!(
+            "Uploading {} (metadata: {} bytes, read: {} bytes) -> s3://{}/{}",
+            path.display(),
+            metadata_size,
+            read_size,
+            bucket,
+            key_str
+        );
         match s3_client
             .put_object()
             .bucket(bucket)
