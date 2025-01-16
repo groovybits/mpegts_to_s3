@@ -67,22 +67,25 @@ fn get_s3_password() -> String {
     std::env::var("S3_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
 }
 
-/// A single line in an hourly index: includes the final URL, duration, optional metadata lines
+#[derive(Debug, Clone)]
 pub struct HourlyIndexEntry {
+    pub sequence_id: u64,
     pub duration: f64,
     pub signed_url: String,
     pub custom_lines: Vec<String>,
 }
 
-/// Tracks per-hour segments and writes `hourly_index.m3u8`.
 pub struct HourlyIndexCreator {
     s3_client: aws_sdk_s3::Client,
     bucket: String,
     generate_unsigned_urls: bool,
-    endpoint: String, // <-- store the CLI’s endpoint here
+    endpoint: String,
 
-    // Keyed by "YYYY/mm/dd/HH" => a vector of segment entries
+    // Keyed by "YYYY/mm/dd/HH" => a vector of HourlyIndexEntry
     hour_map: std::collections::HashMap<String, Vec<HourlyIndexEntry>>,
+
+    // This ensures each new segment gets a strictly increasing sequence
+    global_sequence_id: u64,
 }
 
 impl HourlyIndexCreator {
@@ -99,6 +102,7 @@ impl HourlyIndexCreator {
             generate_unsigned_urls,
             endpoint,
             hour_map: std::collections::HashMap::new(),
+            global_sequence_id: 0,
         }
     }
 
@@ -111,17 +115,27 @@ impl HourlyIndexCreator {
         custom_lines: Vec<String>,
         output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 1) Bump the global sequence ID so it never goes backward
+        self.global_sequence_id += 1;
+
+        // 2) Generate the URL (signed or unsigned)
         let signed_url = self.generate_url(segment_key).await?;
 
+        // 3) Build the new HourlyIndexEntry
         let entry = HourlyIndexEntry {
+            sequence_id: self.global_sequence_id,
             duration,
             signed_url,
             custom_lines,
         };
+
+        // 4) Store it in hour_map
         let entries = self.hour_map.entry(hour_dir.to_string()).or_default();
         entries.push(entry);
 
+        // 5) Rewrite the "hourly_index.m3u8" for that hour
         self.write_hourly_index(hour_dir, output_dir).await?;
+
         Ok(())
     }
 
@@ -131,17 +145,25 @@ impl HourlyIndexCreator {
         hour_dir: &str,
         output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let local_dir = Path::new(output_dir).join(hour_dir);
+        // Build local output paths
+        let local_dir = std::path::Path::new(output_dir).join(hour_dir);
         let index_path = local_dir.join("hourly_index.m3u8");
-        fs::create_dir_all(&local_dir)?;
+        let temp_path = local_dir.join("hourly_index_temp.m3u8");
 
+        std::fs::create_dir_all(&local_dir)?;
+
+        // Grab all entries for this hour
+        let entries = self.hour_map.get(hour_dir);
+
+        // Write the new .m3u8 to a temporary file
         {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&index_path)?;
+                .open(&temp_path)?;
 
+            // Standard HLS boilerplate
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
             writeln!(
@@ -149,11 +171,21 @@ impl HourlyIndexCreator {
                 "#EXT-X-TARGETDURATION:{}",
                 get_segment_duration_seconds() + 1
             )?;
-            let segment_count = self.hour_map.get(hour_dir).map_or(0, |v| v.len() as u64);
-            writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", segment_count)?;
 
-            if let Some(entries) = self.hour_map.get(hour_dir) {
-                for entry in entries {
+            // If we have entries, compute the lowest sequence_id
+            let media_seq = if let Some(vec) = entries {
+                vec.iter().map(|e| e.sequence_id).min().unwrap_or(0)
+            } else {
+                0
+            };
+            writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", media_seq)?;
+
+            // Then write each segment in ascending sequence_id order (optional, but recommended)
+            if let Some(vec) = entries {
+                // Sort by sequence_id so the playlist is in correct order
+                let mut sorted = vec.clone();
+                sorted.sort_by_key(|e| e.sequence_id);
+                for entry in sorted {
                     for line in &entry.custom_lines {
                         writeln!(file, "{}", line)?;
                     }
@@ -163,14 +195,18 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Upload this newly updated `.m3u8` to S3
-        let index_key = format!("{}/hourly_index.m3u8", hour_dir);
-        self.upload_local_file_to_s3(&index_path, &index_key)
+        // Atomic rename to the final "hourly_index.m3u8"
+        std::fs::rename(&temp_path, &index_path)?;
+
+        // Upload the new index to S3
+        self.upload_local_file_to_s3(&index_path, &format!("{}/hourly_index.m3u8", hour_dir))
             .await?;
 
-        // Also rewrite local `urls.log` with that index’s URL
-        let signed_url = self.presign_get_url(&index_key).await?;
-        self.rewrite_urls_log(hour_dir, &signed_url, output_dir)?;
+        // Update local `urls.log` (also do temp-then-rename)
+        let final_index_url = self
+            .presign_get_url(&format!("{}/hourly_index.m3u8", hour_dir))
+            .await?;
+        self.rewrite_urls_log(hour_dir, &final_index_url, output_dir)?;
 
         Ok(())
     }
@@ -182,31 +218,37 @@ impl HourlyIndexCreator {
         final_url: &str,
         output_dir: &str,
     ) -> std::io::Result<()> {
-        let log_path = Path::new(output_dir).join("urls.log");
-        let mut lines = vec![];
+        let log_path = std::path::Path::new(output_dir).join("urls.log");
+        let temp_path = std::path::Path::new(output_dir).join("urls_temp.log");
 
-        // Read existing lines that don't match current hour
+        // Read in old lines except the old line for this hour
+        let mut lines = vec![];
         if log_path.exists() {
-            let old = fs::read_to_string(&log_path)?;
-            for ln in old.lines() {
+            let old_data = std::fs::read_to_string(&log_path)?;
+            for ln in old_data.lines() {
                 if !ln.starts_with(&format!("Hour {} =>", hour_dir)) {
                     lines.push(ln.to_string());
                 }
             }
         }
 
-        // Add the new line for current hour
+        // Insert the new line for this hour
         lines.push(format!("Hour {} => {}", hour_dir, final_url));
 
-        // Write all lines back
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(log_path)?;
-        for ln in &lines {
-            writeln!(f, "{}", ln)?;
+        // Write out to temp
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            for ln in &lines {
+                writeln!(f, "{}", ln)?;
+            }
         }
+
+        // Atomic rename
+        std::fs::rename(&temp_path, &log_path)?;
 
         Ok(())
     }
@@ -253,12 +295,14 @@ impl HourlyIndexCreator {
             self.bucket, object_key
         );
 
-        let body_bytes = ByteStream::from_path(local_path).await?;
+        let body_bytes = aws_sdk_s3::primitives::ByteStream::from_path(local_path).await?;
         self.s3_client
             .put_object()
             .bucket(&self.bucket)
             .key(object_key)
             .body(body_bytes)
+            // Tells clients not to cache the .m3u8
+            .cache_control("no-cache, no-store, must-revalidate")
             .send()
             .await?;
 
