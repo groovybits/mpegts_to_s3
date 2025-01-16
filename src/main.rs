@@ -15,7 +15,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
-use chrono::Utc;
+//use chrono::Utc;
 use clap::{Arg, Command as ClapCommand};
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
@@ -139,9 +139,10 @@ impl HourlyIndexCreator {
             writeln!(
                 file,
                 "#EXT-X-TARGETDURATION:{}",
-                get_segment_duration_seconds()
+                get_segment_duration_seconds() + 1
             )?;
-            writeln!(file, "#EXT-X-MEDIA-SEQUENCE:0")?;
+            let segment_count = self.hour_map.get(hour_dir).map_or(0, |v| v.len() as u64);
+            writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", segment_count )?;
 
             if let Some(entries) = self.hour_map.get(hour_dir) {
                 for entry in entries {
@@ -1069,10 +1070,10 @@ async fn handle_file_events(
                                 }
 
                                 // Add #EXT-X-PROGRAM-DATE-TIME
-                                let current_time = Utc::now().to_rfc3339();
-                                let custom_lines =
-                                    vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
-                                //let custom_lines = vec![];
+                                //let current_time = Utc::now().to_rfc3339();
+                                //let custom_lines =
+                                //    vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
+                                let custom_lines = vec![];
 
                                 hourly_index_creator
                                     .record_segment(
