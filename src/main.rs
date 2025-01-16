@@ -14,7 +14,6 @@ use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use aws_smithy_runtime_api::client::endpoint::{EndpointResolverParams, ResolveEndpoint};
 use aws_types::region::Region;
 use chrono::Utc;
 use clap::{Arg, Command as ClapCommand};
@@ -60,39 +59,42 @@ fn get_url_signing_seconds() -> u64 {
         .unwrap_or(3600)
 }
 
-/// A single line in an hourly index: includes the signed/unsigned URL, duration, optional metadata.
+/// A single line in an hourly index: includes the final URL, duration, optional metadata lines
 pub struct HourlyIndexEntry {
     pub duration: f64,
     pub signed_url: String,
     pub custom_lines: Vec<String>,
 }
 
+/// Tracks per-hour segments and writes `hourly_index.m3u8`.
 pub struct HourlyIndexCreator {
     s3_client: aws_sdk_s3::Client,
     bucket: String,
-    // Make sure we store the generate_unsigned_urls parameter instead of overwriting with `false`.
     generate_unsigned_urls: bool,
+    endpoint: String, // <-- store the CLI’s endpoint here
 
     // Keyed by "YYYY/mm/dd/HH" => a vector of segment entries
     hour_map: std::collections::HashMap<String, Vec<HourlyIndexEntry>>,
 }
 
 impl HourlyIndexCreator {
-    /// Create a new HourlyIndexCreator
+    /// Build the HourlyIndexCreator, storing the endpoint string
     pub fn new(
         s3_client: aws_sdk_s3::Client,
         bucket: String,
         generate_unsigned_urls: bool,
+        endpoint: String,
     ) -> Self {
         Self {
             s3_client,
             bucket,
             generate_unsigned_urls,
+            endpoint,
             hour_map: std::collections::HashMap::new(),
         }
     }
 
-    /// Called each time we finish uploading a segment.
+    /// Called each time we finish uploading a segment
     pub async fn record_segment(
         &mut self,
         hour_dir: &str,
@@ -115,13 +117,12 @@ impl HourlyIndexCreator {
         Ok(())
     }
 
-    /// Actually generate or update the "hourly_index.m3u8" in that hour folder, then upload it.
+    /// Writes/updates "hourly_index.m3u8" in that hour folder, then uploads it to S3
     async fn write_hourly_index(
         &self,
         hour_dir: &str,
         output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Join the output_dir with hour_dir
         let local_dir = Path::new(output_dir).join(hour_dir);
         let index_path = local_dir.join("hourly_index.m3u8");
         fs::create_dir_all(&local_dir)?;
@@ -133,13 +134,11 @@ impl HourlyIndexCreator {
                 .truncate(true)
                 .open(&index_path)?;
 
-            // Write standard HLS boilerplate
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
             writeln!(file, "#EXT-X-TARGETDURATION:60")?;
             writeln!(file, "#EXT-X-MEDIA-SEQUENCE:0")?;
 
-            // Retrieve the array of segments for this hour
             if let Some(entries) = self.hour_map.get(hour_dir) {
                 for entry in entries {
                     for line in &entry.custom_lines {
@@ -151,19 +150,19 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Upload the updated `hourly_index.m3u8` to S3:
+        // Upload this newly updated `.m3u8` to S3
         let index_key = format!("{}/hourly_index.m3u8", hour_dir);
         self.upload_local_file_to_s3(&index_path, &index_key)
             .await?;
 
-        // Also rewrite the local urls.log with the new index's URL:
+        // Also rewrite local `urls.log` with that index’s URL
         let signed_url = self.presign_get_url(&index_key).await?;
         self.rewrite_urls_log(hour_dir, &signed_url, output_dir)?;
 
         Ok(())
     }
 
-    /// Overwrite `urls.log` with the new line appended each time
+    /// Rewrites `urls.log` in the local output dir with the new line appended
     fn rewrite_urls_log(
         &self,
         hour_dir: &str,
@@ -193,25 +192,14 @@ impl HourlyIndexCreator {
         Ok(())
     }
 
-    /// Generate either a signed or unsigned URL based on the configuration
+    /// Generate either a signed or an unsigned URL
     async fn generate_url(
         &self,
         object_key: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if self.generate_unsigned_urls {
-            // Use EndpointResolverParams
-            let params = EndpointResolverParams::new(());
-            let endpoint = self
-                .s3_client
-                .config()
-                .endpoint_resolver()
-                .resolve_endpoint(&params)
-                .await
-                .map_err(|e| format!("Failed to resolve endpoint: {}", e))?
-                .url()
-                .to_string();
-
-            Ok(format!("{}/{}/{}", endpoint, self.bucket, object_key))
+            // Build the final URL from the CLI’s endpoint + bucket + object_key
+            Ok(format!("{}/{}/{}", self.endpoint, self.bucket, object_key))
         } else {
             // Signed URL logic
             let config =
@@ -227,7 +215,7 @@ impl HourlyIndexCreator {
         }
     }
 
-    /// Return `Result<String, Box<dyn std::error::Error + Send + Sync>>`
+    /// For rewriting `urls.log`, we also presign the `.m3u8` object if signing is enabled
     async fn presign_get_url(
         &self,
         object_key: &str,
@@ -235,7 +223,7 @@ impl HourlyIndexCreator {
         self.generate_url(object_key).await
     }
 
-    /// Helper to upload a local file (the .m3u8) to S3
+    /// Upload a local file to S3
     async fn upload_local_file_to_s3(
         &self,
         local_path: &std::path::Path,
@@ -259,7 +247,7 @@ impl HourlyIndexCreator {
     }
 }
 
-/// Attempt to join `multicast_addr` + `port` on the given `interface_name`.
+/// Attempt to join `multicast_addr` + `port` on a given `interface_name`
 pub fn join_multicast_on_iface(
     multicast_addr: &str,
     port: u16,
@@ -281,6 +269,7 @@ pub fn join_multicast_on_iface(
     Ok(sock)
 }
 
+/// Finds the first IPv4 address of `interface_name`
 fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
     let ifaces = get_if_addrs()?;
     for iface in ifaces {
@@ -763,6 +752,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Initializing S3 client with endpoint: {}", endpoint);
     let creds = Credentials::new("minioadmin", "minioadmin", None, None, "dummy");
 
+    // Build shared config from aws_config
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(region_name.clone()))
         .endpoint_url(endpoint)
@@ -770,17 +760,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .load()
         .await;
 
+    // Then build S3 client from that config
     let s3_config = aws_sdk_s3::config::Builder::from(&config)
         .force_path_style(true)
         .build();
     let s3_client = Client::from_conf(s3_config);
 
+    // Ensure S3 bucket
     ensure_bucket_exists(&s3_client, bucket).await?;
 
+    // Build HourlyIndexCreator, storing the endpoint string for future use
     let hourly_index_creator = HourlyIndexCreator::new(
         s3_client.clone(),
         bucket.to_string(),
         generate_unsigned_urls,
+        endpoint.clone(), // store the endpoint to build unsigned URLs
     );
 
     info!("Starting directory watcher on: {}", output_dir);
@@ -848,6 +842,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir_clone = output_dir.clone();
     let output_dir_for_task = output_dir.clone();
 
+    // Start async upload task
     let upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
             watch_rx,
@@ -864,11 +859,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
+    // Join multicast group
     if let Ok(_sock) = join_multicast_on_iface(filter_ip, filter_port, interface) {
     } else {
         eprintln!("Failed to join multicast group or find interface IP!");
     }
 
+    // Start pcap
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
         .buffer_size(8 * 1024 * 1024)
@@ -895,6 +892,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // Main capture loop
     loop {
         if let Some(child) = ffmpeg_child.as_mut() {
             if let Some(exit_status) = child.try_wait()? {
@@ -933,12 +931,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
+            // Pass TS data to FFmpeg if not manual
             if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
                 if let Err(e) = buf.write_all(ts_payload) {
                     eprintln!("Error feeding data to FFmpeg: {:?}", e);
                     break;
                 }
             }
+
+            // If manual, write to segments ourselves
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload) {
                     eprintln!("Error writing manual TS segment: {:?}", e);
@@ -948,6 +949,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Cleanup FFmpeg
     if let Some(mut buf) = ffmpeg_stdin_buf.take() {
         let _ = buf.flush();
         drop(buf);
@@ -1022,6 +1024,7 @@ async fn handle_file_events(
                             };
 
                             if should_upload {
+                                // Give time for file to finish writing
                                 sleep(Duration::from_millis(300)).await;
 
                                 // Derive the relative key
@@ -1037,7 +1040,6 @@ async fn handle_file_events(
                                 };
                                 let key_str = relative_path.to_string_lossy().to_string();
 
-                                // hour_dir = parent folder(s)
                                 let hour_dir = relative_path
                                     .parent()
                                     .map(|p| p.to_string_lossy().to_string())
