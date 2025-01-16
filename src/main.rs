@@ -136,7 +136,7 @@ impl HourlyIndexCreator {
 
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
-            writeln!(file, "#EXT-X-TARGETDURATION:60")?;
+            writeln!(file, "#EXT-X-TARGETDURATION:{}", get_segment_duration_seconds())?;
             writeln!(file, "#EXT-X-MEDIA-SEQUENCE:0")?;
 
             if let Some(entries) = self.hour_map.get(hour_dir) {
@@ -1062,6 +1062,7 @@ async fn handle_file_events(
                                 let current_time = Utc::now().to_rfc3339();
                                 let custom_lines =
                                     vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
+                                //let custom_lines = vec![];
 
                                 hourly_index_creator
                                     .record_segment(
