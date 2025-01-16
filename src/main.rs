@@ -518,10 +518,13 @@ impl ManualSegmenter {
     }
 
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
-        if self.current_ts_file.is_some() {
+        if let Some(mut writer) = self.current_ts_file.take() {
+            // Ensure all buffered data is written to disk
+            writer.flush()?;
+            drop(writer);
+
             let duration = get_segment_duration_seconds() as f64;
             let segment_path = self.current_segment_path(self.segment_index + 1);
-            self.current_ts_file.take();
 
             self.playlist_entries.push(PlaylistEntry {
                 duration,
