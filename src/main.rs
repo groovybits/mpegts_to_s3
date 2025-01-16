@@ -185,7 +185,6 @@ impl HourlyIndexCreator {
             writeln!(file, "#EXT-X-VERSION:3")?;
 
             // Per HLS spec, #EXT-X-TARGETDURATION should be >= the ceiling of any segment's duration.
-            // We'll find the max segment duration among these entries. Fallback to the env default if none.
             let target_duration = if let Some(vec) = entries {
                 let max_seg = vec
                     .iter()
@@ -228,7 +227,7 @@ impl HourlyIndexCreator {
         self.upload_local_file_to_s3(
             &index_path,
             &format!("{}/hourly_index.m3u8", hour_dir),
-            "application/vnd.apple.mpegurl", // correct MIME for HLS playlist
+            "application/vnd.apple.mpegurl",
         )
         .await?;
 
@@ -521,6 +520,70 @@ impl MpegTsTableCache {
     }
 }
 
+// ----------------------------------------------------------------
+// --- PCRTracker + parse_pcr() for real media durations ---
+// ----------------------------------------------------------------
+
+#[derive(Default)]
+struct PcrTracker {
+    earliest_pcr: Option<f64>,
+    latest_pcr: Option<f64>,
+}
+
+impl PcrTracker {
+    /// Parse each TS packet for PCR if present, store earliest and latest.
+    fn handle_ts_packet(&mut self, pkt: &[u8]) {
+        if pkt.len() != 188 {
+            return;
+        }
+        let adaptation_control = (pkt[3] >> 4) & 0b11;
+        if adaptation_control == 0b10 || adaptation_control == 0b11 {
+            let adaptation_len = pkt[4] as usize;
+            if adaptation_len > 0 && adaptation_len <= 183 {
+                let adaptation_flags = pkt[5];
+                let pcr_flag = (adaptation_flags & 0x10) != 0; // bit 4
+                if pcr_flag && adaptation_len >= 7 {
+                    if let Some(pcr_value) = parse_pcr(&pkt[6..12]) {
+                        if self.earliest_pcr.is_none() {
+                            self.earliest_pcr = Some(pcr_value);
+                        }
+                        self.latest_pcr = Some(pcr_value);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns duration = latest - earliest, or 0 if we don't have enough info.
+    fn duration_seconds(&self) -> f64 {
+        match (self.earliest_pcr, self.latest_pcr) {
+            (Some(a), Some(b)) if b > a => b - a,
+            _ => 0.0,
+        }
+    }
+}
+
+/// Parse 6 bytes of PCR into a floating-point number of seconds.
+///  - 33-bit PCR base (90kHz), plus a 9-bit extension (27MHz).
+fn parse_pcr(data: &[u8]) -> Option<f64> {
+    if data.len() < 6 {
+        return None;
+    }
+    // 33-bit base
+    let pcr_base = ((data[0] as u64) << 25)
+        | ((data[1] as u64) << 17)
+        | ((data[2] as u64) << 9)
+        | ((data[3] as u64) << 1)
+        | ((data[4] as u64) >> 7);
+
+    // 9-bit extension
+    let pcr_ext = ((data[4] & 0x01) as u16) << 8 | data[5] as u16;
+
+    // total in 27 MHz ticks
+    let total_ticks_27mhz = pcr_base * 300 + pcr_ext as u64;
+    Some(total_ticks_27mhz as f64 / 27_000_000.0)
+}
+
 // ------------- MANUAL SEGMENTER -------------
 
 struct PlaylistEntry {
@@ -541,6 +604,9 @@ struct ManualSegmenter {
 
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
+
+    // Track real media durations via PCR
+    pcr_tracker: PcrTracker,
 }
 
 impl ManualSegmenter {
@@ -557,6 +623,7 @@ impl ManualSegmenter {
             inject_pat_pmt: false,
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
+            pcr_tracker: PcrTracker::default(),
         }
     }
 
@@ -592,6 +659,14 @@ impl ManualSegmenter {
             file.write_all(data)?;
             file.flush()?;
         }
+
+        // --- Parse data in 188-byte chunks to track PCR
+        let pkt_count = data.len() / 188;
+        for i in 0..pkt_count {
+            let pkt = &data[i * 188..(i + 1) * 188];
+            self.pcr_tracker.handle_ts_packet(pkt);
+        }
+
         Ok(())
     }
 
@@ -601,12 +676,18 @@ impl ManualSegmenter {
             writer.flush()?;
             drop(writer);
 
-            // Measure actual segment duration in real time
-            let actual_duration = self.current_segment_start.elapsed().as_secs_f64();
+            // --- MODIFIED: Use PCR-based duration, fallback to real time
+            let real_pcr_duration = self.pcr_tracker.duration_seconds();
+            let actual_duration = if real_pcr_duration > 0.0 {
+                real_pcr_duration
+            } else {
+                // fallback to measuring with wall clock if no valid PCR
+                self.current_segment_start.elapsed().as_secs_f64()
+            };
+            // --- END MODIFIED
 
             let segment_path = self.current_segment_path(self.segment_index + 1);
 
-            // Store in our in-memory playlist
             self.playlist_entries.push(PlaylistEntry {
                 duration: actual_duration,
                 path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
@@ -628,6 +709,9 @@ impl ManualSegmenter {
 
             // Reset the timer so the next segment starts timing fresh
             self.current_segment_start = Instant::now();
+
+            // Reset PCR tracker for the next segment
+            self.pcr_tracker = PcrTracker::default();
         }
         Ok(())
     }
@@ -671,8 +755,6 @@ impl ManualSegmenter {
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        // We'll start with a target duration of the environment variable + 1,
-        // but will refine it on rewrite.
         writeln!(
             f,
             "#EXT-X-TARGETDURATION:{}",
@@ -692,7 +774,6 @@ impl ManualSegmenter {
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
 
-        // Recompute the largest segment duration so far
         let max_seg = self
             .playlist_entries
             .iter()
@@ -707,7 +788,6 @@ impl ManualSegmenter {
         writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
 
         for entry in &self.playlist_entries {
-            // Apple wants decimal durations
             writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
             writeln!(f, "{}", entry.path)?;
         }
@@ -853,8 +933,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-            interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-            inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
+             interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+             inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
         endpoint,
         region_name,
         bucket,
@@ -897,7 +977,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         s3_client.clone(),
         bucket.to_string(),
         generate_unsigned_urls,
-        endpoint.clone(), // store the endpoint to build unsigned URLs
+        endpoint.clone(),
     );
 
     info!("Starting directory watcher on: {}", output_dir);
@@ -1255,11 +1335,9 @@ async fn upload_file_to_s3(
         if ext == "m3u8" {
             "application/vnd.apple.mpegurl"
         } else {
-            // Default to TS
             "video/mp2t"
         }
     } else {
-        // Fallback
         "application/octet-stream"
     };
 
