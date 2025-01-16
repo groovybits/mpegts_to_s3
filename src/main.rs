@@ -648,7 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              Arg::new("region")
                  .short('r')
                  .long("region")
-                 .default_value("us-west-2")
+                 .default_value("us-east-1")
                  .help("S3 region"),
          )
          .arg(
