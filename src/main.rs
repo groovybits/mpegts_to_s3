@@ -59,6 +59,14 @@ fn get_url_signing_seconds() -> u64 {
         .unwrap_or(3600)
 }
 
+fn get_s3_username() -> String {
+    std::env::var("S3_USERNAME").unwrap_or_else(|_| "minioadmin".to_string())
+}
+
+fn get_s3_password() -> String {
+    std::env::var("S3_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
+}
+
 /// A single line in an hourly index: includes the final URL, duration, optional metadata lines
 pub struct HourlyIndexEntry {
     pub duration: f64,
@@ -142,7 +150,7 @@ impl HourlyIndexCreator {
                 get_segment_duration_seconds() + 1
             )?;
             let segment_count = self.hour_map.get(hour_dir).map_or(0, |v| v.len() as u64);
-            writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", segment_count )?;
+            writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", segment_count)?;
 
             if let Some(entries) = self.hour_map.get(hour_dir) {
                 for entry in entries {
@@ -761,7 +769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     fs::create_dir_all(output_dir)?;
 
     info!("Initializing S3 client with endpoint: {}", endpoint);
-    let creds = Credentials::new("minioadmin", "minioadmin", None, None, "dummy");
+    let creds = Credentials::new(get_s3_username(), get_s3_password(), None, None, "dummy");
 
     // Build shared config from aws_config
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
