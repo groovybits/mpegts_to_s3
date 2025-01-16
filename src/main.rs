@@ -14,6 +14,7 @@ use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use aws_smithy_runtime_api::client::endpoint::{EndpointResolverParams, ResolveEndpoint};
 use aws_types::region::Region;
 use chrono::Utc;
 use clap::{Arg, Command as ClapCommand};
@@ -38,8 +39,6 @@ use tokio::time::sleep;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
-/// Simple time-based segmenter for MPEG-TS packets.
-/// Rotates segments every `SEGMENT_DURATION_SECONDS`.
 fn get_segment_duration_seconds() -> u64 {
     std::env::var("SEGMENT_DURATION_SECONDS")
         .unwrap_or_else(|_| "10".to_string())
@@ -61,18 +60,18 @@ fn get_url_signing_seconds() -> u64 {
         .unwrap_or(3600)
 }
 
-/// A single line in an hourly index: includes the signed URL, duration, optional metadata lines.
+/// A single line in an hourly index: includes the signed/unsigned URL, duration, optional metadata.
 pub struct HourlyIndexEntry {
     pub duration: f64,
     pub signed_url: String,
-    // Additional comments/tags you want to inject, e.g. `#EXT-X-DISCONTINUITY` or your own lines
     pub custom_lines: Vec<String>,
 }
 
-/// A container that tracks the last segments for each "hour" and writes an `hourly_index.m3u8`.
 pub struct HourlyIndexCreator {
     s3_client: aws_sdk_s3::Client,
     bucket: String,
+    // Make sure we store the generate_unsigned_urls parameter instead of overwriting with `false`.
+    generate_unsigned_urls: bool,
 
     // Keyed by "YYYY/mm/dd/HH" => a vector of segment entries
     hour_map: std::collections::HashMap<String, Vec<HourlyIndexEntry>>,
@@ -80,20 +79,20 @@ pub struct HourlyIndexCreator {
 
 impl HourlyIndexCreator {
     /// Create a new HourlyIndexCreator
-    pub fn new(s3_client: aws_sdk_s3::Client, bucket: String) -> Self {
+    pub fn new(
+        s3_client: aws_sdk_s3::Client,
+        bucket: String,
+        generate_unsigned_urls: bool,
+    ) -> Self {
         Self {
             s3_client,
             bucket,
+            generate_unsigned_urls,
             hour_map: std::collections::HashMap::new(),
         }
     }
 
     /// Called each time we finish uploading a segment.
-    /// - `hour_dir` is something like `2025/01/15/11`  
-    /// - `segment_key` is the full S3 object key (e.g. `2025/01/15/11/segment_...ts`)
-    /// - `duration` is how many seconds
-    /// - `custom_lines` is optional metadata lines to insert right before the URI
-    ///   (e.g. `#EXT-X-DISCONTINUITY`, or comments, or ID3 data, etc.).
     pub async fn record_segment(
         &mut self,
         hour_dir: &str,
@@ -101,11 +100,9 @@ impl HourlyIndexCreator {
         duration: f64,
         custom_lines: Vec<String>,
         output_dir: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // 1) Presign the S3 GET URL so the HLS client can fetch it
-        let signed_url = self.presign_get_url(segment_key).await?;
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let signed_url = self.generate_url(segment_key).await?;
 
-        // 2) Store it in our hour_map
         let entry = HourlyIndexEntry {
             duration,
             signed_url,
@@ -114,69 +111,68 @@ impl HourlyIndexCreator {
         let entries = self.hour_map.entry(hour_dir.to_string()).or_default();
         entries.push(entry);
 
-        // 3) Re-write the "hourly_index.m3u8" for that hour
         self.write_hourly_index(hour_dir, output_dir).await?;
-
         Ok(())
     }
 
-    /// Actually generate or update the "hourly_index.m3u8" in that hour folder.  
-    /// Then, optionally upload that `.m3u8` to S3 so remote playback can see it.
+    /// Actually generate or update the "hourly_index.m3u8" in that hour folder, then upload it.
     async fn write_hourly_index(
         &self,
         hour_dir: &str,
         output_dir: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Join the output_dir with hour_dir for local file operations
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Join the output_dir with hour_dir
         let local_dir = Path::new(output_dir).join(hour_dir);
         let index_path = local_dir.join("hourly_index.m3u8");
-
         fs::create_dir_all(&local_dir)?;
 
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&index_path)?;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&index_path)?;
 
-        // Write standard HLS boilerplate
-        writeln!(file, "#EXTM3U")?;
-        writeln!(file, "#EXT-X-VERSION:3")?;
-        // We can compute target duration by scanning all entries or just pick a safe #.
-        writeln!(file, "#EXT-X-TARGETDURATION:60")?; // e.g. 1-min max
-        writeln!(file, "#EXT-X-MEDIA-SEQUENCE:0")?;
+            // Write standard HLS boilerplate
+            writeln!(file, "#EXTM3U")?;
+            writeln!(file, "#EXT-X-VERSION:3")?;
+            writeln!(file, "#EXT-X-TARGETDURATION:60")?;
+            writeln!(file, "#EXT-X-MEDIA-SEQUENCE:0")?;
 
-        // Retrieve the array of segments for this hour
-        if let Some(entries) = self.hour_map.get(hour_dir) {
-            for entry in entries {
-                // Possibly write custom lines (metadata) first
-                for line in &entry.custom_lines {
-                    writeln!(file, "{}", line)?;
+            // Retrieve the array of segments for this hour
+            if let Some(entries) = self.hour_map.get(hour_dir) {
+                for entry in entries {
+                    for line in &entry.custom_lines {
+                        writeln!(file, "{}", line)?;
+                    }
+                    writeln!(file, "#EXTINF:{:.6},", entry.duration)?;
+                    writeln!(file, "{}", entry.signed_url)?;
                 }
-                // Then standard #EXTINF + the signed_url
-                writeln!(file, "#EXTINF:{:.6},", entry.duration)?;
-                writeln!(file, "{}", entry.signed_url)?;
             }
         }
 
-        drop(file);
-
-        // Upload this newly updated `hourly_index.m3u8` to S3:
+        // Upload the updated `hourly_index.m3u8` to S3:
         let index_key = format!("{}/hourly_index.m3u8", hour_dir);
         self.upload_local_file_to_s3(&index_path, &index_key)
             .await?;
 
+        // Also rewrite the local urls.log with the new index's URL:
         let signed_url = self.presign_get_url(&index_key).await?;
-        self.rewrite_urls_log(hour_dir, &signed_url, &output_dir)?;
+        self.rewrite_urls_log(hour_dir, &signed_url, output_dir)?;
 
         Ok(())
     }
 
     /// Overwrite `urls.log` with the new line appended each time
-    fn rewrite_urls_log(&self, hour_dir: &str, final_url: &str, output_dir: &str) -> std::io::Result<()> {
-        // read old lines if exist
+    fn rewrite_urls_log(
+        &self,
+        hour_dir: &str,
+        final_url: &str,
+        output_dir: &str,
+    ) -> std::io::Result<()> {
         let log_path = Path::new(output_dir).join("urls.log");
         let mut lines = vec![];
+
         if log_path.exists() {
             let old = fs::read_to_string(&log_path)?;
             for ln in old.lines() {
@@ -184,10 +180,8 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Add new line with the signed URL
         lines.push(format!("Hour {} => {}", hour_dir, final_url));
 
-        // rewrite the file from scratch
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -199,20 +193,46 @@ impl HourlyIndexCreator {
         Ok(())
     }
 
-    /// Generate a short-lived presigned GET URL for the given S3 object key
+    /// Generate either a signed or unsigned URL based on the configuration
+    async fn generate_url(
+        &self,
+        object_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if self.generate_unsigned_urls {
+            // Use EndpointResolverParams
+            let params = EndpointResolverParams::new(());
+            let endpoint = self
+                .s3_client
+                .config()
+                .endpoint_resolver()
+                .resolve_endpoint(&params)
+                .await
+                .map_err(|e| format!("Failed to resolve endpoint: {}", e))?
+                .url()
+                .to_string();
+
+            Ok(format!("{}/{}/{}", endpoint, self.bucket, object_key))
+        } else {
+            // Signed URL logic
+            let config =
+                PresigningConfig::expires_in(Duration::from_secs(get_url_signing_seconds()))?;
+            let presigned_req = self
+                .s3_client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(object_key)
+                .presigned(config)
+                .await?;
+            Ok(presigned_req.uri().to_string())
+        }
+    }
+
+    /// Return `Result<String, Box<dyn std::error::Error + Send + Sync>>`
     async fn presign_get_url(
         &self,
         object_key: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let config = PresigningConfig::expires_in(Duration::from_secs(get_url_signing_seconds()))?; // 1 hour
-        let presigned_req = self
-            .s3_client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(object_key)
-            .presigned(config)
-            .await?;
-        Ok(presigned_req.uri().to_string())
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.generate_url(object_key).await
     }
 
     /// Helper to upload a local file (the .m3u8) to S3
@@ -220,7 +240,7 @@ impl HourlyIndexCreator {
         &self,
         local_path: &std::path::Path,
         object_key: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!(
             "Uploading hourly index -> s3://{}/{}",
             self.bucket, object_key
@@ -231,7 +251,7 @@ impl HourlyIndexCreator {
             .put_object()
             .bucket(&self.bucket)
             .key(object_key)
-            .body(body_bytes) // pass the ByteStream variable
+            .body(body_bytes)
             .send()
             .await?;
 
@@ -240,26 +260,18 @@ impl HourlyIndexCreator {
 }
 
 /// Attempt to join `multicast_addr` + `port` on the given `interface_name`.
-/// Returns the socket keeping it in scope (which keeps IGMP membership active).
 pub fn join_multicast_on_iface(
     multicast_addr: &str,
     port: u16,
     interface_name: &str,
 ) -> Result<Socket, Box<dyn std::error::Error>> {
-    // 1) Parse the multicast group
     let group_v4: Ipv4Addr = multicast_addr.parse()?;
-
-    // 2) Find the local IPv4 for the interface_name
     let local_iface_ip = find_ipv4_for_interface(interface_name)?;
 
-    // 3) Create a UDP socket and bind to 0.0.0.0:port
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
-
     let bind_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     sock.bind(&bind_addr.into())?;
-
-    // 4) Join the multicast group (group_v4) on that local interface IP
     sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
 
     println!(
@@ -269,7 +281,6 @@ pub fn join_multicast_on_iface(
     Ok(sock)
 }
 
-/// Finds the first IPv4 address of `interface_name`.
 fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
     let ifaces = get_if_addrs()?;
     for iface in ifaces {
@@ -318,7 +329,7 @@ impl FileTracker {
 async fn ensure_bucket_exists(
     client: &Client,
     bucket: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match client.head_bucket().bucket(bucket).send().await {
         Ok(_) => {
             info!("Bucket {} exists", bucket);
@@ -343,9 +354,6 @@ struct MpegTsTableCache {
 }
 
 impl MpegTsTableCache {
-    /// Store the entire 188-byte PAT packet, parse out the first PMT PID.
-    /// TODO: FIXME should handle multiple TS packets for the PAT section,
-    /// CRC checks, multi-program scenarios, etc.
     fn update_pat(&mut self, pkt: &[u8]) {
         if pkt.len() != 188 {
             return;
@@ -381,7 +389,6 @@ impl MpegTsTableCache {
         if payload_offset + 8 > 188 {
             return;
         }
-
         let table_id = pkt[payload_offset];
         if table_id != 0x00 {
             return;
@@ -391,10 +398,10 @@ impl MpegTsTableCache {
         if (section_length as usize) > 1021 {
             return;
         }
-        // Program loop
+
         let _transport_stream_id =
             u16::from_be_bytes([pkt[payload_offset + 3], pkt[payload_offset + 4]]);
-        let _version_number = (pkt[payload_offset + 5] & 0x3E) >> 1; // prefix with underscore to avoid warnings
+        let _version_number = (pkt[payload_offset + 5] & 0x3E) >> 1;
         let mut program_info_offset = payload_offset + 8;
         let pat_section_end = payload_offset + 3 + (section_length as usize);
         while program_info_offset + 4 <= pat_section_end.saturating_sub(4) {
@@ -432,7 +439,6 @@ impl MpegTsTableCache {
 
 // ------------- MANUAL SEGMENTER -------------
 
-// Store the last N segment references in memory so we can remove old ones.
 struct PlaylistEntry {
     duration: f64,
     path: String,
@@ -449,9 +455,8 @@ struct ManualSegmenter {
     pat_pmt_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
     inject_pat_pmt: bool,
 
-    // Maximum segments to keep in the .m3u8 (0=unlimited)
-    max_segments_in_index: usize,         // from CLI
-    playlist_entries: Vec<PlaylistEntry>, // keep track of existing entries
+    max_segments_in_index: usize,
+    playlist_entries: Vec<PlaylistEntry>,
 }
 
 impl ManualSegmenter {
@@ -464,16 +469,13 @@ impl ManualSegmenter {
             segment_index: 0,
             playlist_path,
             m3u8_initialized: false,
-
             pat_pmt_cache: None,
             inject_pat_pmt: false,
-
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
         }
     }
 
-    // Set max_segments_in_index
     fn with_max_segments(mut self, max_segments: usize) -> Self {
         self.max_segments_in_index = max_segments;
         self
@@ -513,20 +515,15 @@ impl ManualSegmenter {
             let segment_path = self.current_segment_path(self.segment_index + 1);
             self.current_ts_file.take();
 
-            // Track in self.playlist_entries so we can manage old ones
             self.playlist_entries.push(PlaylistEntry {
                 duration,
                 path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
             });
 
-            // Now we can remove older entries if max_segments_in_index != 0
             if self.max_segments_in_index > 0
                 && self.playlist_entries.len() > self.max_segments_in_index
             {
-                // remove the oldest one from memory
                 let removed = self.playlist_entries.remove(0);
-
-                // Also remove from disk
                 let old_path = Path::new(&removed.path);
                 if old_path.exists() {
                     let _ = fs::remove_file(old_path);
@@ -534,7 +531,6 @@ impl ManualSegmenter {
             }
 
             self.segment_index += 1;
-            // Re-write the entire .m3u8
             self.rewrite_m3u8()?;
         }
         Ok(())
@@ -583,7 +579,6 @@ impl ManualSegmenter {
         Ok(())
     }
 
-    // Re-write the entire .m3u8 with the current set of segments
     fn rewrite_m3u8(&self) -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new()
             .create(true)
@@ -595,7 +590,6 @@ impl ManualSegmenter {
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
         writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
-        // The media sequence can be the current segment minus how many we have in the list
         let seq_start = self
             .segment_index
             .saturating_sub(self.playlist_entries.len() as u64);
@@ -632,92 +626,99 @@ impl Drop for ManualSegmenter {
 }
 
 // ------------- MAIN -------------
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let matches = ClapCommand::new("mpegts_to_s3")
-         .version("1.0")
-         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
-         .arg(
-             Arg::new("endpoint")
-                 .short('e')
-                 .long("endpoint")
-                 .default_value("http://127.0.0.1:9000")
-                 .help("S3-compatible endpoint"),
-         )
-         .arg(
-             Arg::new("region")
-                 .short('r')
-                 .long("region")
-                 .default_value("us-east-1")
-                 .help("S3 region"),
-         )
-         .arg(
-             Arg::new("bucket")
-                 .short('b')
-                 .long("bucket")
-                 .default_value("ltnhls")
-                 .help("S3 bucket name"),
-         )
-         .arg(
-             Arg::new("udp_ip")
-                 .short('i')
-                 .long("udp_ip")
-                 .default_value("227.1.1.102")
-                 .help("UDP multicast IP to filter"),
-         )
-         .arg(
-             Arg::new("udp_port")
-                 .short('p')
-                 .long("udp_port")
-                 .default_value("4102")
-                 .help("UDP port to filter"),
-         )
-         .arg(
-             Arg::new("interface")
-                 .short('n')
-                 .long("interface")
-                 .default_value("net1")
-                 .help("Network interface for pcap"),
-         )
-         .arg(
-             Arg::new("timeout")
-                 .short('t')
-                 .long("timeout")
-                 .default_value("1000")
-                 .help("Capture timeout in milliseconds"),
-         )
-         .arg(
-             Arg::new("output_dir")
-                 .short('o')
-                 .long("output_dir")
-                 .default_value("hls")
-                 .help("Local dir for HLS output (could be a RAM disk)"),
-         )
-         .arg(
-             Arg::new("remove_local")
-                 .long("remove_local")
-                 .help("Remove local .ts/.m3u8 after uploading to S3?")
-                 .action(clap::ArgAction::SetTrue),
-         )
-         .arg(
-             Arg::new("manual_segment")
-                 .long("manual_segment")
-                 .help("Perform manual TS segmentation + .m3u8 generation (no FFmpeg).")
-                 .action(clap::ArgAction::SetTrue),
-         )
-         .arg(
-             Arg::new("inject_pat_pmt")
-                 .long("inject_pat_pmt")
-                 .help("If using manual segmentation, prepend the latest PAT & PMT to each segment.")
-                 .action(clap::ArgAction::SetTrue),
-         )
-         .arg(
-             Arg::new("hls_keep_segments")
-                 .long("hls_keep_segments")
-                 .help("Limit how many segments to keep in the index.m3u8 (0=unlimited). Also removes old .ts from disk.")
-                 .default_value("0")
-         )
-         .get_matches();
+        .version("1.0")
+        .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
+        .arg(
+            Arg::new("endpoint")
+                .short('e')
+                .long("endpoint")
+                .default_value("http://127.0.0.1:9000")
+                .help("S3-compatible endpoint"),
+        )
+        .arg(
+            Arg::new("region")
+                .short('r')
+                .long("region")
+                .default_value("us-east-1")
+                .help("S3 region"),
+        )
+        .arg(
+            Arg::new("bucket")
+                .short('b')
+                .long("bucket")
+                .default_value("ltnhls")
+                .help("S3 bucket name"),
+        )
+        .arg(
+            Arg::new("udp_ip")
+                .short('i')
+                .long("udp_ip")
+                .default_value("227.1.1.102")
+                .help("UDP multicast IP to filter"),
+        )
+        .arg(
+            Arg::new("udp_port")
+                .short('p')
+                .long("udp_port")
+                .default_value("4102")
+                .help("UDP port to filter"),
+        )
+        .arg(
+            Arg::new("interface")
+                .short('n')
+                .long("interface")
+                .default_value("net1")
+                .help("Network interface for pcap"),
+        )
+        .arg(
+            Arg::new("timeout")
+                .short('t')
+                .long("timeout")
+                .default_value("1000")
+                .help("Capture timeout in milliseconds"),
+        )
+        .arg(
+            Arg::new("output_dir")
+                .short('o')
+                .long("output_dir")
+                .default_value("hls")
+                .help("Local dir for HLS output"),
+        )
+        .arg(
+            Arg::new("remove_local")
+                .long("remove_local")
+                .help("Remove local .ts/.m3u8 after uploading to S3?")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("manual_segment")
+                .long("manual_segment")
+                .help("Perform manual TS segmentation + .m3u8 generation (no FFmpeg).")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("inject_pat_pmt")
+                .long("inject_pat_pmt")
+                .help("If using manual segmentation, prepend the latest PAT & PMT to each segment.")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("hls_keep_segments")
+                .long("hls_keep_segments")
+                .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("unsigned_urls")
+                .long("unsigned_urls")
+                .help("Generate unsigned S3 URLs instead of presigned URLs.")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .get_matches();
 
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
     let region_name = matches.get_one::<String>("region").unwrap();
@@ -730,6 +731,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let remove_local = matches.get_flag("remove_local");
     let manual_segment = matches.get_flag("manual_segment");
     let inject_pat_pmt = matches.get_flag("inject_pat_pmt");
+    let generate_unsigned_urls = matches.get_flag("unsigned_urls");
 
     let hls_keep_segments: usize = matches
         .get_one::<String>("hls_keep_segments")
@@ -738,21 +740,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
 
     info!(
-          "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-           interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, inject_pat_pmt={}, hls_keep_segments={}",
-          endpoint,
-          region_name,
-          bucket,
-          filter_ip,
-          filter_port,
-          interface,
-          timeout,
-          output_dir,
-          remove_local,
-          manual_segment,
-          inject_pat_pmt,
-          hls_keep_segments
-      );
+        "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
+          interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+          inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
+        endpoint,
+        region_name,
+        bucket,
+        filter_ip,
+        filter_port,
+        interface,
+        timeout,
+        output_dir,
+        remove_local,
+        manual_segment,
+        inject_pat_pmt,
+        hls_keep_segments,
+        generate_unsigned_urls
+    );
 
     fs::create_dir_all(output_dir)?;
 
@@ -773,7 +777,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_bucket_exists(&s3_client, bucket).await?;
 
-    let hourly_index_creator = HourlyIndexCreator::new(s3_client.clone(), bucket.to_string());
+    let hourly_index_creator = HourlyIndexCreator::new(
+        s3_client.clone(),
+        bucket.to_string(),
+        generate_unsigned_urls,
+    );
 
     info!("Starting directory watcher on: {}", output_dir);
     let (watch_tx, watch_rx) = channel();
@@ -790,7 +798,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let m3u8_output = "index.m3u8".to_string();
 
         info!("Starting FFmpeg with output: {}", m3u8_output);
-
         let mut child = Command::new("ffmpeg")
             .arg("-i")
             .arg("pipe:0")
@@ -836,12 +843,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let table_cache = Arc::new(Mutex::new(MpegTsTableCache::default()));
-
     let s3_client_clone = s3_client.clone();
     let bucket_clone = bucket.clone();
     let output_dir_clone = output_dir.clone();
-    let output_dir: String = matches.get_one::<String>("output_dir").unwrap().to_string();
-    let output_dir_for_task = output_dir.clone(); // Clone again for the task
+    let output_dir_for_task = output_dir.clone();
 
     let upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
@@ -856,7 +861,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         {
             error!("File event handler error: {}", e);
-            // TODO: need to handle errors if constantly failing
         }
     });
 
@@ -882,10 +886,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut manual_segmenter = if manual_segment {
-        let seg = ManualSegmenter::new(&output_dir)
-            .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt)
-            .with_max_segments(hls_keep_segments);
-        Some(seg)
+        Some(
+            ManualSegmenter::new(output_dir)
+                .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt)
+                .with_max_segments(hls_keep_segments),
+        )
     } else {
         None
     };
@@ -958,7 +963,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     drop(manual_segmenter);
-
     let _ = upload_task.await?;
     let _ = watch_thread.join();
 
@@ -1000,7 +1004,7 @@ async fn handle_file_events(
     remove_local: bool,
     mut hourly_index_creator: HourlyIndexCreator,
     output_dir: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds())));
 
     while let Ok(event) = rx.recv() {
@@ -1018,11 +1022,9 @@ async fn handle_file_events(
                             };
 
                             if should_upload {
-                                // Give the file a moment to finish writing
                                 sleep(Duration::from_millis(300)).await;
 
-                                // -------------- [A] Figure out the relative key --------------
-                                //    e.g. "ts/2025/01/16/00/segment_20250116-003050__0022.ts"
+                                // Derive the relative key
                                 let relative_path = match strip_base_dir(&path, &base_dir) {
                                     Ok(rp) => rp,
                                     Err(e) => {
@@ -1035,14 +1037,12 @@ async fn handle_file_events(
                                 };
                                 let key_str = relative_path.to_string_lossy().to_string();
 
-                                // -------------- [B] Extract "hour_dir" from that relative path --------------
-                                //    e.g. hour_dir = "ts/2025/01/16/00"
+                                // hour_dir = parent folder(s)
                                 let hour_dir = relative_path
                                     .parent()
                                     .map(|p| p.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "".to_string());
 
-                                // -------------- [C] Upload to S3 using the same key_str --------------
                                 if let Ok(()) = upload_file_to_s3(
                                     &s3_client,
                                     &bucket,
@@ -1053,22 +1053,21 @@ async fn handle_file_events(
                                 .await
                                 {
                                     let mut tracker = tracker_clone.lock().unwrap();
-                                    tracker.mark_uploaded(full_path_str);
+                                    tracker.mark_uploaded(full_path_str.clone());
                                 }
 
-                                // -------------- [D] Add a date-time tag, then record in the index --------------
+                                // Add #EXT-X-PROGRAM-DATE-TIME
                                 let current_time = Utc::now().to_rfc3339();
                                 let custom_lines =
                                     vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
 
-                                // The call to record_segment() must use the real S3 key and that hour_dir
                                 hourly_index_creator
                                     .record_segment(
-                                        &hour_dir, // e.g. "ts/2025/01/16/00"
-                                        &key_str,  // e.g. "ts/2025/01/16/00/segment_2025..."
+                                        &hour_dir,
+                                        &key_str,
                                         get_segment_duration_seconds() as f64,
                                         custom_lines,
-                                        &output_dir, // local HLS folder
+                                        &output_dir,
                                     )
                                     .await?;
                             } else {
@@ -1091,7 +1090,7 @@ async fn upload_file_to_s3(
     base_dir: &str,
     path: &Path,
     remove_local: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let relative_path = strip_base_dir(path, base_dir)?;
     let key_str = relative_path.to_string_lossy().to_string();
 
@@ -1140,7 +1139,7 @@ async fn upload_file_to_s3(
 fn strip_base_dir<'a>(
     full_path: &'a Path,
     base_dir: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let base = Path::new(base_dir).canonicalize()?;
     let full = full_path.canonicalize()?;
     let relative = full.strip_prefix(base)?;
@@ -1183,7 +1182,6 @@ fn extract_mpegts_payload<'a>(
         "{}.{}.{}.{}",
         ip_dst_addr[0], ip_dst_addr[1], ip_dst_addr[2], ip_dst_addr[3]
     );
-
     let udp_dst_port =
         u16::from_be_bytes([data[udp_header_offset + 2], data[udp_header_offset + 3]]);
     let udp_length =
@@ -1232,7 +1230,6 @@ fn extract_mpegts_payload<'a>(
 
     let num_packets = ts_payload.len() / 188;
     let aligned_len = num_packets * 188;
-
     for i in 0..num_packets {
         if ts_payload[i * 188] != 0x47 {
             warn!("Misaligned TS packet found at offset {}", i * 188);
