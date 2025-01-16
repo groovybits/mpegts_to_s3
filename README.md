@@ -23,7 +23,7 @@ mkdir hls && cd hls
 # as ts/year/month/day/hour/segment_YYYYMMDD-HHMMSS__0000.ts 10 second segments
 SEGMENT_DURATION_SECONDS=10 \
   ../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
-    -o ts -n net1 --manual_segment
+    -o ts -n net1 --manual_segment --hls_keep_segments 3
 
 # From another computer playback
 mpv -i http://192.168.130.93:3001/index.m3u8 
