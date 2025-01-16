@@ -11,5 +11,8 @@ podman run -p 127.0.0.1:9000:9000 -p 127.0.0.1:9001:9001 \
     --name s3minio \
     -e "MINIO_ROOT_USER=minioadmin" \
     -e "MINIO_ROOT_PASSWORD=minioadmin" \
+    -e "MINIO_DOMAIN=localhost" \
+    -e "MINIO_SERVER_URL=http://127.0.0.1:9000" \
+    -e "MINIO_BROWSER_REDIRECT_URL=http://127.0.0.1:9001" \
     -v $(pwd)/data:/data \
     quay.io/minio/minio server /data --console-address ":9001" --anonymous
