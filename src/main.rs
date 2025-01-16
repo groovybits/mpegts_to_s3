@@ -162,17 +162,14 @@ impl HourlyIndexCreator {
         hour_dir: &str,
         output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Build local output paths
         let local_dir = std::path::Path::new(output_dir).join(hour_dir);
         let index_path = local_dir.join("hourly_index.m3u8");
         let temp_path = local_dir.join("hourly_index_temp.m3u8");
 
         std::fs::create_dir_all(&local_dir)?;
 
-        // Grab all entries for this hour
         let entries = self.hour_map.get(hour_dir);
 
-        // Write the new .m3u8 to a temporary file
         {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -180,11 +177,9 @@ impl HourlyIndexCreator {
                 .truncate(true)
                 .open(&temp_path)?;
 
-            // Standard HLS boilerplate
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
 
-            // Per HLS spec, #EXT-X-TARGETDURATION should be >= the ceiling of any segment's duration.
             let target_duration = if let Some(vec) = entries {
                 let max_seg = vec
                     .iter()
@@ -197,7 +192,6 @@ impl HourlyIndexCreator {
             };
             writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration)?;
 
-            // If we have entries, compute the lowest sequence_id
             let media_seq = if let Some(vec) = entries {
                 vec.iter().map(|e| e.sequence_id).min().unwrap_or(0)
             } else {
@@ -205,7 +199,6 @@ impl HourlyIndexCreator {
             };
             writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", media_seq)?;
 
-            // Then write each segment in ascending sequence_id order
             if let Some(vec) = entries {
                 let mut sorted = vec.clone();
                 sorted.sort_by_key(|e| e.sequence_id);
@@ -213,25 +206,21 @@ impl HourlyIndexCreator {
                     for line in &entry.custom_lines {
                         writeln!(file, "{}", line)?;
                     }
-                    // Use a decimal with enough precision for Apple HLS
                     writeln!(file, "#EXTINF:{:.6},", entry.duration)?;
                     writeln!(file, "{}", entry.signed_url)?;
                 }
             }
         }
 
-        // Atomic rename to the final "hourly_index.m3u8"
         std::fs::rename(&temp_path, &index_path)?;
 
-        // Upload the new index to S3, specifying correct MIME type
         self.upload_local_file_to_s3(
             &index_path,
             &format!("{}/hourly_index.m3u8", hour_dir),
-            "application/vnd.apple.mpegurl", // correct MIME for HLS playlist
+            "application/vnd.apple.mpegurl",
         )
         .await?;
 
-        // Update local `urls.log` (also do temp-then-rename)
         let final_index_url = self
             .presign_get_url(&format!("{}/hourly_index.m3u8", hour_dir))
             .await?;
@@ -240,7 +229,6 @@ impl HourlyIndexCreator {
         Ok(())
     }
 
-    /// Rewrites `urls.log` in the local output dir with the new line appended
     fn rewrite_urls_log(
         &mut self,
         hour_dir: &str,
@@ -250,7 +238,6 @@ impl HourlyIndexCreator {
         let log_path = std::path::Path::new(output_dir).join("urls.log");
         let temp_path = std::path::Path::new(output_dir).join("urls_temp.log");
 
-        // Read in old lines except the old line for this hour
         let mut lines = vec![];
         if log_path.exists() {
             let old_data = std::fs::read_to_string(&log_path)?;
@@ -261,10 +248,8 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Insert the new line for this hour
         lines.push(format!("Hour {} => {}", hour_dir, final_url));
 
-        // Write out to temp
         {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
@@ -276,22 +261,17 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Atomic rename
         std::fs::rename(&temp_path, &log_path)?;
-
         Ok(())
     }
 
-    /// Generate either a signed or an unsigned URL
     async fn generate_url(
         &self,
         object_key: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if self.generate_unsigned_urls {
-            // Build the final URL from the CLI’s endpoint + bucket + object_key
             Ok(format!("{}/{}/{}", self.endpoint, self.bucket, object_key))
         } else {
-            // Signed URL logic
             let config =
                 PresigningConfig::expires_in(Duration::from_secs(get_url_signing_seconds()))?;
             let presigned_req = self
@@ -305,7 +285,6 @@ impl HourlyIndexCreator {
         }
     }
 
-    /// For rewriting `urls.log`, we also presign the `.m3u8` object if signing is enabled
     async fn presign_get_url(
         &self,
         object_key: &str,
@@ -313,7 +292,6 @@ impl HourlyIndexCreator {
         self.generate_url(object_key).await
     }
 
-    /// Upload a local file to S3 (with provided mime-type)
     async fn upload_local_file_to_s3(
         &self,
         local_path: &std::path::Path,
@@ -324,14 +302,12 @@ impl HourlyIndexCreator {
             "Uploading hourly index -> s3://{}/{} (content_type={})",
             self.bucket, object_key, content_type
         );
-
         let body_bytes = aws_sdk_s3::primitives::ByteStream::from_path(local_path).await?;
         self.s3_client
             .put_object()
             .bucket(&self.bucket)
             .key(object_key)
             .body(body_bytes)
-            // Tells clients not to cache the .m3u8
             .cache_control("no-cache, no-store, must-revalidate")
             .content_type(content_type)
             .send()
@@ -363,7 +339,6 @@ pub fn join_multicast_on_iface(
     Ok(sock)
 }
 
-/// Finds the first IPv4 address of `interface_name`
 fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
     let ifaces = get_if_addrs()?;
     for iface in ifaces {
@@ -521,12 +496,17 @@ impl MpegTsTableCache {
 }
 
 // -------------------------------------------------------------
-// PCRTracker: We'll close segments purely based on PCR
+// PCRTracker with Pre/Post offset compensation
 // -------------------------------------------------------------
 #[derive(Default)]
 struct PcrTracker {
     earliest_pcr: Option<f64>,
     latest_pcr: Option<f64>,
+
+    // --- ADDED FIELDS: track packet indices
+    pcr_first_idx: Option<usize>,
+    pcr_last_idx: Option<usize>,
+    total_packets: usize, // how many packets we've written so far
 }
 
 impl PcrTracker {
@@ -535,6 +515,8 @@ impl PcrTracker {
             return;
         }
         let adaptation_control = (pkt[3] >> 4) & 0b11;
+        self.total_packets += 1; // count *every* TS packet
+
         if adaptation_control == 0b10 || adaptation_control == 0b11 {
             let adaptation_len = pkt[4] as usize;
             if adaptation_len > 0 && adaptation_len <= 183 {
@@ -544,30 +526,62 @@ impl PcrTracker {
                     if let Some(pcr_value) = parse_pcr(&pkt[6..12]) {
                         if self.earliest_pcr.is_none() {
                             self.earliest_pcr = Some(pcr_value);
+                            self.pcr_first_idx = Some(self.total_packets - 1);
                         }
                         self.latest_pcr = Some(pcr_value);
+                        self.pcr_last_idx = Some(self.total_packets - 1);
                     }
                 }
             }
         }
     }
 
-    fn duration_seconds(&self) -> f64 {
-        match (self.earliest_pcr, self.latest_pcr) {
-            (Some(start), Some(end)) if end > start => end - start,
+    fn compensated_duration(&self) -> f64 {
+        let raw = match (self.earliest_pcr, self.latest_pcr) {
+            (Some(s), Some(e)) if e > s => e - s,
             _ => 0.0,
+        };
+        if raw <= 0.0 {
+            return 0.0;
         }
+
+        let first_idx = self.pcr_first_idx.unwrap_or(0);
+        let last_idx = self.pcr_last_idx.unwrap_or(0);
+
+        if last_idx <= first_idx {
+            return raw; // no real offset
+        }
+
+        // average time per packet
+        let packet_count_in_pcr_range = (last_idx - first_idx) as f64;
+        if packet_count_in_pcr_range < 1.0 {
+            return raw;
+        }
+        let time_per_pkt = raw / packet_count_in_pcr_range;
+
+        // how many packets are before earliest PCR?
+        let packets_before = first_idx as f64;
+        // how many packets are after latest PCR?
+        let packets_after = (self.total_packets.saturating_sub(last_idx + 1)) as f64;
+
+        // compute the offsets
+        let pre_offset = packets_before * time_per_pkt;
+        let post_offset = packets_after * time_per_pkt;
+
+        let final_duration = raw + pre_offset + post_offset;
+        final_duration
     }
 
-    /// Clears PCR data for the next segment
     fn reset(&mut self) {
         self.earliest_pcr = None;
         self.latest_pcr = None;
+        self.pcr_first_idx = None;
+        self.pcr_last_idx = None;
+        self.total_packets = 0;
     }
 }
 
-/// Parse 6 bytes of PCR into a floating-point number of seconds.
-///  - 33-bit PCR base (90kHz), plus a 9-bit extension (27MHz).
+/// Parse 6 bytes of PCR into a floating-point number of seconds (90kHz base + 27MHz extension)
 fn parse_pcr(data: &[u8]) -> Option<f64> {
     if data.len() < 6 {
         return None;
@@ -584,7 +598,7 @@ fn parse_pcr(data: &[u8]) -> Option<f64> {
 }
 
 // ------------- MANUAL SEGMENTER -------------
-// --- CHANGED FOR PCR-BASED: remove real-time checks, rely on PCR
+// Now we use `pcr_tracker.compensated_duration()` to get a more accurate #EXTINF
 
 struct PlaylistEntry {
     duration: f64,
@@ -604,7 +618,7 @@ struct ManualSegmenter {
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
 
-    pcr_tracker: PcrTracker, // purely used for durations & deciding when to cut
+    pcr_tracker: PcrTracker,
 }
 
 impl ManualSegmenter {
@@ -658,10 +672,14 @@ impl ManualSegmenter {
             self.pcr_tracker.handle_ts_packet(pkt);
         }
 
-        // Check if the PCR-based duration has reached our target
+        // Check if the *raw* PCR-based duration >= target
         let segment_duration_target = get_segment_duration_seconds() as f64;
-        let current_pcr_duration = self.pcr_tracker.duration_seconds();
-        if current_pcr_duration >= segment_duration_target {
+        let raw_pcr_duration = match (self.pcr_tracker.earliest_pcr, self.pcr_tracker.latest_pcr) {
+            (Some(s), Some(e)) => e - s,
+            _ => 0.0,
+        };
+
+        if raw_pcr_duration >= segment_duration_target {
             // Time to close this segment and start a new one
             self.close_current_segment_file()?;
             self.open_new_segment_file()?;
@@ -675,10 +693,9 @@ impl ManualSegmenter {
             writer.flush()?;
             drop(writer);
 
-            // The real PCR-based duration
-            let actual_duration = self.pcr_tracker.duration_seconds();
+            // --- MODIFIED: Use "compensated_duration()"
+            let actual_duration = self.pcr_tracker.compensated_duration();
 
-            // Build the segment path
             let segment_path = self.current_segment_path(self.segment_index + 1);
 
             self.playlist_entries.push(PlaylistEntry {
@@ -686,7 +703,7 @@ impl ManualSegmenter {
                 path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
             });
 
-            // Implement rolling segment deletion if desired
+            // Rolling segment deletion if needed
             if self.max_segments_in_index > 0
                 && self.playlist_entries.len() > self.max_segments_in_index
             {
@@ -742,7 +759,6 @@ impl ManualSegmenter {
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        // We'll start with a target duration from env + 1, but we will refine on rewrite
         writeln!(
             f,
             "#EXT-X-TARGETDURATION:{}",
@@ -762,7 +778,6 @@ impl ManualSegmenter {
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
 
-        // Recompute the largest segment duration so far
         let max_seg = self
             .playlist_entries
             .iter()
