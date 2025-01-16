@@ -46,19 +46,34 @@ PCAP capture -> HLS -> Directory Watch -> S3 Upload
 Usage: mpegts_to_s3 [OPTIONS]
 
 Options:
-  -e, --endpoint <endpoint>      S3-compatible endpoint [default: http://127.0.0.1:9000]
-  -r, --region <region>          S3 region [default: us-west-2]
-  -b, --bucket <bucket>          S3 bucket name [default: ltnhls]
-  -i, --udp_ip <udp_ip>          UDP multicast IP to filter [default: 227.1.1.102]
-  -p, --udp_port <udp_port>      UDP port to filter [default: 4102]
-  -n, --interface <interface>    Network interface for pcap [default: net1]
-  -t, --timeout <timeout>        Capture timeout in milliseconds [default: 1000]
-  -o, --output_dir <output_dir>  Local dir for HLS output (could be a RAM disk) [default: hls]
-      --remove_local             Remove local .ts/.m3u8 after uploading to S3?
-      --manual_segment           Perform manual TS segmentation + .m3u8 generation (no FFmpeg).
-      --inject_pat_pmt           If using manual segmentation, prepend the latest PAT & PMT to each segment.
-  -h, --help                     Print help
-  -V, --version                  Print version
+  -e, --endpoint <endpoint>
+          S3-compatible endpoint [default: http://127.0.0.1:9000]
+  -r, --region <region>
+          S3 region [default: us-west-2]
+  -b, --bucket <bucket>
+          S3 bucket name [default: ltnhls]
+  -i, --udp_ip <udp_ip>
+          UDP multicast IP to filter [default: 227.1.1.102]
+  -p, --udp_port <udp_port>
+          UDP port to filter [default: 4102]
+  -n, --interface <interface>
+          Network interface for pcap [default: net1]
+  -t, --timeout <timeout>
+          Capture timeout in milliseconds [default: 1000]
+  -o, --output_dir <output_dir>
+          Local dir for HLS output (could be a RAM disk) [default: hls]
+      --remove_local
+          Remove local .ts/.m3u8 after uploading to S3?
+      --manual_segment
+          Perform manual TS segmentation + .m3u8 generation (no FFmpeg).
+      --inject_pat_pmt
+          If using manual segmentation, prepend the latest PAT & PMT to each segment.
+      --hls_keep_segments <hls_keep_segments>
+          Limit how many segments to keep in the index.m3u8 (0=unlimited). Also removes old .ts from disk. [default: 0]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 - Monitor uploads in MinIO's web interface or your S3-compatible client.
