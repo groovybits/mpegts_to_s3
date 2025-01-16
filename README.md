@@ -4,13 +4,13 @@ This Rust application enables capturing of MPEG-TS UDP multicast streams, segmen
 
 ```mermaid
 graph LR
-    A["UDP Multicast Stream"] -->|"Captured via libpcap"| B["Capture Module"]
-    B -->|"MPEG-TS Packets"| C["Segmentation Process"]
+    A["UDP<br/>Multicast<br/>Stream"] -->|"Captured via libpcap"| B["Capture<br/>Module"]
+    B -->|"MPEG-TS"| C["Segmentation<br/>Process"]
     C -->|"FFmpeg"| D["HLS Segments<br/>and Playlist"]
     C -->|"Manual"| D
-    D -->|"Directory<br/>Watcher"| E["Upload to<br/>S3/MinIO"]
-    E -->|"Signed/Unsigned URLs"| F["HLS Playback"]
-    E -->|"Logs URLs"| G["Segment Logs<br/>urls.log"]
+    D -->|"Watch"| E["S3/MinIO<br/>Upload"]
+    E -->|"URLs"| F["HLS<br/>Playback"]
+    E -->|"Log"| G["URL<br/>Logs"]
 
     style A fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
     style B fill:#b3ffb3,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
