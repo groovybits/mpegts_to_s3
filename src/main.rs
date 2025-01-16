@@ -15,14 +15,17 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
+use get_if_addrs::get_if_addrs;
 use log::{debug, info, warn};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
 };
 use pcap::Capture;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufWriter, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
@@ -30,9 +33,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::sleep;
-use get_if_addrs::get_if_addrs;
-use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
@@ -153,78 +153,55 @@ impl MpegTsTableCache {
     /// TODO: FIXME should handle multiple TS packets for the PAT section,
     /// CRC checks, multi-program scenarios, etc.
     fn update_pat(&mut self, pkt: &[u8]) {
-        // Must be exactly one TS packet of 188 bytes
         if pkt.len() != 188 {
             return;
         }
-
-        // Keep a copy of the raw packet
         let mut arr = [0u8; 188];
         arr.copy_from_slice(pkt);
         self.latest_pat = Some(arr);
 
-        // --- 1) Parse TS header (first 4 bytes) ---
         let transport_error_indicator = (pkt[1] & 0x80) != 0;
         if transport_error_indicator {
-            // If error bit is set, ignore
             return;
         }
         let adaptation_control = (pkt[3] >> 4) & 0x3;
-        // b11 means “adaptation + payload”, b01 means “payload only”
-
-        let mut payload_offset = 4; // after TS header
-
-        // --- 2) If there's an adaptation field, skip it ---
+        let mut payload_offset = 4;
         if adaptation_control == 0b10 || adaptation_control == 0b11 {
             let adaptation_length = pkt[payload_offset] as usize;
-            payload_offset += 1; // skip length byte
+            payload_offset += 1;
             if payload_offset + adaptation_length > 188 {
-                // corrupt
                 return;
             }
             payload_offset += adaptation_length;
         }
-
-        // If there's no payload, we can't parse further
         if payload_offset >= 188 {
             return;
         }
-
-        // --- 3) Pointer field (1 byte) ---
         let pointer_field = pkt[payload_offset] as usize;
         payload_offset += 1;
         if payload_offset + pointer_field >= 188 {
-            // corrupt or incomplete
             return;
         }
         payload_offset += pointer_field;
 
         if payload_offset + 8 > 188 {
-            // at least 8 bytes needed for a minimal section header
             return;
         }
 
-        // --- 4) Now we should be at the start of the PAT section ---
         let table_id = pkt[payload_offset];
         if table_id != 0x00 {
-            // 0x00 = PAT
             return;
         }
-
         let section_length =
             u16::from_be_bytes([pkt[payload_offset + 1] & 0x0F, pkt[payload_offset + 2]]);
-
-        // safety check
         if (section_length as usize) > 1021 {
             return;
         }
-
         // Program loop
         let _transport_stream_id =
             u16::from_be_bytes([pkt[payload_offset + 3], pkt[payload_offset + 4]]);
         let _version_number = (pkt[payload_offset + 5] & 0x3E) >> 1; // prefix with underscore to avoid warnings
         let mut program_info_offset = payload_offset + 8;
-
         let pat_section_end = payload_offset + 3 + (section_length as usize);
         while program_info_offset + 4 <= pat_section_end.saturating_sub(4) {
             let program_number =
@@ -232,7 +209,6 @@ impl MpegTsTableCache {
             let pid_hi = pkt[program_info_offset + 2] & 0x1F;
             let pid_lo = pkt[program_info_offset + 3];
             let pmt_pid = ((pid_hi as u16) << 8) | (pid_lo as u16);
-
             if program_number != 0 {
                 self.pmt_pid = Some(pmt_pid);
                 break;
@@ -241,7 +217,6 @@ impl MpegTsTableCache {
         }
     }
 
-    /// Store the entire 188-byte PMT packet in `latest_pmt`.
     fn update_pmt(&mut self, pkt: &[u8]) {
         if pkt.len() == 188 {
             let mut arr = [0u8; 188];
@@ -250,7 +225,6 @@ impl MpegTsTableCache {
         }
     }
 
-    /// Write PAT + PMT if we have them
     fn write_tables<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         if let Some(ref pat) = self.latest_pat {
             writer.write_all(pat)?;
@@ -264,6 +238,12 @@ impl MpegTsTableCache {
 
 // ------------- MANUAL SEGMENTER -------------
 
+// Store the last N segment references in memory so we can remove old ones.
+struct PlaylistEntry {
+    duration: f64,
+    path: String,
+}
+
 struct ManualSegmenter {
     output_dir: String,
     current_ts_file: Option<BufWriter<fs::File>>,
@@ -272,9 +252,12 @@ struct ManualSegmenter {
     playlist_path: PathBuf,
     m3u8_initialized: bool,
 
-    // optional reference to table cache (only used if user wants to inject PAT/PMT)
     pat_pmt_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
     inject_pat_pmt: bool,
+
+    // Maximum segments to keep in the .m3u8 (0=unlimited)
+    max_segments_in_index: usize,         // from CLI
+    playlist_entries: Vec<PlaylistEntry>, // keep track of existing entries
 }
 
 impl ManualSegmenter {
@@ -290,10 +273,18 @@ impl ManualSegmenter {
 
             pat_pmt_cache: None,
             inject_pat_pmt: false,
+
+            max_segments_in_index: 0,
+            playlist_entries: Vec::new(),
         }
     }
 
-    /// For convenience, set the optional table cache + boolean
+    // Set max_segments_in_index
+    fn with_max_segments(mut self, max_segments: usize) -> Self {
+        self.max_segments_in_index = max_segments;
+        self
+    }
+
     fn with_pat_pmt(
         mut self,
         table_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
@@ -304,7 +295,6 @@ impl ManualSegmenter {
         self
     }
 
-    /// Write TS data to the “current segment,” rotating if necessary.
     fn write_ts(&mut self, data: &[u8]) -> std::io::Result<()> {
         if self.current_ts_file.is_none() {
             self.open_new_segment_file()?;
@@ -312,7 +302,7 @@ impl ManualSegmenter {
 
         let elapsed = self.current_segment_start.elapsed().as_secs_f64();
         let segment_duration = get_segment_duration_seconds() as f64;
-        if elapsed >= segment_duration as f64 {
+        if elapsed >= segment_duration {
             self.close_current_segment_file()?;
             self.open_new_segment_file()?;
         }
@@ -323,20 +313,39 @@ impl ManualSegmenter {
         Ok(())
     }
 
-    /// Close the current .ts file, finalize it, and update the .m3u8
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         if self.current_ts_file.is_some() {
             let duration = get_segment_duration_seconds() as f64;
             let segment_path = self.current_segment_path(self.segment_index + 1);
-            self.current_ts_file.take(); // drop the writer
+            self.current_ts_file.take();
 
-            self.append_m3u8_entry(&segment_path, duration)?;
+            // Track in self.playlist_entries so we can manage old ones
+            self.playlist_entries.push(PlaylistEntry {
+                duration,
+                path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
+            });
+
+            // Now we can remove older entries if max_segments_in_index != 0
+            if self.max_segments_in_index > 0
+                && self.playlist_entries.len() > self.max_segments_in_index
+            {
+                // remove the oldest one from memory
+                let removed = self.playlist_entries.remove(0);
+
+                // Also remove from disk
+                let old_path = Path::new(&removed.path);
+                if old_path.exists() {
+                    let _ = fs::remove_file(old_path);
+                }
+            }
+
             self.segment_index += 1;
+            // Re-write the entire .m3u8
+            self.rewrite_m3u8()?;
         }
         Ok(())
     }
 
-    /// Open a new .ts file for writing + update tracking fields
     fn open_new_segment_file(&mut self) -> std::io::Result<()> {
         self.current_segment_start = Instant::now();
         let segment_path = self.current_segment_path(self.segment_index);
@@ -349,7 +358,6 @@ impl ManualSegmenter {
         let file = fs::File::create(&full_path)?;
         let mut writer = BufWriter::new(file);
 
-        // If the user wants to inject PAT/PMT, do so now
         if self.inject_pat_pmt {
             if let Some(cache) = &self.pat_pmt_cache {
                 let cache = cache.lock().unwrap();
@@ -366,7 +374,6 @@ impl ManualSegmenter {
         Ok(())
     }
 
-    /// Write the standard HLS preamble if not yet written
     fn init_m3u8(&self) -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new()
             .create(true)
@@ -375,7 +382,6 @@ impl ManualSegmenter {
             .open(&self.playlist_path)?;
 
         let segment_duration = get_segment_duration_seconds();
-
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
         writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
@@ -383,15 +389,28 @@ impl ManualSegmenter {
         Ok(())
     }
 
-    /// Append an #EXTINF line + segment URI to the .m3u8
-    fn append_m3u8_entry(&self, segment_path: &Path, duration: f64) -> std::io::Result<()> {
+    // Re-write the entire .m3u8 with the current set of segments
+    fn rewrite_m3u8(&self) -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .append(true)
+            .truncate(true)
             .open(&self.playlist_path)?;
-        writeln!(f, "#EXTINF:{:.6},", duration)?;
-        writeln!(f, "{}/{}", self.output_dir, segment_path.to_string_lossy())?;
+
+        let segment_duration = get_segment_duration_seconds();
+        writeln!(f, "#EXTM3U")?;
+        writeln!(f, "#EXT-X-VERSION:3")?;
+        writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
+        // The media sequence can be the current segment minus how many we have in the list
+        let seq_start = self
+            .segment_index
+            .saturating_sub(self.playlist_entries.len() as u64);
+        writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
+
+        for entry in &self.playlist_entries {
+            writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
+            writeln!(f, "{}", entry.path)?;
+        }
         Ok(())
     }
 
@@ -422,83 +441,89 @@ impl Drop for ManualSegmenter {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = ClapCommand::new("mpegts_to_s3")
-        .version("1.0")
-        .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
-        .arg(
-            Arg::new("endpoint")
-                .short('e')
-                .long("endpoint")
-                .default_value("http://127.0.0.1:9000")
-                .help("S3-compatible endpoint"),
-        )
-        .arg(
-            Arg::new("region")
-                .short('r')
-                .long("region")
-                .default_value("us-west-2")
-                .help("S3 region"),
-        )
-        .arg(
-            Arg::new("bucket")
-                .short('b')
-                .long("bucket")
-                .default_value("ltnhls")
-                .help("S3 bucket name"),
-        )
-        .arg(
-            Arg::new("udp_ip")
-                .short('i')
-                .long("udp_ip")
-                .default_value("227.1.1.102")
-                .help("UDP multicast IP to filter"),
-        )
-        .arg(
-            Arg::new("udp_port")
-                .short('p')
-                .long("udp_port")
-                .default_value("4102")
-                .help("UDP port to filter"),
-        )
-        .arg(
-            Arg::new("interface")
-                .short('n')
-                .long("interface")
-                .default_value("net1")
-                .help("Network interface for pcap"),
-        )
-        .arg(
-            Arg::new("timeout")
-                .short('t')
-                .long("timeout")
-                .default_value("1000")
-                .help("Capture timeout in milliseconds"),
-        )
-        .arg(
-            Arg::new("output_dir")
-                .short('o')
-                .long("output_dir")
-                .default_value("hls")
-                .help("Local dir for HLS output (could be a RAM disk)"),
-        )
-        .arg(
-            Arg::new("remove_local")
-                .long("remove_local")
-                .help("Remove local .ts/.m3u8 after uploading to S3?")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("manual_segment")
-                .long("manual_segment")
-                .help("Perform manual TS segmentation + .m3u8 generation (no FFmpeg).")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("inject_pat_pmt")
-                .long("inject_pat_pmt")
-                .help("If using manual segmentation, prepend the latest PAT & PMT to each segment.")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .get_matches();
+         .version("1.0")
+         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
+         .arg(
+             Arg::new("endpoint")
+                 .short('e')
+                 .long("endpoint")
+                 .default_value("http://127.0.0.1:9000")
+                 .help("S3-compatible endpoint"),
+         )
+         .arg(
+             Arg::new("region")
+                 .short('r')
+                 .long("region")
+                 .default_value("us-west-2")
+                 .help("S3 region"),
+         )
+         .arg(
+             Arg::new("bucket")
+                 .short('b')
+                 .long("bucket")
+                 .default_value("ltnhls")
+                 .help("S3 bucket name"),
+         )
+         .arg(
+             Arg::new("udp_ip")
+                 .short('i')
+                 .long("udp_ip")
+                 .default_value("227.1.1.102")
+                 .help("UDP multicast IP to filter"),
+         )
+         .arg(
+             Arg::new("udp_port")
+                 .short('p')
+                 .long("udp_port")
+                 .default_value("4102")
+                 .help("UDP port to filter"),
+         )
+         .arg(
+             Arg::new("interface")
+                 .short('n')
+                 .long("interface")
+                 .default_value("net1")
+                 .help("Network interface for pcap"),
+         )
+         .arg(
+             Arg::new("timeout")
+                 .short('t')
+                 .long("timeout")
+                 .default_value("1000")
+                 .help("Capture timeout in milliseconds"),
+         )
+         .arg(
+             Arg::new("output_dir")
+                 .short('o')
+                 .long("output_dir")
+                 .default_value("hls")
+                 .help("Local dir for HLS output (could be a RAM disk)"),
+         )
+         .arg(
+             Arg::new("remove_local")
+                 .long("remove_local")
+                 .help("Remove local .ts/.m3u8 after uploading to S3?")
+                 .action(clap::ArgAction::SetTrue),
+         )
+         .arg(
+             Arg::new("manual_segment")
+                 .long("manual_segment")
+                 .help("Perform manual TS segmentation + .m3u8 generation (no FFmpeg).")
+                 .action(clap::ArgAction::SetTrue),
+         )
+         .arg(
+             Arg::new("inject_pat_pmt")
+                 .long("inject_pat_pmt")
+                 .help("If using manual segmentation, prepend the latest PAT & PMT to each segment.")
+                 .action(clap::ArgAction::SetTrue),
+         )
+         .arg(
+             Arg::new("hls_keep_segments")
+                 .long("hls_keep_segments")
+                 .help("Limit how many segments to keep in the index.m3u8 (0=unlimited). Also removes old .ts from disk.")
+                 .default_value("0")
+         )
+         .get_matches();
 
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
     let region_name = matches.get_one::<String>("region").unwrap();
@@ -512,21 +537,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manual_segment = matches.get_flag("manual_segment");
     let inject_pat_pmt = matches.get_flag("inject_pat_pmt");
 
+    let hls_keep_segments: usize = matches
+        .get_one::<String>("hls_keep_segments")
+        .unwrap()
+        .parse()
+        .unwrap_or(0);
+
     info!(
-         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-          interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, inject_pat_pmt={}",
-         endpoint,
-         region_name,
-         bucket,
-         filter_ip,
-         filter_port,
-         interface,
-         timeout,
-         output_dir,
-         remove_local,
-         manual_segment,
-         inject_pat_pmt
-     );
+          "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
+           interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, inject_pat_pmt={}, hls_keep_segments={}",
+          endpoint,
+          region_name,
+          bucket,
+          filter_ip,
+          filter_port,
+          interface,
+          timeout,
+          output_dir,
+          remove_local,
+          manual_segment,
+          inject_pat_pmt,
+          hls_keep_segments
+      );
 
     fs::create_dir_all(output_dir)?;
 
@@ -557,7 +589,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let (mut ffmpeg_child, mut ffmpeg_stdin_buf) = if !manual_segment {
-        // FFmpeg-based HLS
         let hls_segment_filename =
             format!("{}/%Y/%m/%d/%H/segment_%Y%m%d-%H%M%S_%04d.ts", output_dir);
         let m3u8_output = "index.m3u8".to_string();
@@ -608,7 +639,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None)
     };
 
-    // Create MpegTsTableCache if we might use it
     let table_cache = Arc::new(Mutex::new(MpegTsTableCache::default()));
 
     let s3_client_clone = s3_client.clone();
@@ -625,9 +655,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     });
 
-    // Join multicast group on the specified interface
     if let Ok(_sock) = join_multicast_on_iface(filter_ip, filter_port, interface) {
-        // Keep the socket in scope.
     } else {
         eprintln!("Failed to join multicast group or find interface IP!");
     }
@@ -650,7 +678,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut manual_segmenter = if manual_segment {
         let seg = ManualSegmenter::new(output_dir)
-            .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt);
+            .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt)
+            .with_max_segments(hls_keep_segments);
         Some(seg)
     } else {
         None
@@ -936,7 +965,7 @@ fn extract_mpegts_payload<'a>(
     } else {
         warn!(
             "Unknown payload type found at offset {} of type 0x{:02x}, size {}",
-            udp_payload_offset,
+            udp_header_offset,
             payload[0],
             payload.len()
         );
