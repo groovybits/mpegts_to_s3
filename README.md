@@ -2,6 +2,25 @@
 
 This Rust application enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback.
 
+```mermaid
+graph LR
+    A["UDP Multicast Stream"] -->|"Captured via libpcap"| B["Capture Module"]
+    B -->|"MPEG-TS Packets"| C["Segmentation Process"]
+    C -->|"FFmpeg"| D["HLS Segments<br/>and Playlist"]
+    C -->|"Manual"| D
+    D -->|"Directory<br/>Watcher"| E["Upload to<br/>S3/MinIO"]
+    E -->|"Signed/Unsigned URLs"| F["HLS Playback"]
+    E -->|"Logs URLs"| G["Segment Logs<br/>urls.log"]
+
+    style A fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
+    style B fill:#b3ffb3,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
+    style C fill:#ffb3ff,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
+    style D fill:#ffcc80,stroke:#995200,stroke-width:2px,color:#663300,font-weight:bold
+    style E fill:#ff99cc,stroke:#cc0066,stroke-width:2px,color:#660033,font-weight:bold
+    style F fill:#e6b3e6,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
+    style G fill:#b3b3e6,stroke:#000066,stroke-width:2px,color:#000033,font-weight:bold
+```
+
 ---
 
 ## Quick Start Guide
