@@ -504,7 +504,7 @@ impl MpegTsTableCache {
 }
 
 // ----------------------------------------------------------------
-// NEW: PAT/PMT parsing for the single authoritative PCR PID
+// PAT/PMT parsing for the single authoritative PCR PID
 // ----------------------------------------------------------------
 
 /// Try to parse the PMT PID out of this PAT packet (PID=0).
