@@ -753,8 +753,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-          interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-          inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
+           interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+           inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
         endpoint,
         region_name,
         bucket,
@@ -1019,6 +1019,26 @@ fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> Notify
     Ok(())
 }
 
+// ---------------- FILE STABILITY CHECK ----------------
+
+/// Wait until the file stops growing, so we don't upload partial data
+async fn wait_for_file_stable(
+    path: &Path,
+    check_interval_ms: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut previous_size = 0;
+    loop {
+        let current_size = fs::metadata(path)?.len();
+        if current_size > 0 && current_size == previous_size {
+            // same size twice in a row, assume stable
+            break;
+        }
+        previous_size = current_size;
+        sleep(Duration::from_millis(check_interval_ms)).await;
+    }
+    Ok(())
+}
+
 // ---------------- File-Event -> S3-Upload ----------------
 
 async fn handle_file_events(
@@ -1047,10 +1067,15 @@ async fn handle_file_events(
                             };
 
                             if should_upload {
-                                // Give time for file to finish writing
-                                sleep(Duration::from_millis(300)).await;
+                                // Wait for the file to stop growing
+                                if let Err(e) = wait_for_file_stable(&path, 300).await {
+                                    warn!(
+                                        "Skipping {}: error waiting for stable file: {}",
+                                        full_path_str, e
+                                    );
+                                    continue;
+                                }
 
-                                // Derive the relative key
                                 let relative_path = match strip_base_dir(&path, &base_dir) {
                                     Ok(rp) => rp,
                                     Err(e) => {
@@ -1068,6 +1093,7 @@ async fn handle_file_events(
                                     .map(|p| p.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "".to_string());
 
+                                // Attempt the upload
                                 if let Ok(()) = upload_file_to_s3(
                                     &s3_client,
                                     &bucket,
@@ -1085,7 +1111,6 @@ async fn handle_file_events(
                                 let current_time = Utc::now().to_rfc3339();
                                 let custom_lines =
                                     vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
-
                                 hourly_index_creator
                                     .record_segment(
                                         &hour_dir,
@@ -1119,7 +1144,6 @@ async fn upload_file_to_s3(
     let relative_path = strip_base_dir(path, base_dir)?;
     let key_str = relative_path.to_string_lossy().to_string();
 
-    // Read file size before upload
     let file_size = fs::metadata(path)?.len();
     println!(
         "Uploading {} ({} bytes) -> s3://{}/{}",
@@ -1131,7 +1155,6 @@ async fn upload_file_to_s3(
 
     let mut retries = 3;
     while retries > 0 {
-        // Multiple ways to check file size
         let metadata_size = fs::metadata(path)?.len();
         let file_contents = fs::read(path)?;
         let read_size = file_contents.len();
