@@ -1116,31 +1116,38 @@ async fn upload_file_to_s3(
     let relative_path = strip_base_dir(path, base_dir)?;
     let key_str = relative_path.to_string_lossy().to_string();
 
+    // Read file size before upload
+    let file_size = fs::metadata(path)?.len();
     println!(
-        "Uploading {} -> s3://{}/{}",
+        "Uploading {} ({} bytes) -> s3://{}/{}",
         path.display(),
+        file_size,
         bucket,
         key_str
     );
 
-    let file_size = fs::metadata(path)?.len();
-    println!("Uploading {} bytes for {}", file_size, path.display());
-
     let mut retries = 3;
     while retries > 0 {
-        let body_bytes: ByteStream = ByteStream::from_path(path).await?;
+        // Read the entire file into memory first
+        let file_contents = fs::read(path)?;
+        if file_contents.len() as u64 != file_size {
+            return Err("File read size mismatch".into());
+        }
+
+        let body_stream = ByteStream::from(file_contents);
+
         match s3_client
             .put_object()
             .bucket(bucket)
             .key(&key_str)
+            .body(body_stream)
             .content_type("video/mp2t")
             .content_length(file_size as i64)
-            .body(body_bytes)
             .send()
             .await
         {
             Ok(_) => {
-                println!("Uploaded {}", key_str);
+                println!("Uploaded {} ({} bytes)", key_str, file_size);
                 if remove_local {
                     if let Err(e) = fs::remove_file(path) {
                         eprintln!("Failed removing local file {}: {:?}", path.display(), e);
