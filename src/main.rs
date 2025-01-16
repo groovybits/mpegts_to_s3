@@ -15,7 +15,6 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
-//use chrono::Utc;
 use clap::{Arg, Command as ClapCommand};
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
@@ -411,6 +410,7 @@ async fn ensure_bucket_exists(
 }
 
 // --------------------- MpegTsTableCache ---------------------
+// (Optional: keeps latest PAT/PMT for re-injection.)
 
 #[derive(Default)]
 struct MpegTsTableCache {
@@ -503,7 +503,113 @@ impl MpegTsTableCache {
     }
 }
 
-// ---------------- PCRTracker with partial compensation ----------------
+// ----------------------------------------------------------------
+// NEW: PAT/PMT parsing for the single authoritative PCR PID
+// ----------------------------------------------------------------
+
+/// Try to parse the PMT PID out of this PAT packet (PID=0).
+/// Returns Some(pmt_pid) if successful.
+fn parse_pat_for_pmt_pid(pkt: &[u8]) -> Option<u16> {
+    if pkt.len() < 188 {
+        return None;
+    }
+    let transport_error_indicator = (pkt[1] & 0x80) != 0;
+    if transport_error_indicator {
+        return None;
+    }
+
+    let adaptation_control = (pkt[3] >> 4) & 0x03;
+    let mut payload_offset = 4;
+    if adaptation_control == 0b10 || adaptation_control == 0b11 {
+        let adaptation_length = pkt[payload_offset] as usize;
+        payload_offset += 1 + adaptation_length;
+        if payload_offset >= 188 {
+            return None;
+        }
+    }
+
+    if payload_offset >= 188 {
+        return None;
+    }
+    let pointer_field = pkt[payload_offset];
+    payload_offset += 1 + pointer_field as usize;
+    if payload_offset + 8 > 188 {
+        return None;
+    }
+
+    // table_id = 0x00 for PAT
+    if pkt[payload_offset] != 0x00 {
+        return None;
+    }
+
+    let section_length =
+        u16::from_be_bytes([pkt[payload_offset + 1] & 0x0f, pkt[payload_offset + 2]]) as usize;
+    let pat_section_end = payload_offset + 3 + section_length;
+    let mut program_info_offset = payload_offset + 8;
+
+    while program_info_offset + 4 <= pat_section_end.saturating_sub(4) {
+        let program_number =
+            u16::from_be_bytes([pkt[program_info_offset], pkt[program_info_offset + 1]]);
+        let pid_hi = pkt[program_info_offset + 2] & 0x1F;
+        let pid_lo = pkt[program_info_offset + 3];
+        let candidate_pmt_pid = ((pid_hi as u16) << 8) | (pid_lo as u16);
+
+        // nonzero program_number => real PMT PID
+        if program_number != 0 {
+            return Some(candidate_pmt_pid);
+        }
+        program_info_offset += 4;
+    }
+
+    None
+}
+
+/// Try to parse the PCR PID out of the PMT packet (PID = the one from parse_pat_for_pmt_pid).
+fn parse_pmt_for_pcr_pid(pkt: &[u8]) -> Option<u16> {
+    if pkt.len() < 188 {
+        return None;
+    }
+
+    let adaptation_control = (pkt[3] >> 4) & 0x3;
+    let mut payload_offset = 4;
+
+    // Skip adaptation field if present
+    if adaptation_control == 0b10 || adaptation_control == 0b11 {
+        let adaptation_length = pkt[payload_offset] as usize;
+        payload_offset += 1 + adaptation_length;
+        if payload_offset >= 188 {
+            return None;
+        }
+    }
+
+    // If there's no payload, bail
+    if adaptation_control == 0b00 || adaptation_control == 0b10 {
+        return None;
+    }
+
+    // Skip pointer_field
+    if payload_offset >= 188 {
+        return None;
+    }
+    let pointer_field = pkt[payload_offset];
+    payload_offset += 1 + pointer_field as usize;
+    if payload_offset + 8 > 188 {
+        return None;
+    }
+
+    // table_id = 0x02 => PMT
+    if pkt[payload_offset] != 0x02 {
+        return None;
+    }
+
+    // The PCR PID is at [payload_offset + 8..+10]
+    let pcr_pid = ((pkt[payload_offset + 8] as u16 & 0x1F) << 8) | pkt[payload_offset + 9] as u16;
+    Some(pcr_pid)
+}
+
+// ----------------------------------------------------------------
+// PCR tracker with single PID-based logic
+// ----------------------------------------------------------------
 
 #[derive(Default)]
 struct PcrTracker {
@@ -512,6 +618,12 @@ struct PcrTracker {
     pcr_first_idx: Option<usize>,
     pcr_last_idx: Option<usize>,
     total_packets: usize,
+
+    // Key addition: we only track PCR from the authoritative "primary" PID
+    primary_pcr_pid: Option<u16>,
+
+    // We might store "discovered PMT PID" if you want to parse it in steps
+    discovered_pmt_pid: Option<u16>,
 }
 
 impl PcrTracker {
@@ -519,28 +631,67 @@ impl PcrTracker {
         if pkt.len() != 188 {
             return;
         }
-        self.total_packets += 1;
-        let adaptation_control = (pkt[3] >> 4) & 0b11;
-        if adaptation_control == 0b10 || adaptation_control == 0b11 {
-            let adaptation_len = pkt[4] as usize;
-            if adaptation_len > 0 && adaptation_len <= 183 {
-                let adaptation_flags = pkt[5];
-                let pcr_flag = (adaptation_flags & 0x10) != 0;
-                if pcr_flag && adaptation_len >= 7 {
-                    if let Some(pcr_value) = parse_pcr(&pkt[6..12]) {
-                        if self.earliest_pcr.is_none() {
-                            self.earliest_pcr = Some(pcr_value);
-                            self.pcr_first_idx = Some(self.total_packets - 1);
+
+        // Which PID is this packet?
+        let pid = ((pkt[1] as u16 & 0x1F) << 8) | (pkt[2] as u16);
+
+        // ---------------------------------------------------------
+        // 1) If we don't yet know the PCR PID, try to parse PAT/PMT
+        // ---------------------------------------------------------
+        if self.primary_pcr_pid.is_none() {
+            // If it's a PAT (PID=0), parse to find PMT PID
+            if pid == 0 {
+                if let Some(pmt_pid) = parse_pat_for_pmt_pid(pkt) {
+                    self.discovered_pmt_pid = Some(pmt_pid);
+                }
+            }
+            // If it's the PMT PID we discovered, parse to find the real PCR PID
+            else if Some(pid) == self.discovered_pmt_pid {
+                if let Some(pcr_pid) = parse_pmt_for_pcr_pid(pkt) {
+                    println!("Found primary PCR PID = 0x{:04x} from PMT", pcr_pid);
+                    self.primary_pcr_pid = Some(pcr_pid);
+                }
+            }
+        }
+
+        // ---------------------------------------
+        // 2) Only track PCR if pid == primary_pcr_pid
+        // ---------------------------------------
+        if let Some(pcr_pid) = self.primary_pcr_pid {
+            if pid == pcr_pid {
+                self.total_packets += 1;
+
+                let adaptation_control = (pkt[3] >> 4) & 0b11;
+                if adaptation_control == 0b10 || adaptation_control == 0b11 {
+                    let adaptation_len = pkt[4] as usize;
+                    if adaptation_len > 0 && adaptation_len <= 183 {
+                        let adaptation_flags = pkt[5];
+                        let pcr_flag = (adaptation_flags & 0x10) != 0;
+                        if pcr_flag && adaptation_len >= 7 {
+                            if let Some(pcr_value) = parse_pcr(&pkt[6..12]) {
+                                // First PCR?
+                                if self.earliest_pcr.is_none() {
+                                    self.earliest_pcr = Some(pcr_value);
+                                    self.pcr_first_idx = Some(self.total_packets - 1);
+                                }
+                                // Check discontinuity
+                                if let Some(prev) = self.latest_pcr {
+                                    if pcr_value < prev {
+                                        println!("PCR discontinuity: {} -> {}", prev, pcr_value);
+                                        // You might choose to reset or skip
+                                    }
+                                }
+                                self.latest_pcr = Some(pcr_value);
+                                self.pcr_last_idx = Some(self.total_packets - 1);
+                            }
                         }
-                        self.latest_pcr = Some(pcr_value);
-                        self.pcr_last_idx = Some(self.total_packets - 1);
                     }
                 }
             }
         }
     }
 
-    // Use a more conservative compensation, limiting to 5 packets before/after
+    /// Use a conservative partial compensation to yield the final segment duration
     fn compensated_duration(&self) -> f64 {
         match (self.earliest_pcr, self.latest_pcr) {
             (Some(start), Some(end)) if end > start => {
@@ -561,7 +712,7 @@ impl PcrTracker {
                 let packets_before = first_idx.min(5) as f64;
                 let packets_after = (self.total_packets.saturating_sub(last_idx + 1)).min(5) as f64;
 
-                // slightly reduce the compensation (multiply by 0.8)
+                // partial multiplier
                 raw + (packets_before + packets_after) * time_per_pkt * 0.8
             }
             _ => 0.0,
@@ -577,6 +728,7 @@ impl PcrTracker {
     }
 }
 
+/// Parse raw 42-bit base + 9-bit extension => f64 seconds
 fn parse_pcr(data: &[u8]) -> Option<f64> {
     if data.len() < 6 {
         return None;
@@ -612,6 +764,7 @@ struct ManualSegmenter {
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
 
+    // Our brand-new selective PcrTracker
     pcr_tracker: PcrTracker,
 }
 
@@ -656,15 +809,15 @@ impl ManualSegmenter {
             file.flush()?;
         }
 
-        // Update PCR
+        // Update PCR from these packets (if any)
         let pkt_count = data.len() / 188;
-        for _i in 0..pkt_count {
-            let idx_start = _i * 188;
+        for i in 0..pkt_count {
+            let idx_start = i * 188;
             let pkt = &data[idx_start..(idx_start + 188)];
             self.pcr_tracker.handle_ts_packet(pkt);
         }
 
-        // Use the same compensated duration for segment cutting
+        // Use the (new) compensated duration for segment cutting
         let current_duration = self.pcr_tracker.compensated_duration();
         if current_duration >= get_segment_duration_seconds() as f64 {
             self.close_current_segment_file()?;
@@ -678,11 +831,11 @@ impl ManualSegmenter {
             writer.flush()?;
             drop(writer);
 
-            // Use compensated duration for both EXTINF and .dur side file
+            // Use compensated duration
             let duration = self.pcr_tracker.compensated_duration();
             let segment_path = self.current_segment_path(self.segment_index + 1);
 
-            // --- NEW: Write the duration to a companion file
+            // Write the duration to a companion file
             let duration_path = segment_path.with_extension("dur");
             let full_dur_path = Path::new(&self.output_dir).join(&duration_path);
             fs::write(full_dur_path, duration.to_string())?;
@@ -707,7 +860,7 @@ impl ManualSegmenter {
             self.segment_index += 1;
             self.rewrite_m3u8()?;
 
-            // Reset PCR
+            // Reset PCR each time a segment ends
             self.pcr_tracker.reset();
         }
         Ok(())
@@ -723,6 +876,7 @@ impl ManualSegmenter {
         let file = fs::File::create(&full_path)?;
         let mut writer = BufWriter::new(file);
 
+        // Optionally inject latest PAT/PMT at the start of each new segment
         if self.inject_pat_pmt {
             if let Some(cache) = &self.pat_pmt_cache {
                 let cache = cache.lock().unwrap();
@@ -747,7 +901,7 @@ impl ManualSegmenter {
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        // We'll refine the target duration on rewrite
+        // We'll refine target duration on rewrite
         writeln!(
             f,
             "#EXT-X-TARGETDURATION:{}",
@@ -926,8 +1080,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-             interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-             inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
+              interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+              inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
         endpoint,
         region_name,
         bucket,
@@ -1090,6 +1244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Main capture loop
     loop {
+        // Check if FFmpeg died
         if let Some(child) = ffmpeg_child.as_mut() {
             if let Some(exit_status) = child.try_wait()? {
                 eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -1100,6 +1255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let packet = match cap.next_packet() {
             Ok(pkt) => pkt,
             Err(_) => {
+                // Check if FFmpeg ended
                 if let Some(child) = ffmpeg_child.as_mut() {
                     if let Some(exit_status) = child.try_wait()? {
                         eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -1111,6 +1267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
+            // Optionally update table cache for re-injection
             if manual_segment && inject_pat_pmt {
                 let pkt_count = ts_payload.len() / 188;
                 let mut cache = table_cache.lock().unwrap();
@@ -1127,7 +1284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // Pass TS data to FFmpeg if not manual
+            // Feed TS data to FFmpeg if not manual
             if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
                 if let Err(e) = buf.write_all(ts_payload) {
                     eprintln!("Error feeding data to FFmpeg: {:?}", e);
@@ -1135,7 +1292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // If manual, write to segments ourselves
+            // If manual segmentation, write to segments ourselves
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload) {
                     eprintln!("Error writing manual TS segment: {:?}", e);
@@ -1480,14 +1637,14 @@ fn extract_mpegts_payload<'a>(
         return None;
     }
 
+    // Some streams wrap TS in RTP (0x80.. + 12 bytes, then 0x47).
     let (ts_payload, is_rtp) = if payload[0] == 0x80 && payload.len() > 12 && payload[12] == 0x47 {
         (&payload[12..], true)
     } else if payload[0] == 0x47 {
         (payload, false)
     } else {
         warn!(
-            "Unknown payload type found at offset {} of type 0x{:02x}, size {}",
-            udp_header_offset,
+            "Unknown payload type found (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
             payload[0],
             payload.len()
         );
