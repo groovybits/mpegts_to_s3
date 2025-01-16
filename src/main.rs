@@ -167,18 +167,18 @@ impl HourlyIndexCreator {
             .await?;
 
         let signed_url = self.presign_get_url(&index_key).await?;
-        self.rewrite_urls_log(hour_dir, &signed_url)?;
+        self.rewrite_urls_log(hour_dir, &signed_url, &output_dir)?;
 
         Ok(())
     }
 
     /// Overwrite `urls.log` with the new line appended each time
-    fn rewrite_urls_log(&self, hour_dir: &str, final_url: &str) -> std::io::Result<()> {
+    fn rewrite_urls_log(&self, hour_dir: &str, final_url: &str, output_dir: &str) -> std::io::Result<()> {
         // read old lines if exist
-        let log_path = Path::new("urls.log");
+        let log_path = Path::new(output_dir).join("urls.log");
         let mut lines = vec![];
         if log_path.exists() {
-            let old = fs::read_to_string(log_path)?;
+            let old = fs::read_to_string(&log_path)?;
             for ln in old.lines() {
                 lines.push(ln.to_string());
             }
@@ -856,7 +856,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         {
             error!("File event handler error: {}", e);
-            // TODO: send a signal to the main thread to exit?
+            // TODO: need to handle errors if constantly failing
         }
     });
 
@@ -1001,7 +1001,7 @@ async fn handle_file_events(
     mut hourly_index_creator: HourlyIndexCreator,
     output_dir: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds()))); // 1 hour max age
+    let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds())));
 
     while let Ok(event) = rx.recv() {
         match event.kind {
@@ -1009,17 +1009,40 @@ async fn handle_file_events(
                 for path in event.paths {
                     if let Some(ext) = path.extension() {
                         if ext == "ts" || ext == "m3u8" {
-                            let path_str = path.to_string_lossy().to_string();
-                            let path_str_clone = path_str.clone();
+                            let full_path_str = path.to_string_lossy().to_string();
                             let tracker_clone = Arc::clone(&tracker);
 
                             let should_upload = {
                                 let tracker = tracker_clone.lock().unwrap();
-                                !tracker.is_uploaded(&path_str) && !tracker.is_too_old(&path)
+                                !tracker.is_uploaded(&full_path_str) && !tracker.is_too_old(&path)
                             };
 
                             if should_upload {
+                                // Give the file a moment to finish writing
                                 sleep(Duration::from_millis(300)).await;
+
+                                // -------------- [A] Figure out the relative key --------------
+                                //    e.g. "ts/2025/01/16/00/segment_20250116-003050__0022.ts"
+                                let relative_path = match strip_base_dir(&path, &base_dir) {
+                                    Ok(rp) => rp,
+                                    Err(e) => {
+                                        warn!(
+                                            "Skipping {}: strip_base_dir() error: {}",
+                                            full_path_str, e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let key_str = relative_path.to_string_lossy().to_string();
+
+                                // -------------- [B] Extract "hour_dir" from that relative path --------------
+                                //    e.g. hour_dir = "ts/2025/01/16/00"
+                                let hour_dir = relative_path
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "".to_string());
+
+                                // -------------- [C] Upload to S3 using the same key_str --------------
                                 if let Ok(()) = upload_file_to_s3(
                                     &s3_client,
                                     &bucket,
@@ -1030,24 +1053,26 @@ async fn handle_file_events(
                                 .await
                                 {
                                     let mut tracker = tracker_clone.lock().unwrap();
-                                    tracker.mark_uploaded(path_str);
+                                    tracker.mark_uploaded(full_path_str);
                                 }
 
+                                // -------------- [D] Add a date-time tag, then record in the index --------------
                                 let current_time = Utc::now().to_rfc3339();
                                 let custom_lines =
                                     vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
 
+                                // The call to record_segment() must use the real S3 key and that hour_dir
                                 hourly_index_creator
                                     .record_segment(
-                                        &base_dir,
-                                        &path_str_clone,
+                                        &hour_dir, // e.g. "ts/2025/01/16/00"
+                                        &key_str,  // e.g. "ts/2025/01/16/00/segment_2025..."
                                         get_segment_duration_seconds() as f64,
                                         custom_lines,
-                                        &output_dir,
+                                        &output_dir, // local HLS folder
                                     )
                                     .await?;
                             } else {
-                                debug!("Skipping file {}: already uploaded or too old", path_str);
+                                debug!("Skipping {}: already uploaded or too old", full_path_str);
                             }
                         }
                     }
