@@ -5,6 +5,7 @@ This Rust application captures MPEG-TS UDP multicast streams, segments them, and
 ```bash
 # Capture udp://227.1.1.102:4102 from network interface net1 
 # with segments in ./ts/ directory and upload to MinIO/S3
+# using a server at http://192.168.130.93 port 3001 http, 9000 MinIO, 9001 MinIO Admin
 git clone https://github.com/groovybits/mpegts_to_s3.git
 cd mpegts_to_s3
 
@@ -19,14 +20,24 @@ mkdir hls && cd hls
 # Run Python HTTP Server port 3001 from ./hls/ directory
 ../scripts/http_server.py &  # background, serves the current directory
 
-# Run Rust mpegts_to_s3 collecting in ts/ directory
+# Run Rust mpegts_to_s3 collecting in ts/ directory from udp://227.1.1.102:4102
 # as ts/year/month/day/hour/segment_YYYYMMDD-HHMMSS__0000.ts 10 second segments
 SEGMENT_DURATION_SECONDS=10 \
   ../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
     -o ts -n net1 --manual_segment --hls_keep_segments 3
 
-# From another computer playback
+# From another computer playback directly from the HTTP server
 mpv -i http://192.168.130.93:3001/index.m3u8 
+
+# Playback from minIO / S3 signed urls
+## Get list of each hours signed master index URL
+curl -s http://192.168.130.93:3001/ts/urls.log | tail -1 # Hour 2025/01/16/06 => http://...
+
+## Setup SSH Tunnel into HTTP server
+scripts/minio_admin.sh # ssh -p 3999 -L 9000:localhost:9000 -L 9001:localhost:9001 root@192.168.130.93 -N -f
+
+## Playback the hourly_index.m3u8
+mpv http://127.0.0.1:9000/ltnhls/2025/01/16/06/hourly_index.m3u8?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=minioadmin%2F20250116%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250116T114743Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=9271b9f8ff7ddffb4fa720b16077d5481926f7ad1d533474341502bc399e5fde
 ```
 
 ## Prerequisites
