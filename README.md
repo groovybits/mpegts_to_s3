@@ -11,6 +11,7 @@ graph LR
     D -->|"Watch"| E["S3/MinIO<br/>Upload"]
     E -->|"URLs"| F["HLS<br/>Playback"]
     E -->|"Log"| G["URL<br/>Logs"]
+    G ~~~ Z[" "]
 
     style A fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
     style B fill:#b3ffb3,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
@@ -19,6 +20,7 @@ graph LR
     style E fill:#ff99cc,stroke:#cc0066,stroke-width:2px,color:#660033,font-weight:bold
     style F fill:#e6b3e6,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
     style G fill:#b3b3e6,stroke:#000066,stroke-width:2px,color:#000033,font-weight:bold
+    style Z fill:none,stroke:none,color:transparent
 ```
 
 ---
