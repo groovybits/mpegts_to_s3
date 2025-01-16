@@ -513,6 +513,7 @@ impl ManualSegmenter {
 
         if let Some(file) = self.current_ts_file.as_mut() {
             file.write_all(data)?;
+            file.flush()?;
         }
         Ok(())
     }
