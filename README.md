@@ -1,6 +1,6 @@
-# MinIO MPEG-TS UDP Stream Uploader
+# Rust based Multicast MPEG-TS UDP Stream Pcap Capture for S3/MinIO HLS Hourly Archiving for Playback
 
-This Rust application captures MPEG-TS UDP multicast streams, segments them, and uploads the segments to MinIO storage.
+This Rust application captures MPEG-TS UDP multicast streams as time based segments, creates an m3u8 playlist, uploads the segments to MinIO/S3 storage, signs the segments and a master playlist for playback.
 
 ```bash
 # Capture udp://227.1.1.102:4102 from network interface net1 
