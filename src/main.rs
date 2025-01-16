@@ -11,12 +11,14 @@
  */
 
 use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
+use chrono::Utc;
 use clap::{Arg, Command as ClapCommand};
 use get_if_addrs::get_if_addrs;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
 };
@@ -43,6 +45,193 @@ fn get_segment_duration_seconds() -> u64 {
         .unwrap_or_else(|_| "10".to_string())
         .parse()
         .unwrap_or(10)
+}
+
+fn get_file_max_age_seconds() -> u64 {
+    std::env::var("FILE_MAX_AGE_SECONDS")
+        .unwrap_or_else(|_| "30".to_string())
+        .parse()
+        .unwrap_or(30)
+}
+
+fn get_url_signing_seconds() -> u64 {
+    std::env::var("URL_SIGNING_SECONDS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse()
+        .unwrap_or(3600)
+}
+
+/// A single line in an hourly index: includes the signed URL, duration, optional metadata lines.
+pub struct HourlyIndexEntry {
+    pub duration: f64,
+    pub signed_url: String,
+    // Additional comments/tags you want to inject, e.g. `#EXT-X-DISCONTINUITY` or your own lines
+    pub custom_lines: Vec<String>,
+}
+
+/// A container that tracks the last segments for each "hour" and writes an `hourly_index.m3u8`.
+pub struct HourlyIndexCreator {
+    s3_client: aws_sdk_s3::Client,
+    bucket: String,
+
+    // Keyed by "YYYY/mm/dd/HH" => a vector of segment entries
+    hour_map: std::collections::HashMap<String, Vec<HourlyIndexEntry>>,
+}
+
+impl HourlyIndexCreator {
+    /// Create a new HourlyIndexCreator
+    pub fn new(s3_client: aws_sdk_s3::Client, bucket: String) -> Self {
+        Self {
+            s3_client,
+            bucket,
+            hour_map: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Called each time we finish uploading a segment.
+    /// - `hour_dir` is something like `2025/01/15/11`  
+    /// - `segment_key` is the full S3 object key (e.g. `2025/01/15/11/segment_...ts`)
+    /// - `duration` is how many seconds
+    /// - `custom_lines` is optional metadata lines to insert right before the URI
+    ///   (e.g. `#EXT-X-DISCONTINUITY`, or comments, or ID3 data, etc.).
+    pub async fn record_segment(
+        &mut self,
+        hour_dir: &str,
+        segment_key: &str,
+        duration: f64,
+        custom_lines: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // 1) Presign the S3 GET URL so the HLS client can fetch it
+        let signed_url = self.presign_get_url(segment_key).await?;
+
+        // 2) Store it in our hour_map
+        let entry = HourlyIndexEntry {
+            duration,
+            signed_url,
+            custom_lines,
+        };
+        let entries = self.hour_map.entry(hour_dir.to_string()).or_default();
+        entries.push(entry);
+
+        // 3) Re-write the "hourly_index.m3u8" for that hour
+        self.write_hourly_index(hour_dir).await?;
+
+        Ok(())
+    }
+
+    /// Actually generate or update the "hourly_index.m3u8" in that hour folder.  
+    /// Then, optionally upload that `.m3u8` to S3 so remote playback can see it.
+    async fn write_hourly_index(&self, hour_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // For an hour like `2025/01/15/11`, we'll put `hourly_index.m3u8` there
+        let local_dir = std::path::Path::new("hls").join(hour_dir);
+        let index_path = local_dir.join("hourly_index.m3u8");
+
+        fs::create_dir_all(&local_dir)?;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&index_path)?;
+
+        // Write standard HLS boilerplate
+        writeln!(file, "#EXTM3U")?;
+        writeln!(file, "#EXT-X-VERSION:3")?;
+        // We can compute target duration by scanning all entries or just pick a safe #.
+        writeln!(file, "#EXT-X-TARGETDURATION:60")?; // e.g. 1-min max
+        writeln!(file, "#EXT-X-MEDIA-SEQUENCE:0")?;
+
+        // Retrieve the array of segments for this hour
+        if let Some(entries) = self.hour_map.get(hour_dir) {
+            for entry in entries {
+                // Possibly write custom lines (metadata) first
+                for line in &entry.custom_lines {
+                    writeln!(file, "{}", line)?;
+                }
+                // Then standard #EXTINF + the signed_url
+                writeln!(file, "#EXTINF:{:.6},", entry.duration)?;
+                writeln!(file, "{}", entry.signed_url)?;
+            }
+        }
+
+        drop(file);
+
+        // Upload this newly updated `hourly_index.m3u8` to S3:
+        let index_key = format!("{}/hourly_index.m3u8", hour_dir);
+        self.upload_local_file_to_s3(&index_path, &index_key)
+            .await?;
+
+        let final_url = format!("s3://{}/{}", self.bucket, index_key);
+        self.rewrite_urls_log(hour_dir, &final_url)?;
+
+        Ok(())
+    }
+
+    /// Overwrite `urls.log` with the new line appended each time
+    fn rewrite_urls_log(&self, hour_dir: &str, final_url: &str) -> std::io::Result<()> {
+        // read old lines if exist
+        let log_path = Path::new("urls.log");
+        let mut lines = vec![];
+        if log_path.exists() {
+            let old = fs::read_to_string(log_path)?;
+            for ln in old.lines() {
+                lines.push(ln.to_string());
+            }
+        }
+
+        // Add new line, e.g. "Hour 2025/01/15/11 => https://..."
+        lines.push(format!("Hour {} => {}", hour_dir, final_url));
+
+        // rewrite the file from scratch
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)?;
+        for ln in &lines {
+            writeln!(f, "{}", ln)?;
+        }
+        Ok(())
+    }
+
+    /// Generate a short-lived presigned GET URL for the given S3 object key
+    async fn presign_get_url(
+        &self,
+        object_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let config = PresigningConfig::expires_in(Duration::from_secs(get_url_signing_seconds()))?; // 1 hour
+        let presigned_req = self
+            .s3_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(object_key)
+            .presigned(config)
+            .await?;
+        Ok(presigned_req.uri().to_string())
+    }
+
+    /// Helper to upload a local file (the .m3u8) to S3
+    async fn upload_local_file_to_s3(
+        &self,
+        local_path: &std::path::Path,
+        object_key: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "Uploading hourly index -> s3://{}/{}",
+            self.bucket, object_key
+        );
+
+        let body_bytes = ByteStream::from_path(local_path).await?;
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(object_key)
+            .body(body_bytes) // pass the ByteStream variable
+            .send()
+            .await?;
+
+        Ok(())
+    }
 }
 
 /// Attempt to join `multicast_addr` + `port` on the given `interface_name`.
@@ -579,6 +768,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_bucket_exists(&s3_client, bucket).await?;
 
+    let hourly_index_creator = HourlyIndexCreator::new(s3_client.clone(), bucket.to_string());
+
     info!("Starting directory watcher on: {}", output_dir);
     let (watch_tx, watch_rx) = channel();
     let watch_dir = output_dir.to_string();
@@ -645,14 +836,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bucket_clone = bucket.clone();
     let output_dir_clone = output_dir.clone();
     let upload_task = tokio::spawn(async move {
-        handle_file_events(
+        if let Err(e) = handle_file_events(
             watch_rx,
             s3_client_clone,
             bucket_clone,
             output_dir_clone,
             remove_local,
+            hourly_index_creator,
         )
-        .await;
+        .await
+        {
+            error!("File event handler error: {}", e);
+            // TODO: send a signal to the main thread to exit?
+        }
     });
 
     if let Ok(_sock) = join_multicast_on_iface(filter_ip, filter_port, interface) {
@@ -793,8 +989,9 @@ async fn handle_file_events(
     bucket: String,
     base_dir: String,
     remove_local: bool,
-) {
-    let tracker = Arc::new(Mutex::new(FileTracker::new(3600))); // 1 hour max age
+    mut hourly_index_creator: HourlyIndexCreator,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds()))); // 1 hour max age
 
     while let Ok(event) = rx.recv() {
         match event.kind {
@@ -803,6 +1000,7 @@ async fn handle_file_events(
                     if let Some(ext) = path.extension() {
                         if ext == "ts" || ext == "m3u8" {
                             let path_str = path.to_string_lossy().to_string();
+                            let path_str_clone = path_str.clone();
                             let tracker_clone = Arc::clone(&tracker);
 
                             let should_upload = {
@@ -824,6 +1022,19 @@ async fn handle_file_events(
                                     let mut tracker = tracker_clone.lock().unwrap();
                                     tracker.mark_uploaded(path_str);
                                 }
+
+                                let current_time = Utc::now().to_rfc3339();
+                                let custom_lines =
+                                    vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
+
+                                hourly_index_creator
+                                    .record_segment(
+                                        &base_dir,
+                                        &path_str_clone,
+                                        get_segment_duration_seconds() as f64,
+                                        custom_lines,
+                                    )
+                                    .await?;
                             } else {
                                 debug!("Skipping file {}: already uploaded or too old", path_str);
                             }
@@ -834,6 +1045,8 @@ async fn handle_file_events(
             _ => {}
         }
     }
+
+    Ok(())
 }
 
 async fn upload_file_to_s3(
