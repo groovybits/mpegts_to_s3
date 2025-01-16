@@ -713,7 +713,7 @@ impl PcrTracker {
                 let packets_after = (self.total_packets.saturating_sub(last_idx + 1)).min(5) as f64;
 
                 // partial multiplier
-                raw + (packets_before + packets_after) * time_per_pkt * 0.8
+                (raw + (packets_before + packets_after) * time_per_pkt * 0.8) * 1.2
             }
             _ => 0.0,
         }
