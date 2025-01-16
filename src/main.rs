@@ -33,7 +33,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
@@ -227,7 +227,7 @@ impl HourlyIndexCreator {
         self.upload_local_file_to_s3(
             &index_path,
             &format!("{}/hourly_index.m3u8", hour_dir),
-            "application/vnd.apple.mpegurl",
+            "application/vnd.apple.mpegurl", // correct MIME for HLS playlist
         )
         .await?;
 
@@ -520,10 +520,9 @@ impl MpegTsTableCache {
     }
 }
 
-// ----------------------------------------------------------------
-// --- PCRTracker + parse_pcr() for real media durations ---
-// ----------------------------------------------------------------
-
+// -------------------------------------------------------------
+// PCRTracker: We'll close segments purely based on PCR
+// -------------------------------------------------------------
 #[derive(Default)]
 struct PcrTracker {
     earliest_pcr: Option<f64>,
@@ -531,7 +530,6 @@ struct PcrTracker {
 }
 
 impl PcrTracker {
-    /// Parse each TS packet for PCR if present, store earliest and latest.
     fn handle_ts_packet(&mut self, pkt: &[u8]) {
         if pkt.len() != 188 {
             return;
@@ -554,12 +552,17 @@ impl PcrTracker {
         }
     }
 
-    /// Returns duration = latest - earliest, or 0 if we don't have enough info.
     fn duration_seconds(&self) -> f64 {
         match (self.earliest_pcr, self.latest_pcr) {
-            (Some(a), Some(b)) if b > a => b - a,
+            (Some(start), Some(end)) if end > start => end - start,
             _ => 0.0,
         }
+    }
+
+    /// Clears PCR data for the next segment
+    fn reset(&mut self) {
+        self.earliest_pcr = None;
+        self.latest_pcr = None;
     }
 }
 
@@ -569,22 +572,19 @@ fn parse_pcr(data: &[u8]) -> Option<f64> {
     if data.len() < 6 {
         return None;
     }
-    // 33-bit base
     let pcr_base = ((data[0] as u64) << 25)
         | ((data[1] as u64) << 17)
         | ((data[2] as u64) << 9)
         | ((data[3] as u64) << 1)
         | ((data[4] as u64) >> 7);
 
-    // 9-bit extension
     let pcr_ext = ((data[4] & 0x01) as u16) << 8 | data[5] as u16;
-
-    // total in 27 MHz ticks
-    let total_ticks_27mhz = pcr_base * 300 + pcr_ext as u64;
-    Some(total_ticks_27mhz as f64 / 27_000_000.0)
+    let total_27mhz_ticks = pcr_base * 300 + pcr_ext as u64;
+    Some(total_27mhz_ticks as f64 / 27_000_000.0)
 }
 
 // ------------- MANUAL SEGMENTER -------------
+// --- CHANGED FOR PCR-BASED: remove real-time checks, rely on PCR
 
 struct PlaylistEntry {
     duration: f64,
@@ -594,7 +594,6 @@ struct PlaylistEntry {
 struct ManualSegmenter {
     output_dir: String,
     current_ts_file: Option<BufWriter<fs::File>>,
-    current_segment_start: Instant,
     segment_index: u64,
     playlist_path: PathBuf,
     m3u8_initialized: bool,
@@ -605,8 +604,7 @@ struct ManualSegmenter {
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
 
-    // Track real media durations via PCR
-    pcr_tracker: PcrTracker,
+    pcr_tracker: PcrTracker, // purely used for durations & deciding when to cut
 }
 
 impl ManualSegmenter {
@@ -615,7 +613,6 @@ impl ManualSegmenter {
         Self {
             output_dir: output_dir.to_string(),
             current_ts_file: None,
-            current_segment_start: Instant::now(),
             segment_index: 0,
             playlist_path,
             m3u8_initialized: false,
@@ -643,28 +640,31 @@ impl ManualSegmenter {
     }
 
     fn write_ts(&mut self, data: &[u8]) -> std::io::Result<()> {
+        // If no file open, create a new segment
         if self.current_ts_file.is_none() {
             self.open_new_segment_file()?;
         }
 
-        let elapsed = self.current_segment_start.elapsed().as_secs_f64();
-        let segment_duration = get_segment_duration_seconds() as f64;
-        // If we've hit/exceeded our target segment length, finalize this segment
-        if elapsed >= segment_duration {
-            self.close_current_segment_file()?;
-            self.open_new_segment_file()?;
-        }
-
+        // Write data to segment
         if let Some(file) = self.current_ts_file.as_mut() {
             file.write_all(data)?;
             file.flush()?;
         }
 
-        // --- Parse data in 188-byte chunks to track PCR
+        // Parse the TS packets for PCR
         let pkt_count = data.len() / 188;
         for i in 0..pkt_count {
             let pkt = &data[i * 188..(i + 1) * 188];
             self.pcr_tracker.handle_ts_packet(pkt);
+        }
+
+        // Check if the PCR-based duration has reached our target
+        let segment_duration_target = get_segment_duration_seconds() as f64;
+        let current_pcr_duration = self.pcr_tracker.duration_seconds();
+        if current_pcr_duration >= segment_duration_target {
+            // Time to close this segment and start a new one
+            self.close_current_segment_file()?;
+            self.open_new_segment_file()?;
         }
 
         Ok(())
@@ -672,20 +672,13 @@ impl ManualSegmenter {
 
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         if let Some(mut writer) = self.current_ts_file.take() {
-            // Ensure all buffered data is written to disk
             writer.flush()?;
             drop(writer);
 
-            // --- MODIFIED: Use PCR-based duration, fallback to real time
-            let real_pcr_duration = self.pcr_tracker.duration_seconds();
-            let actual_duration = if real_pcr_duration > 0.0 {
-                real_pcr_duration
-            } else {
-                // fallback to measuring with wall clock if no valid PCR
-                self.current_segment_start.elapsed().as_secs_f64()
-            };
-            // --- END MODIFIED
+            // The real PCR-based duration
+            let actual_duration = self.pcr_tracker.duration_seconds();
 
+            // Build the segment path
             let segment_path = self.current_segment_path(self.segment_index + 1);
 
             self.playlist_entries.push(PlaylistEntry {
@@ -707,19 +700,13 @@ impl ManualSegmenter {
             self.segment_index += 1;
             self.rewrite_m3u8()?;
 
-            // Reset the timer so the next segment starts timing fresh
-            self.current_segment_start = Instant::now();
-
-            // Reset PCR tracker for the next segment
-            self.pcr_tracker = PcrTracker::default();
+            // Reset PCR so next segment starts fresh
+            self.pcr_tracker.reset();
         }
         Ok(())
     }
 
     fn open_new_segment_file(&mut self) -> std::io::Result<()> {
-        // Mark the start time (for measuring actual durations)
-        self.current_segment_start = Instant::now();
-
         let segment_path = self.current_segment_path(self.segment_index);
         let full_path = Path::new(&self.output_dir).join(&segment_path);
 
@@ -755,6 +742,7 @@ impl ManualSegmenter {
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
+        // We'll start with a target duration from env + 1, but we will refine on rewrite
         writeln!(
             f,
             "#EXT-X-TARGETDURATION:{}",
@@ -774,6 +762,7 @@ impl ManualSegmenter {
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
 
+        // Recompute the largest segment duration so far
         let max_seg = self
             .playlist_entries
             .iter()
@@ -1119,6 +1108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
+            // If injecting PAT/PMT, update the table cache
             if manual_segment && inject_pat_pmt {
                 let pkt_count = ts_payload.len() / 188;
                 let mut cache = table_cache.lock().unwrap();
@@ -1143,7 +1133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // If manual, write to segments ourselves
+            // If manual, write to segments ourselves (PCR-based)
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload) {
                     eprintln!("Error writing manual TS segment: {:?}", e);
