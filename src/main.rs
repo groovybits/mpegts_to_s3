@@ -67,6 +67,23 @@ fn get_s3_password() -> String {
     std::env::var("S3_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
 }
 
+/// Utility: Attempt to get the actual duration from file creation/modification times.
+/// Fallback to environment-based default if we can't measure it.
+fn get_actual_file_duration(path: &Path) -> f64 {
+    if let Ok(metadata) = path.metadata() {
+        if let Ok(created_time) = metadata.created() {
+            if let Ok(modified_time) = metadata.modified() {
+                if let Ok(elapsed) = modified_time.duration_since(created_time) {
+                    // Return measured duration
+                    return elapsed.as_secs_f64();
+                }
+            }
+        }
+    }
+    // Fallback
+    get_segment_duration_seconds() as f64
+}
+
 #[derive(Debug, Clone)]
 pub struct HourlyIndexEntry {
     pub sequence_id: u64,
@@ -166,11 +183,20 @@ impl HourlyIndexCreator {
             // Standard HLS boilerplate
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
-            writeln!(
-                file,
-                "#EXT-X-TARGETDURATION:{}",
-                get_segment_duration_seconds() + 1
-            )?;
+
+            // Per HLS spec, #EXT-X-TARGETDURATION should be >= the ceiling of any segment's duration.
+            // We'll find the max segment duration among these entries. Fallback to the env default if none.
+            let target_duration = if let Some(vec) = entries {
+                let max_seg = vec
+                    .iter()
+                    .map(|e| e.duration.ceil() as u64)
+                    .max()
+                    .unwrap_or(get_segment_duration_seconds());
+                max_seg
+            } else {
+                get_segment_duration_seconds()
+            };
+            writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration)?;
 
             // If we have entries, compute the lowest sequence_id
             let media_seq = if let Some(vec) = entries {
@@ -180,15 +206,15 @@ impl HourlyIndexCreator {
             };
             writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", media_seq)?;
 
-            // Then write each segment in ascending sequence_id order (optional, but recommended)
+            // Then write each segment in ascending sequence_id order
             if let Some(vec) = entries {
-                // Sort by sequence_id so the playlist is in correct order
                 let mut sorted = vec.clone();
                 sorted.sort_by_key(|e| e.sequence_id);
                 for entry in sorted {
                     for line in &entry.custom_lines {
                         writeln!(file, "{}", line)?;
                     }
+                    // Use a decimal with enough precision for Apple HLS
                     writeln!(file, "#EXTINF:{:.6},", entry.duration)?;
                     writeln!(file, "{}", entry.signed_url)?;
                 }
@@ -198,9 +224,13 @@ impl HourlyIndexCreator {
         // Atomic rename to the final "hourly_index.m3u8"
         std::fs::rename(&temp_path, &index_path)?;
 
-        // Upload the new index to S3
-        self.upload_local_file_to_s3(&index_path, &format!("{}/hourly_index.m3u8", hour_dir))
-            .await?;
+        // Upload the new index to S3, specifying correct MIME type
+        self.upload_local_file_to_s3(
+            &index_path,
+            &format!("{}/hourly_index.m3u8", hour_dir),
+            "application/vnd.apple.mpegurl", // correct MIME for HLS playlist
+        )
+        .await?;
 
         // Update local `urls.log` (also do temp-then-rename)
         let final_index_url = self
@@ -284,15 +314,16 @@ impl HourlyIndexCreator {
         self.generate_url(object_key).await
     }
 
-    /// Upload a local file to S3
+    /// Upload a local file to S3 (with provided mime-type)
     async fn upload_local_file_to_s3(
         &self,
         local_path: &std::path::Path,
         object_key: &str,
+        content_type: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!(
-            "Uploading hourly index -> s3://{}/{}",
-            self.bucket, object_key
+            "Uploading hourly index -> s3://{}/{} (content_type={})",
+            self.bucket, object_key, content_type
         );
 
         let body_bytes = aws_sdk_s3::primitives::ByteStream::from_path(local_path).await?;
@@ -303,6 +334,7 @@ impl HourlyIndexCreator {
             .body(body_bytes)
             // Tells clients not to cache the .m3u8
             .cache_control("no-cache, no-store, must-revalidate")
+            .content_type(content_type)
             .send()
             .await?;
 
@@ -550,6 +582,7 @@ impl ManualSegmenter {
 
         let elapsed = self.current_segment_start.elapsed().as_secs_f64();
         let segment_duration = get_segment_duration_seconds() as f64;
+        // If we've hit/exceeded our target segment length, finalize this segment
         if elapsed >= segment_duration {
             self.close_current_segment_file()?;
             self.open_new_segment_file()?;
@@ -568,14 +601,18 @@ impl ManualSegmenter {
             writer.flush()?;
             drop(writer);
 
-            let duration = get_segment_duration_seconds() as f64;
+            // Measure actual segment duration in real time
+            let actual_duration = self.current_segment_start.elapsed().as_secs_f64();
+
             let segment_path = self.current_segment_path(self.segment_index + 1);
 
+            // Store in our in-memory playlist
             self.playlist_entries.push(PlaylistEntry {
-                duration,
+                duration: actual_duration,
                 path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
             });
 
+            // Implement rolling segment deletion if desired
             if self.max_segments_in_index > 0
                 && self.playlist_entries.len() > self.max_segments_in_index
             {
@@ -588,12 +625,17 @@ impl ManualSegmenter {
 
             self.segment_index += 1;
             self.rewrite_m3u8()?;
+
+            // Reset the timer so the next segment starts timing fresh
+            self.current_segment_start = Instant::now();
         }
         Ok(())
     }
 
     fn open_new_segment_file(&mut self) -> std::io::Result<()> {
+        // Mark the start time (for measuring actual durations)
         self.current_segment_start = Instant::now();
+
         let segment_path = self.current_segment_path(self.segment_index);
         let full_path = Path::new(&self.output_dir).join(&segment_path);
 
@@ -627,10 +669,15 @@ impl ManualSegmenter {
             .truncate(true)
             .open(&self.playlist_path)?;
 
-        let segment_duration = get_segment_duration_seconds();
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
+        // We'll start with a target duration of the environment variable + 1,
+        // but will refine it on rewrite.
+        writeln!(
+            f,
+            "#EXT-X-TARGETDURATION:{}",
+            get_segment_duration_seconds() + 1
+        )?;
         writeln!(f, "#EXT-X-MEDIA-SEQUENCE:0")?;
         Ok(())
     }
@@ -642,16 +689,25 @@ impl ManualSegmenter {
             .truncate(true)
             .open(&self.playlist_path)?;
 
-        let segment_duration = get_segment_duration_seconds();
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
+
+        // Recompute the largest segment duration so far
+        let max_seg = self
+            .playlist_entries
+            .iter()
+            .map(|e| e.duration.ceil() as u64)
+            .max()
+            .unwrap_or_else(|| get_segment_duration_seconds());
+        writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg)?;
+
         let seq_start = self
             .segment_index
             .saturating_sub(self.playlist_entries.len() as u64);
         writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
 
         for entry in &self.playlist_entries {
+            // Apple wants decimal durations
             writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
             writeln!(f, "{}", entry.path)?;
         }
@@ -797,8 +853,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-           interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-           inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
+            interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+            inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
         endpoint,
         region_name,
         bucket,
@@ -856,7 +912,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ffmpeg_child, mut ffmpeg_stdin_buf) = if !manual_segment {
         let hls_segment_filename =
             format!("{}/%Y/%m/%d/%H/segment_%Y%m%d-%H%M%S_%04d.ts", output_dir);
-        let m3u8_output = "index.m3u8".to_string();
+        let m3u8_output = format!("index.m3u8");
 
         info!("Starting FFmpeg with output: {}", m3u8_output);
         let mut child = Command::new("ffmpeg")
@@ -875,6 +931,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .arg("hls")
             .arg("-map")
             .arg("0")
+            // Request small segments so Apple sees decimals
             .arg("-hls_time")
             .arg("2")
             .arg("-hls_segment_type")
@@ -1131,7 +1188,6 @@ async fn handle_file_events(
                                     }
                                 };
                                 let key_str = relative_path.to_string_lossy().to_string();
-
                                 let hour_dir = relative_path
                                     .parent()
                                     .map(|p| p.to_string_lossy().to_string())
@@ -1151,16 +1207,21 @@ async fn handle_file_events(
                                     tracker.mark_uploaded(full_path_str.clone());
                                 }
 
-                                // Add #EXT-X-PROGRAM-DATE-TIME
-                                //let current_time = Utc::now().to_rfc3339();
-                                //let custom_lines =
-                                //    vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
+                                // For the hourly index, we need an accurate duration.
+                                // We'll measure it from file metadata (or fallback).
+                                let actual_segment_duration = get_actual_file_duration(&path);
+
+                                // Add #EXT-X-PROGRAM-DATE-TIME if desired
+                                // let current_time = Utc::now().to_rfc3339();
+                                // let custom_lines = vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
                                 let custom_lines = vec![];
+
+                                // Update hourly index with real segment duration
                                 hourly_index_creator
                                     .record_segment(
                                         &hour_dir,
                                         &key_str,
-                                        get_segment_duration_seconds() as f64,
+                                        actual_segment_duration,
                                         custom_lines,
                                         &output_dir,
                                     )
@@ -1189,13 +1250,27 @@ async fn upload_file_to_s3(
     let relative_path = strip_base_dir(path, base_dir)?;
     let key_str = relative_path.to_string_lossy().to_string();
 
+    // Choose content_type by file extension
+    let mime_type = if let Some(ext) = path.extension() {
+        if ext == "m3u8" {
+            "application/vnd.apple.mpegurl"
+        } else {
+            // Default to TS
+            "video/mp2t"
+        }
+    } else {
+        // Fallback
+        "application/octet-stream"
+    };
+
     let file_size = fs::metadata(path)?.len();
     println!(
-        "Uploading {} ({} bytes) -> s3://{}/{}",
+        "Uploading {} ({} bytes) -> s3://{}/{} as {}",
         path.display(),
         file_size,
         bucket,
-        key_str
+        key_str,
+        mime_type
     );
 
     let mut retries = 3;
@@ -1226,7 +1301,7 @@ async fn upload_file_to_s3(
             .bucket(bucket)
             .key(&key_str)
             .body(body_stream)
-            .content_type("video/mp2t")
+            .content_type(mime_type)
             .content_length(file_size as i64)
             .send()
             .await
