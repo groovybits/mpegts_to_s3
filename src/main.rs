@@ -100,6 +100,7 @@ impl HourlyIndexCreator {
         segment_key: &str,
         duration: f64,
         custom_lines: Vec<String>,
+        output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 1) Presign the S3 GET URL so the HLS client can fetch it
         let signed_url = self.presign_get_url(segment_key).await?;
@@ -114,16 +115,20 @@ impl HourlyIndexCreator {
         entries.push(entry);
 
         // 3) Re-write the "hourly_index.m3u8" for that hour
-        self.write_hourly_index(hour_dir).await?;
+        self.write_hourly_index(hour_dir, output_dir).await?;
 
         Ok(())
     }
 
     /// Actually generate or update the "hourly_index.m3u8" in that hour folder.  
     /// Then, optionally upload that `.m3u8` to S3 so remote playback can see it.
-    async fn write_hourly_index(&self, hour_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // For an hour like `2025/01/15/11`, we'll put `hourly_index.m3u8` there
-        let local_dir = Path::new(hour_dir);
+    async fn write_hourly_index(
+        &self,
+        hour_dir: &str,
+        output_dir: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Join the output_dir with hour_dir for local file operations
+        let local_dir = Path::new(output_dir).join(hour_dir);
         let index_path = local_dir.join("hourly_index.m3u8");
 
         fs::create_dir_all(&local_dir)?;
@@ -835,6 +840,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s3_client_clone = s3_client.clone();
     let bucket_clone = bucket.clone();
     let output_dir_clone = output_dir.clone();
+    let output_dir: String = matches.get_one::<String>("output_dir").unwrap().to_string();
+    let output_dir_for_task = output_dir.clone(); // Clone again for the task
+
     let upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
             watch_rx,
@@ -843,6 +851,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_dir_clone,
             remove_local,
             hourly_index_creator,
+            output_dir_for_task,
         )
         .await
         {
@@ -873,7 +882,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut manual_segmenter = if manual_segment {
-        let seg = ManualSegmenter::new(output_dir)
+        let seg = ManualSegmenter::new(&output_dir)
             .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt)
             .with_max_segments(hls_keep_segments);
         Some(seg)
@@ -990,6 +999,7 @@ async fn handle_file_events(
     base_dir: String,
     remove_local: bool,
     mut hourly_index_creator: HourlyIndexCreator,
+    output_dir: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds()))); // 1 hour max age
 
@@ -1033,6 +1043,7 @@ async fn handle_file_events(
                                         &path_str_clone,
                                         get_segment_duration_seconds() as f64,
                                         custom_lines,
+                                        &output_dir,
                                     )
                                     .await?;
                             } else {
