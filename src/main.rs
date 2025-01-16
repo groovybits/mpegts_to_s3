@@ -15,7 +15,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
-use chrono::Utc;
+//use chrono::Utc;
 use clap::{Arg, Command as ClapCommand};
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
@@ -1152,9 +1152,10 @@ async fn handle_file_events(
                                 }
 
                                 // Add #EXT-X-PROGRAM-DATE-TIME
-                                let current_time = Utc::now().to_rfc3339();
-                                let custom_lines =
-                                    vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
+                                //let current_time = Utc::now().to_rfc3339();
+                                //let custom_lines =
+                                //    vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
+                                let custom_lines = vec![];
                                 hourly_index_creator
                                     .record_segment(
                                         &hour_dir,
