@@ -1,90 +1,139 @@
-# Rust based Multicast MPEG-TS UDP Stream Pcap Capture for S3/MinIO HLS Hourly Archiving for Playback
+# Rust-Based Multicast MPEG-TS UDP Stream PCAP Capture for S3/MinIO HLS Hourly Archiving and Playback
 
-This Rust application captures MPEG-TS UDP multicast streams as time based segments, creates an m3u8 playlist, uploads the segments to MinIO/S3 storage, signs the segments and a master playlist for playback.
+This Rust application enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback.
 
+---
+
+## Quick Start Guide
+
+### Clone and Build the Project
 ```bash
-# Capture udp://227.1.1.102:4102 from network interface net1 
-# with segments in ./ts/ directory and upload to MinIO/S3
-# using a server at http://192.168.130.93 port 3001 http, 9000 MinIO, 9001 MinIO Admin
 git clone https://github.com/groovybits/mpegts_to_s3.git
 cd mpegts_to_s3
 
-# Build Rust mpegts_to_s3 program
+# Build the application in release mode
 cargo build --release
-
-# Start MinIO Server on 127.0.0.1:9000 from a container w/podman
-scripts/minio_server.py & # background, uses ./data/ for storage
-
-# Create hls subdir for index.m3u8 serving
-mkdir hls && cd hls 
-# Run Python HTTP Server port 3001 from ./hls/ directory
-../scripts/http_server.py &  # background, serves the current directory
-
-# Run Rust mpegts_to_s3 collecting in ts/ directory from udp://227.1.1.102:4102
-# as ts/year/month/day/hour/segment_YYYYMMDD-HHMMSS__0000.ts 10 second segments
-SEGMENT_DURATION_SECONDS=10 \
-  ../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
-    -o ts -n net1 --manual_segment --hls_keep_segments 3
-
-# From another computer playback directly from the HTTP server
-mpv -i http://192.168.130.93:3001/index.m3u8 
-
-# Playback from minIO / S3 signed urls
-## Get list of each hours signed master index URL
-curl -s http://192.168.130.93:3001/ts/urls.log | tail -1 # Hour 2025/01/16/06 => http://...
-
-## Setup SSH Tunnel into HTTP server
-scripts/minio_admin.sh # ssh -p 3999 -L 9000:localhost:9000 -L 9001:localhost:9001 root@192.168.130.93 -N -f
-
-## Playback the hourly_index.m3u8
-mpv http://127.0.0.1:9000/ltnhls/2025/01/16/06/hourly_index.m3u8?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=minioadmin%2F20250116%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20250116T114743Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=9271b9f8ff7ddffb4fa720b16077d5481926f7ad1d533474341502bc399e5fde
 ```
+
+### Configure and Run the Components
+#### 1. Start MinIO Server
+```bash
+# Start the MinIO server (uses ./data/ for storage)
+scripts/minio_server.py &
+```
+
+#### 2. Serve HLS Playlist
+```bash
+# Create HLS directory for serving the index.m3u8 file
+mkdir hls && cd hls
+
+# Run Python HTTP Server to serve files from the ./hls/ directory
+../scripts/http_server.py &
+```
+
+#### 3. Capture and Segment UDP Stream
+```bash
+# Capture multicast stream from udp://227.1.1.102:4102 on interface net1
+# Segments are saved to ./ts/ directory with 10-second duration and uploaded to MinIO
+SEGMENT_DURATION_SECONDS=10 \
+../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
+    -o ts -n net1 --manual_segment --hls_keep_segments 3
+```
+
+#### 4. Playback
+- **Direct Playback:**
+```bash
+mpv -i http://192.168.130.93:3001/index.m3u8
+```
+
+- **MinIO Playback:**
+  1. Retrieve the signed URL for the desired hour:
+     ```bash
+     curl -s http://192.168.130.93:3001/ts/urls.log | tail -1
+     ```
+  2. Setup an SSH tunnel for the HTTP server:
+     ```bash
+     scripts/minio_admin.sh
+     ```
+  3. Play back the hourly playlist:
+     ```bash
+     mpv http://127.0.0.1:9000/ltnhls/2025/01/16/06/hourly_index.m3u8?...(signed_url_params)
+     ```
+
+---
 
 ## Prerequisites
 
-- Newest Rust toolchain ([install here](https://rustup.rs/))
-- MinIO server container or S3 [scripts/minio_server.sh](scripts/minio_server.sh)
-- PCAP library (ensure `libpcap` is installed)
-- FFmpeg installed for stream handling (optional)
-- Ports 9000 and 9001 open for MinIO and HTTP server
-- SSH Forwarding into 127.0.0.1:9001 on the host for HTTP server
+- **Rust Toolchain:** Install via [Rustup](https://rustup.rs/).
+- **MinIO/S3 Server:** Ensure MinIO is available locally or via a container.
+- **Dependencies:** Install `libpcap` for packet capture and FFmpeg (optional) for HLS segment generation.
+- **Ports:** Open ports 9000 and 9001 for MinIO and the HTTP server.
+- **SSH Tunneling:** For HTTP access to MinIO, set up SSH forwarding.
 
-## Configuration
+---
+
+## Usage
 
 ```bash
-PCAP capture -> HLS -> Directory Watch -> S3 Upload
-
-Usage: mpegts_to_s3 [OPTIONS]
-
-Options:
-  -e, --endpoint <endpoint>
-          S3-compatible endpoint [default: http://127.0.0.1:9000]
-  -r, --region <region>
-          S3 region [default: us-west-2]
-  -b, --bucket <bucket>
-          S3 bucket name [default: ltnhls]
-  -i, --udp_ip <udp_ip>
-          UDP multicast IP to filter [default: 227.1.1.102]
-  -p, --udp_port <udp_port>
-          UDP port to filter [default: 4102]
-  -n, --interface <interface>
-          Network interface for pcap [default: net1]
-  -t, --timeout <timeout>
-          Capture timeout in milliseconds [default: 1000]
-  -o, --output_dir <output_dir>
-          Local dir for HLS output (could be a RAM disk) [default: hls]
-      --remove_local
-          Remove local .ts/.m3u8 after uploading to S3?
-      --manual_segment
-          Perform manual TS segmentation + .m3u8 generation (no FFmpeg).
-      --inject_pat_pmt
-          If using manual segmentation, prepend the latest PAT & PMT to each segment.
-      --hls_keep_segments <hls_keep_segments>
-          Limit how many segments to keep in the index.m3u8 (0=unlimited). Also removes old .ts from disk. [default: 0]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
+mpegts_to_s3 [OPTIONS]
 ```
+### Options:
+- **General Settings:**
+  - `-e`, `--endpoint`: S3-compatible endpoint (default: `http://127.0.0.1:9000`)
+  - `-r`, `--region`: S3 region (default: `us-west-2`)
+  - `-b`, `--bucket`: S3 bucket name (default: `ltnhls`)
+- **UDP Stream Capture:**
+  - `-i`, `--udp_ip`: Multicast IP to filter (default: `227.1.1.102`)
+  - `-p`, `--udp_port`: UDP port to filter (default: `4102`)
+  - `-n`, `--interface`: Network interface for packet capture (default: `net1`)
+  - `-t`, `--timeout`: Packet capture timeout in milliseconds (default: `1000`)
+- **HLS Output:**
+  - `-o`, `--output_dir`: Local directory for HLS output (default: `hls`)
+  - `--remove_local`: Remove local `.ts` and `.m3u8` files after upload
+  - `--manual_segment`: Use manual segmentation instead of FFmpeg
+  - `--inject_pat_pmt`: Prepend PAT & PMT tables to each segment (if manually segmented)
+  - `--hls_keep_segments`: Number of segments to keep in the `.m3u8` index (0 = unlimited, default: `0`)
 
-- Monitor uploads in MinIO's web interface or your S3-compatible client.
+---
+
+## How It Works
+
+1. **Capture:** The application uses `libpcap` to capture UDP multicast MPEG-TS packets on a specified interface.
+2. **Segment:** It either:
+   - **Automatically segments** streams with FFmpeg
+   - **Manually segments** streams by directly processing MPEG-TS packets
+3. **Upload:** A directory watcher uploads new `.ts` segments and playlists to S3 or MinIO.
+4. **Playback:** The uploaded segments are accessible via signed or unsigned URLs, enabling HLS playback.
+
+---
+
+## Monitoring and Logs
+- **MinIO Web Interface:** View uploaded files via the MinIO web client.
+- **Segment Logs:** Signed URL logs are stored in `urls.log` in the output directory.
+
+---
+
+## Example File Structure
+```text
+hls/
+├── index.m3u8
+├── 2025/
+    └── 01/
+        └── 16/
+            └── 06/
+                ├── segment_20250116-060000__0000.ts
+                └── hourly_index.m3u8
+```
+---
+
+## Development Notes
+
+The full source code is located in the `src/` directory. Additional utility scripts for managing MinIO and HTTP servers are available in the `scripts/` folder.
+
+For questions or issues, refer to the repository's issue tracker.
+
+---
+
+**Author:** Chris Kennedy  
+**Date:** January 15, 2025
+
