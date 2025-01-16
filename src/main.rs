@@ -1123,13 +1123,19 @@ async fn upload_file_to_s3(
         key_str
     );
 
+    let file_size = fs::metadata(path)?.len();
+    println!("Uploading {} bytes for {}", file_size, path.display());
+
     let mut retries = 3;
     while retries > 0 {
+        let body_bytes: ByteStream = ByteStream::from_path(path).await?;
         match s3_client
             .put_object()
             .bucket(bucket)
             .key(&key_str)
-            .body(ByteStream::from_path(path).await?)
+            .content_type("video/mp2t")
+            .content_length(file_size as i64)
+            .body(body_bytes)
             .send()
             .await
         {
