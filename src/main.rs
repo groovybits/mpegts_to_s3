@@ -724,6 +724,15 @@ impl ManualSegmenter {
             {
                 let _ = self.playlist_entries.remove(0);
             }
+
+            // If we're over the max ring size, drop the oldest segment
+            let mut buf = self.diskless_buffer.lock().unwrap();
+            if buf.queue.len() > self.max_segments_in_index {
+                buf.queue.pop_front();
+            }
+
+            // free the buffer we cloned
+            drop(seg_data_clone);
         }
 
         // bump segment index
