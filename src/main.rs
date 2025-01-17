@@ -1223,11 +1223,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    if let Ok(_sock) = join_multicast_on_iface(filter_ip, filter_port, interface) {
-        // joined multicast
-    } else {
-        eprintln!("Failed to join multicast group or find interface IP!");
-    }
+    let _sock = match join_multicast_on_iface(filter_ip, filter_port, interface) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to join multicast group or find interface IP: {}", e);
+            return Ok(());
+        }
+    };
 
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
