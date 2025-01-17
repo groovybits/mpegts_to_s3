@@ -15,7 +15,6 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
-//use chrono::Utc;
 use clap::{Arg, Command as ClapCommand};
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
@@ -33,7 +32,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
@@ -65,6 +64,23 @@ fn get_s3_username() -> String {
 
 fn get_s3_password() -> String {
     std::env::var("S3_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
+}
+
+/// Utility: Attempt to get the actual duration from file creation/modification times.
+/// Fallback to environment-based default if we can't measure it.
+fn get_actual_file_duration(path: &Path) -> f64 {
+    if let Ok(metadata) = path.metadata() {
+        if let Ok(created_time) = metadata.created() {
+            if let Ok(modified_time) = metadata.modified() {
+                if let Ok(elapsed) = modified_time.duration_since(created_time) {
+                    // Return measured duration
+                    return elapsed.as_secs_f64();
+                }
+            }
+        }
+    }
+    // Fallback
+    get_segment_duration_seconds() as f64
 }
 
 #[derive(Debug, Clone)]
@@ -166,11 +182,19 @@ impl HourlyIndexCreator {
             // Standard HLS boilerplate
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
-            writeln!(
-                file,
-                "#EXT-X-TARGETDURATION:{}",
-                get_segment_duration_seconds() + 1
-            )?;
+
+            // Per HLS spec, #EXT-X-TARGETDURATION >= the ceiling of any segment's duration.
+            let target_duration = if let Some(vec) = entries {
+                let max_seg = vec
+                    .iter()
+                    .map(|e| e.duration.ceil() as u64)
+                    .max()
+                    .unwrap_or(get_segment_duration_seconds());
+                max_seg
+            } else {
+                get_segment_duration_seconds()
+            };
+            writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration)?;
 
             // If we have entries, compute the lowest sequence_id
             let media_seq = if let Some(vec) = entries {
@@ -180,9 +204,8 @@ impl HourlyIndexCreator {
             };
             writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", media_seq)?;
 
-            // Then write each segment in ascending sequence_id order (optional, but recommended)
+            // Then write each segment in ascending sequence_id order
             if let Some(vec) = entries {
-                // Sort by sequence_id so the playlist is in correct order
                 let mut sorted = vec.clone();
                 sorted.sort_by_key(|e| e.sequence_id);
                 for entry in sorted {
@@ -195,14 +218,18 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Atomic rename to the final "hourly_index.m3u8"
+        // Atomic rename to final
         std::fs::rename(&temp_path, &index_path)?;
 
         // Upload the new index to S3
-        self.upload_local_file_to_s3(&index_path, &format!("{}/hourly_index.m3u8", hour_dir))
-            .await?;
+        self.upload_local_file_to_s3(
+            &index_path,
+            &format!("{}/hourly_index.m3u8", hour_dir),
+            "application/vnd.apple.mpegurl",
+        )
+        .await?;
 
-        // Update local `urls.log` (also do temp-then-rename)
+        // Update local `urls.log`
         let final_index_url = self
             .presign_get_url(&format!("{}/hourly_index.m3u8", hour_dir))
             .await?;
@@ -211,7 +238,7 @@ impl HourlyIndexCreator {
         Ok(())
     }
 
-    /// Rewrites `urls.log` in the local output dir with the new line appended
+    /// Rewrites `urls.log` in the local output dir
     fn rewrite_urls_log(
         &mut self,
         hour_dir: &str,
@@ -221,7 +248,6 @@ impl HourlyIndexCreator {
         let log_path = std::path::Path::new(output_dir).join("urls.log");
         let temp_path = std::path::Path::new(output_dir).join("urls_temp.log");
 
-        // Read in old lines except the old line for this hour
         let mut lines = vec![];
         if log_path.exists() {
             let old_data = std::fs::read_to_string(&log_path)?;
@@ -231,11 +257,8 @@ impl HourlyIndexCreator {
                 }
             }
         }
-
-        // Insert the new line for this hour
         lines.push(format!("Hour {} => {}", hour_dir, final_url));
 
-        // Write out to temp
         {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
@@ -246,23 +269,17 @@ impl HourlyIndexCreator {
                 writeln!(f, "{}", ln)?;
             }
         }
-
-        // Atomic rename
         std::fs::rename(&temp_path, &log_path)?;
-
         Ok(())
     }
 
-    /// Generate either a signed or an unsigned URL
     async fn generate_url(
         &self,
         object_key: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if self.generate_unsigned_urls {
-            // Build the final URL from the CLI’s endpoint + bucket + object_key
             Ok(format!("{}/{}/{}", self.endpoint, self.bucket, object_key))
         } else {
-            // Signed URL logic
             let config =
                 PresigningConfig::expires_in(Duration::from_secs(get_url_signing_seconds()))?;
             let presigned_req = self
@@ -276,7 +293,6 @@ impl HourlyIndexCreator {
         }
     }
 
-    /// For rewriting `urls.log`, we also presign the `.m3u8` object if signing is enabled
     async fn presign_get_url(
         &self,
         object_key: &str,
@@ -284,30 +300,41 @@ impl HourlyIndexCreator {
         self.generate_url(object_key).await
     }
 
-    /// Upload a local file to S3
     async fn upload_local_file_to_s3(
         &self,
         local_path: &std::path::Path,
         object_key: &str,
+        content_type: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!(
-            "Uploading hourly index -> s3://{}/{}",
-            self.bucket, object_key
+            "Uploading hourly index -> s3://{}/{} (content_type={})",
+            self.bucket, object_key, content_type
         );
-
-        let body_bytes = aws_sdk_s3::primitives::ByteStream::from_path(local_path).await?;
+        let body_bytes = ByteStream::from_path(local_path).await?;
         self.s3_client
             .put_object()
             .bucket(&self.bucket)
             .key(object_key)
             .body(body_bytes)
-            // Tells clients not to cache the .m3u8
             .cache_control("no-cache, no-store, must-revalidate")
+            .content_type(content_type)
             .send()
             .await?;
-
         Ok(())
     }
+}
+
+/// Finds the first IPv4 address associated with `interface_name`
+fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+    let ifaces = get_if_addrs()?;
+    for iface in ifaces {
+        if iface.name == interface_name {
+            if let IpAddr::V4(ipv4) = iface.ip() {
+                return Ok(ipv4);
+            }
+        }
+    }
+    Err(format!("No IPv4 address found for interface '{}'", interface_name).into())
 }
 
 /// Attempt to join `multicast_addr` + `port` on a given `interface_name`
@@ -319,10 +346,22 @@ pub fn join_multicast_on_iface(
     let group_v4: Ipv4Addr = multicast_addr.parse()?;
     let local_iface_ip = find_ipv4_for_interface(interface_name)?;
 
+    // Create a UDP/IPv4 socket
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // Allow re-binding to the same address (needed for multicast on many OSes)
     sock.set_reuse_address(true)?;
-    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    #[cfg(unix)]
+    sock.set_reuse_port(true)?;
+
+    // Bind specifically to the local interface's IP (instead of 0.0.0.0)
+    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(local_iface_ip), port);
     sock.bind(&bind_addr.into())?;
+
+    // Tell the kernel which interface to use for outbound multicast traffic
+    sock.set_multicast_if_v4(&local_iface_ip)?;
+
+    // Finally, join the multicast group on that interface
     sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
 
     println!(
@@ -330,19 +369,6 @@ pub fn join_multicast_on_iface(
         multicast_addr, interface_name, local_iface_ip, port
     );
     Ok(sock)
-}
-
-/// Finds the first IPv4 address of `interface_name`
-fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
-    let ifaces = get_if_addrs()?;
-    for iface in ifaces {
-        if iface.name == interface_name {
-            if let IpAddr::V4(ipv4) = iface.ip() {
-                return Ok(ipv4);
-            }
-        }
-    }
-    Err(format!("No IPv4 found for interface '{}'", interface_name).into())
 }
 
 struct FileTracker {
@@ -397,6 +423,7 @@ async fn ensure_bucket_exists(
 }
 
 // --------------------- MpegTsTableCache ---------------------
+// (Keeps latest PAT/PMT for re-injection.)
 
 #[derive(Default)]
 struct MpegTsTableCache {
@@ -489,6 +516,247 @@ impl MpegTsTableCache {
     }
 }
 
+// ----------------------------------------------------------------
+// PAT/PMT parsing for the single authoritative PCR PID
+// ----------------------------------------------------------------
+
+/// Try to parse the PMT PID out of this PAT packet (PID=0).
+/// Returns Some(pmt_pid) if successful.
+fn parse_pat_for_pmt_pid(pkt: &[u8]) -> Option<u16> {
+    if pkt.len() < 188 {
+        return None;
+    }
+    let transport_error_indicator = (pkt[1] & 0x80) != 0;
+    if transport_error_indicator {
+        return None;
+    }
+
+    let adaptation_control = (pkt[3] >> 4) & 0x03;
+    let mut payload_offset = 4;
+    if adaptation_control == 0b10 || adaptation_control == 0b11 {
+        let adaptation_length = pkt[payload_offset] as usize;
+        payload_offset += 1 + adaptation_length;
+        if payload_offset >= 188 {
+            return None;
+        }
+    }
+
+    if payload_offset >= 188 {
+        return None;
+    }
+    let pointer_field = pkt[payload_offset];
+    payload_offset += 1 + pointer_field as usize;
+    if payload_offset + 8 > 188 {
+        return None;
+    }
+
+    // table_id = 0x00 for PAT
+    if pkt[payload_offset] != 0x00 {
+        return None;
+    }
+
+    let section_length =
+        u16::from_be_bytes([pkt[payload_offset + 1] & 0x0f, pkt[payload_offset + 2]]) as usize;
+    let pat_section_end = payload_offset + 3 + section_length;
+    let mut program_info_offset = payload_offset + 8;
+
+    while program_info_offset + 4 <= pat_section_end.saturating_sub(4) {
+        let program_number =
+            u16::from_be_bytes([pkt[program_info_offset], pkt[program_info_offset + 1]]);
+        let pid_hi = pkt[program_info_offset + 2] & 0x1F;
+        let pid_lo = pkt[program_info_offset + 3];
+        let candidate_pmt_pid = ((pid_hi as u16) << 8) | (pid_lo as u16);
+
+        // nonzero program_number => real PMT PID
+        if program_number != 0 {
+            return Some(candidate_pmt_pid);
+        }
+        program_info_offset += 4;
+    }
+
+    None
+}
+
+/// Try to parse the PCR PID out of the PMT packet (PID = the one from parse_pat_for_pmt_pid).
+fn parse_pmt_for_pcr_pid(pkt: &[u8]) -> Option<u16> {
+    if pkt.len() < 188 {
+        return None;
+    }
+
+    let adaptation_control = (pkt[3] >> 4) & 0x3;
+    let mut payload_offset = 4;
+
+    // Skip adaptation field if present
+    if adaptation_control == 0b10 || adaptation_control == 0b11 {
+        let adaptation_length = pkt[payload_offset] as usize;
+        payload_offset += 1 + adaptation_length;
+        if payload_offset >= 188 {
+            return None;
+        }
+    }
+
+    // If there's no payload, bail
+    if adaptation_control == 0b00 || adaptation_control == 0b10 {
+        return None;
+    }
+
+    // Skip pointer_field
+    if payload_offset >= 188 {
+        return None;
+    }
+    let pointer_field = pkt[payload_offset];
+    payload_offset += 1 + pointer_field as usize;
+    if payload_offset + 8 > 188 {
+        return None;
+    }
+
+    // table_id = 0x02 => PMT
+    if pkt[payload_offset] != 0x02 {
+        return None;
+    }
+
+    // The PCR PID is at [payload_offset + 8..+10]
+    let pcr_pid = ((pkt[payload_offset + 8] as u16 & 0x1F) << 8) | pkt[payload_offset + 9] as u16;
+    Some(pcr_pid)
+}
+
+// ----------------------------------------------------------------
+// PCR tracker with single PID-based logic
+// ----------------------------------------------------------------
+
+#[derive(Default)]
+struct PcrTracker {
+    earliest_pcr: Option<f64>,
+    latest_pcr: Option<f64>,
+    pcr_first_idx: Option<usize>,
+    pcr_last_idx: Option<usize>,
+    total_packets: usize,
+
+    // Key addition: we only track PCR from the authoritative "primary" PID
+    primary_pcr_pid: Option<u16>,
+
+    // We might store "discovered PMT PID" if you want to parse it in steps
+    discovered_pmt_pid: Option<u16>,
+}
+
+impl PcrTracker {
+    fn handle_ts_packet(&mut self, pkt: &[u8]) {
+        if pkt.len() != 188 {
+            return;
+        }
+
+        // Which PID is this packet?
+        let pid = ((pkt[1] as u16 & 0x1F) << 8) | (pkt[2] as u16);
+
+        // ---------------------------------------------------------
+        // 1) If we don't yet know the PCR PID, try to parse PAT/PMT
+        // ---------------------------------------------------------
+        if self.primary_pcr_pid.is_none() {
+            // If it's a PAT (PID=0), parse to find PMT PID
+            if pid == 0 {
+                if let Some(pmt_pid) = parse_pat_for_pmt_pid(pkt) {
+                    self.discovered_pmt_pid = Some(pmt_pid);
+                }
+            }
+            // If it's the PMT PID we discovered, parse to find the real PCR PID
+            else if Some(pid) == self.discovered_pmt_pid {
+                if let Some(pcr_pid) = parse_pmt_for_pcr_pid(pkt) {
+                    println!("Found primary PCR PID = 0x{:04x} from PMT", pcr_pid);
+                    self.primary_pcr_pid = Some(pcr_pid);
+                }
+            }
+        }
+
+        // ---------------------------------------
+        // 2) Only track PCR if pid == primary_pcr_pid
+        // ---------------------------------------
+        if let Some(pcr_pid) = self.primary_pcr_pid {
+            if pid == pcr_pid {
+                self.total_packets += 1;
+
+                let adaptation_control = (pkt[3] >> 4) & 0b11;
+                if adaptation_control == 0b10 || adaptation_control == 0b11 {
+                    let adaptation_len = pkt[4] as usize;
+                    if adaptation_len > 0 && adaptation_len <= 183 {
+                        let adaptation_flags = pkt[5];
+                        let pcr_flag = (adaptation_flags & 0x10) != 0;
+                        if pcr_flag && adaptation_len >= 7 {
+                            if let Some(pcr_value) = parse_pcr(&pkt[6..12]) {
+                                // First PCR?
+                                if self.earliest_pcr.is_none() {
+                                    self.earliest_pcr = Some(pcr_value);
+                                    self.pcr_first_idx = Some(self.total_packets - 1);
+                                }
+                                // Check discontinuity
+                                if let Some(prev) = self.latest_pcr {
+                                    if pcr_value < prev {
+                                        println!("PCR discontinuity: {} -> {}", prev, pcr_value);
+                                        // You might choose to reset or skip
+                                    }
+                                }
+                                self.latest_pcr = Some(pcr_value);
+                                self.pcr_last_idx = Some(self.total_packets - 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Use a conservative partial compensation to yield the final segment duration
+    fn compensated_duration(&self) -> f64 {
+        match (self.earliest_pcr, self.latest_pcr) {
+            (Some(start), Some(end)) if end > start => {
+                let raw = end - start;
+                let first_idx = self.pcr_first_idx.unwrap_or(0);
+                let last_idx = self.pcr_last_idx.unwrap_or(0);
+                if last_idx <= first_idx || raw <= 0.0 {
+                    return raw;
+                }
+
+                let packet_range = (last_idx - first_idx) as f64;
+                let time_per_pkt = if packet_range > 0.0 {
+                    raw / packet_range
+                } else {
+                    0.0
+                };
+                // limit pre/post to 5 packets
+                let packets_before = first_idx.min(5) as f64;
+                let packets_after = (self.total_packets.saturating_sub(last_idx + 1)).min(5) as f64;
+
+                // partial multiplier
+                (raw + (packets_before + packets_after) * time_per_pkt * 0.8) * 1.2
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.earliest_pcr = None;
+        self.latest_pcr = None;
+        self.pcr_first_idx = None;
+        self.pcr_last_idx = None;
+        self.total_packets = 0;
+    }
+}
+
+/// Parse raw 42-bit base + 9-bit extension => f64 seconds
+fn parse_pcr(data: &[u8]) -> Option<f64> {
+    if data.len() < 6 {
+        return None;
+    }
+    let pcr_base = ((data[0] as u64) << 25)
+        | ((data[1] as u64) << 17)
+        | ((data[2] as u64) << 9)
+        | ((data[3] as u64) << 1)
+        | ((data[4] as u64) >> 7);
+
+    let pcr_ext = ((data[4] & 0x01) as u16) << 8 | data[5] as u16;
+    let total_27mhz_ticks = pcr_base * 300 + pcr_ext as u64;
+    Some(total_27mhz_ticks as f64 / 27_000_000.0)
+}
+
 // ------------- MANUAL SEGMENTER -------------
 
 struct PlaylistEntry {
@@ -499,7 +767,6 @@ struct PlaylistEntry {
 struct ManualSegmenter {
     output_dir: String,
     current_ts_file: Option<BufWriter<fs::File>>,
-    current_segment_start: Instant,
     segment_index: u64,
     playlist_path: PathBuf,
     m3u8_initialized: bool,
@@ -509,6 +776,9 @@ struct ManualSegmenter {
 
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
+
+    // Our brand-new selective PcrTracker
+    pcr_tracker: PcrTracker,
 }
 
 impl ManualSegmenter {
@@ -517,7 +787,6 @@ impl ManualSegmenter {
         Self {
             output_dir: output_dir.to_string(),
             current_ts_file: None,
-            current_segment_start: Instant::now(),
             segment_index: 0,
             playlist_path,
             m3u8_initialized: false,
@@ -525,6 +794,7 @@ impl ManualSegmenter {
             inject_pat_pmt: false,
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
+            pcr_tracker: PcrTracker::default(),
         }
     }
 
@@ -547,29 +817,41 @@ impl ManualSegmenter {
         if self.current_ts_file.is_none() {
             self.open_new_segment_file()?;
         }
-
-        let elapsed = self.current_segment_start.elapsed().as_secs_f64();
-        let segment_duration = get_segment_duration_seconds() as f64;
-        if elapsed >= segment_duration {
-            self.close_current_segment_file()?;
-            self.open_new_segment_file()?;
-        }
-
         if let Some(file) = self.current_ts_file.as_mut() {
             file.write_all(data)?;
             file.flush()?;
+        }
+
+        // Update PCR from these packets (if any)
+        let pkt_count = data.len() / 188;
+        for i in 0..pkt_count {
+            let idx_start = i * 188;
+            let pkt = &data[idx_start..(idx_start + 188)];
+            self.pcr_tracker.handle_ts_packet(pkt);
+        }
+
+        // Use the (new) compensated duration for segment cutting
+        let current_duration = self.pcr_tracker.compensated_duration();
+        if current_duration >= get_segment_duration_seconds() as f64 {
+            self.close_current_segment_file()?;
+            self.open_new_segment_file()?;
         }
         Ok(())
     }
 
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         if let Some(mut writer) = self.current_ts_file.take() {
-            // Ensure all buffered data is written to disk
             writer.flush()?;
             drop(writer);
 
-            let duration = get_segment_duration_seconds() as f64;
+            // Use compensated duration
+            let duration = self.pcr_tracker.compensated_duration();
             let segment_path = self.current_segment_path(self.segment_index + 1);
+
+            // Write the duration to a companion file
+            let duration_path = segment_path.with_extension("dur");
+            let full_dur_path = Path::new(&self.output_dir).join(&duration_path);
+            fs::write(full_dur_path, duration.to_string())?;
 
             self.playlist_entries.push(PlaylistEntry {
                 duration,
@@ -583,20 +865,23 @@ impl ManualSegmenter {
                 let old_path = Path::new(&removed.path);
                 if old_path.exists() {
                     let _ = fs::remove_file(old_path);
+                    let dur_path = old_path.with_extension("dur");
+                    let _ = fs::remove_file(dur_path);
                 }
             }
 
             self.segment_index += 1;
             self.rewrite_m3u8()?;
+
+            // Reset PCR each time a segment ends
+            self.pcr_tracker.reset();
         }
         Ok(())
     }
 
     fn open_new_segment_file(&mut self) -> std::io::Result<()> {
-        self.current_segment_start = Instant::now();
         let segment_path = self.current_segment_path(self.segment_index);
         let full_path = Path::new(&self.output_dir).join(&segment_path);
-
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -604,6 +889,7 @@ impl ManualSegmenter {
         let file = fs::File::create(&full_path)?;
         let mut writer = BufWriter::new(file);
 
+        // Inject latest PAT/PMT at the start of each new segment
         if self.inject_pat_pmt {
             if let Some(cache) = &self.pat_pmt_cache {
                 let cache = cache.lock().unwrap();
@@ -612,7 +898,6 @@ impl ManualSegmenter {
         }
 
         self.current_ts_file = Some(writer);
-
         if !self.m3u8_initialized {
             self.init_m3u8()?;
             self.m3u8_initialized = true;
@@ -627,10 +912,14 @@ impl ManualSegmenter {
             .truncate(true)
             .open(&self.playlist_path)?;
 
-        let segment_duration = get_segment_duration_seconds();
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
+        // We'll refine target duration on rewrite
+        writeln!(
+            f,
+            "#EXT-X-TARGETDURATION:{}",
+            get_segment_duration_seconds() + 1
+        )?;
         writeln!(f, "#EXT-X-MEDIA-SEQUENCE:0")?;
         Ok(())
     }
@@ -642,10 +931,17 @@ impl ManualSegmenter {
             .truncate(true)
             .open(&self.playlist_path)?;
 
-        let segment_duration = get_segment_duration_seconds();
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", segment_duration + 1)?;
+
+        let max_seg = self
+            .playlist_entries
+            .iter()
+            .map(|e| e.duration.ceil() as u64)
+            .max()
+            .unwrap_or_else(|| get_segment_duration_seconds());
+        writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg)?;
+
         let seq_start = self
             .segment_index
             .saturating_sub(self.playlist_entries.len() as u64);
@@ -797,8 +1093,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-           interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-           inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
+              interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+              inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
         endpoint,
         region_name,
         bucket,
@@ -827,7 +1123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .load()
         .await;
 
-    // Then build S3 client from that config
+    // Then build S3 client
     let s3_config = aws_sdk_s3::config::Builder::from(&config)
         .force_path_style(true)
         .build();
@@ -836,12 +1132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Ensure S3 bucket
     ensure_bucket_exists(&s3_client, bucket).await?;
 
-    // Build HourlyIndexCreator, storing the endpoint string for future use
+    // Build HourlyIndexCreator
     let hourly_index_creator = HourlyIndexCreator::new(
         s3_client.clone(),
         bucket.to_string(),
         generate_unsigned_urls,
-        endpoint.clone(), // store the endpoint to build unsigned URLs
+        endpoint.clone(),
     );
 
     info!("Starting directory watcher on: {}", output_dir);
@@ -856,7 +1152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ffmpeg_child, mut ffmpeg_stdin_buf) = if !manual_segment {
         let hls_segment_filename =
             format!("{}/%Y/%m/%d/%H/segment_%Y%m%d-%H%M%S_%04d.ts", output_dir);
-        let m3u8_output = "index.m3u8".to_string();
+        let m3u8_output = format!("index.m3u8");
 
         info!("Starting FFmpeg with output: {}", m3u8_output);
         let mut child = Command::new("ffmpeg")
@@ -875,6 +1171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .arg("hls")
             .arg("-map")
             .arg("0")
+            // smaller segments
             .arg("-hls_time")
             .arg("2")
             .arg("-hls_segment_type")
@@ -926,18 +1223,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // Join multicast group
-    if let Ok(_sock) = join_multicast_on_iface(filter_ip, filter_port, interface) {
-    } else {
-        eprintln!("Failed to join multicast group or find interface IP!");
-    }
+    let _sock = match join_multicast_on_iface(filter_ip, filter_port, interface) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to join multicast group or find interface IP: {}", e);
+            return Ok(());
+        }
+    };
 
-    // Start pcap
+    let pcap_packet_count = 7;
+    let pcap_packet_size = 188;
+    let pcap_packet_header_size = 42;
+    let snaplen = (pcap_packet_count * pcap_packet_size) + pcap_packet_header_size;
+    let buffer_size = 1024 * 1024 * 4;
+
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
-        .buffer_size(8 * 1024 * 1024)
-        .snaplen(65535)
-        .timeout(100)
+        .buffer_size(buffer_size)
+        .snaplen(snaplen)
         .timeout(timeout)
         .open()?;
 
@@ -961,6 +1264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Main capture loop
     loop {
+        // Check if FFmpeg died
         if let Some(child) = ffmpeg_child.as_mut() {
             if let Some(exit_status) = child.try_wait()? {
                 eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -971,6 +1275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let packet = match cap.next_packet() {
             Ok(pkt) => pkt,
             Err(_) => {
+                // Check if FFmpeg ended
                 if let Some(child) = ffmpeg_child.as_mut() {
                     if let Some(exit_status) = child.try_wait()? {
                         eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -982,6 +1287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
+            // Update table cache for re-injection
             if manual_segment && inject_pat_pmt {
                 let pkt_count = ts_payload.len() / 188;
                 let mut cache = table_cache.lock().unwrap();
@@ -998,7 +1304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // Pass TS data to FFmpeg if not manual
+            // Feed TS data to FFmpeg if not manual
             if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
                 if let Err(e) = buf.write_all(ts_payload) {
                     eprintln!("Error feeding data to FFmpeg: {:?}", e);
@@ -1006,7 +1312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // If manual, write to segments ourselves
+            // If manual segmentation, write to segments ourselves
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload) {
                     eprintln!("Error writing manual TS segment: {:?}", e);
@@ -1020,7 +1326,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(mut buf) = ffmpeg_stdin_buf.take() {
         let _ = buf.flush();
         drop(buf);
-
         if let Some(child) = ffmpeg_child.as_mut() {
             let ffmpeg_status = child.wait()?;
             if !ffmpeg_status.success() {
@@ -1034,7 +1339,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     drop(manual_segmenter);
     let _ = upload_task.await?;
     let _ = watch_thread.join();
-
     println!("Exiting normally.");
     Ok(())
 }
@@ -1065,7 +1369,6 @@ fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> Notify
 
 // ---------------- FILE STABILITY CHECK ----------------
 
-/// Wait until the file stops growing, so we don't upload partial data
 async fn wait_for_file_stable(
     path: &Path,
     check_interval_ms: u64,
@@ -1074,7 +1377,6 @@ async fn wait_for_file_stable(
     loop {
         let current_size = fs::metadata(path)?.len();
         if current_size > 0 && current_size == previous_size {
-            // same size twice in a row, assume stable
             break;
         }
         previous_size = current_size;
@@ -1111,7 +1413,7 @@ async fn handle_file_events(
                             };
 
                             if should_upload {
-                                // Wait for the file to stop growing
+                                // Wait until stable
                                 if let Err(e) = wait_for_file_stable(&path, 300).await {
                                     warn!(
                                         "Skipping {}: error waiting for stable file: {}",
@@ -1119,7 +1421,6 @@ async fn handle_file_events(
                                     );
                                     continue;
                                 }
-
                                 let relative_path = match strip_base_dir(&path, &base_dir) {
                                     Ok(rp) => rp,
                                     Err(e) => {
@@ -1131,13 +1432,12 @@ async fn handle_file_events(
                                     }
                                 };
                                 let key_str = relative_path.to_string_lossy().to_string();
-
                                 let hour_dir = relative_path
                                     .parent()
                                     .map(|p| p.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "".to_string());
 
-                                // Attempt the upload
+                                // Upload the file
                                 if let Ok(()) = upload_file_to_s3(
                                     &s3_client,
                                     &bucket,
@@ -1151,16 +1451,30 @@ async fn handle_file_events(
                                     tracker.mark_uploaded(full_path_str.clone());
                                 }
 
-                                // Add #EXT-X-PROGRAM-DATE-TIME
-                                //let current_time = Utc::now().to_rfc3339();
-                                //let custom_lines =
-                                //    vec![format!("#EXT-X-PROGRAM-DATE-TIME:{}", current_time)];
+                                // If we wrote a ".dur" side file, read it
+                                let pcr_dur_path = path.with_extension("dur");
+                                let actual_segment_duration = if pcr_dur_path.exists() {
+                                    // If parse fails, fallback
+                                    if let Ok(dur_str) = fs::read_to_string(&pcr_dur_path) {
+                                        dur_str
+                                            .parse()
+                                            .unwrap_or_else(|_| get_actual_file_duration(&path))
+                                    } else {
+                                        get_actual_file_duration(&path)
+                                    }
+                                } else {
+                                    // fallback if no .dur
+                                    get_actual_file_duration(&path)
+                                };
+
                                 let custom_lines = vec![];
+
+                                // Hourly index -> use PCR-based duration
                                 hourly_index_creator
                                     .record_segment(
                                         &hour_dir,
                                         &key_str,
-                                        get_segment_duration_seconds() as f64,
+                                        actual_segment_duration,
                                         custom_lines,
                                         &output_dir,
                                     )
@@ -1175,7 +1489,6 @@ async fn handle_file_events(
             _ => {}
         }
     }
-
     Ok(())
 }
 
@@ -1189,13 +1502,25 @@ async fn upload_file_to_s3(
     let relative_path = strip_base_dir(path, base_dir)?;
     let key_str = relative_path.to_string_lossy().to_string();
 
+    // content-type by extension
+    let mime_type = if let Some(ext) = path.extension() {
+        if ext == "m3u8" {
+            "application/vnd.apple.mpegurl"
+        } else {
+            "video/mp2t"
+        }
+    } else {
+        "application/octet-stream"
+    };
+
     let file_size = fs::metadata(path)?.len();
     println!(
-        "Uploading {} ({} bytes) -> s3://{}/{}",
+        "Uploading {} ({} bytes) -> s3://{}/{} as {}",
         path.display(),
         file_size,
         bucket,
-        key_str
+        key_str,
+        mime_type
     );
 
     let mut retries = 3;
@@ -1226,7 +1551,7 @@ async fn upload_file_to_s3(
             .bucket(bucket)
             .key(&key_str)
             .body(body_stream)
-            .content_type("video/mp2t")
+            .content_type(mime_type)
             .content_length(file_size as i64)
             .send()
             .await
@@ -1236,6 +1561,13 @@ async fn upload_file_to_s3(
                 if remove_local {
                     if let Err(e) = fs::remove_file(path) {
                         eprintln!("Failed removing local file {}: {:?}", path.display(), e);
+                    }
+                    // also remove .dur sidecar if it exists
+                    let dur_sidecar = path.with_extension("dur");
+                    if dur_sidecar.exists() {
+                        if let Err(e) = fs::remove_file(&dur_sidecar) {
+                            eprintln!("Failed removing local sidecar {:?}: {:?}", dur_sidecar, e);
+                        }
                     }
                 }
                 return Ok(());
@@ -1325,14 +1657,14 @@ fn extract_mpegts_payload<'a>(
         return None;
     }
 
+    // Some streams wrap TS in RTP (0x80.. + 12 bytes, then 0x47).
     let (ts_payload, is_rtp) = if payload[0] == 0x80 && payload.len() > 12 && payload[12] == 0x47 {
         (&payload[12..], true)
     } else if payload[0] == 0x47 {
         (payload, false)
     } else {
         warn!(
-            "Unknown payload type found at offset {} of type 0x{:02x}, size {}",
-            udp_header_offset,
+            "Unknown payload type found (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
             payload[0],
             payload.len()
         );
