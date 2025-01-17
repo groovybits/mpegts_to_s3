@@ -16,7 +16,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
-use futures::executor::block_on; // ADDED: to allow block_on
+use futures::executor::block_on;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
 use notify::{
@@ -34,10 +34,8 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::task;
 use tokio::time::sleep;
 
-// ADDED: For log initialization
 use env_logger;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
@@ -390,63 +388,6 @@ async fn ensure_bucket_exists(
     }
 }
 
-#[derive(Default)]
-struct MpegTsTableCache {
-    latest_pat: Option<[u8; 188]>,
-    latest_pmt: Option<[u8; 188]>,
-    pmt_pid: Option<u16>,
-}
-
-impl MpegTsTableCache {
-    fn update_pat(&mut self, _pkt: &[u8]) {
-        // No-op to avoid warnings
-    }
-    fn update_pmt(&mut self, _pkt: &[u8]) {}
-    fn write_tables<W: std::io::Write>(&self, _writer: &mut W) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn parse_pat_for_pmt_pid(_pkt: &[u8]) -> Option<u16> {
-    None
-}
-fn parse_pmt_for_pcr_pid(_pkt: &[u8]) -> Option<u16> {
-    None
-}
-
-/// A PCR tracker that no longer tries to track real timestamps; it always returns 0.
-#[derive(Default)]
-struct PcrTracker {
-    earliest_pcr: Option<f64>,
-    latest_pcr: Option<f64>,
-    pcr_first_idx: Option<usize>,
-    pcr_last_idx: Option<usize>,
-    total_packets: usize,
-
-    primary_pcr_pid: Option<u16>,
-    discovered_pmt_pid: Option<u16>,
-}
-
-impl PcrTracker {
-    fn handle_ts_packet(&mut self, _pkt: &[u8]) {
-        // no-op
-    }
-    fn compensated_duration(&self) -> f64 {
-        0.0
-    }
-    fn reset(&mut self) {
-        self.earliest_pcr = None;
-        self.latest_pcr = None;
-        self.pcr_first_idx = None;
-        self.pcr_last_idx = None;
-        self.total_packets = 0;
-    }
-}
-
-fn parse_pcr(_data: &[u8]) -> Option<f64> {
-    None
-}
-
 // ------------- DISKLESS MODE SUPPORT -------------
 
 #[derive(Clone)]
@@ -519,13 +460,9 @@ struct ManualSegmenter {
     playlist_path: PathBuf,
     m3u8_initialized: bool,
 
-    pat_pmt_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
-    inject_pat_pmt: bool,
-
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
 
-    pcr_tracker: PcrTracker,
     diskless_mode: bool,
     diskless_buffer: Arc<Mutex<DisklessBuffer>>,
 
@@ -553,11 +490,8 @@ impl ManualSegmenter {
             segment_index: 0,
             playlist_path,
             m3u8_initialized: false,
-            pat_pmt_cache: None,
-            inject_pat_pmt: false,
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
-            pcr_tracker: PcrTracker::default(),
             diskless_mode: false,
             diskless_buffer: Arc::new(Mutex::new(DisklessBuffer::new(0))),
             segment_open_time: None,
@@ -588,16 +522,6 @@ impl ManualSegmenter {
 
     fn with_max_segments(mut self, max_segments: usize) -> Self {
         self.max_segments_in_index = max_segments;
-        self
-    }
-
-    fn with_pat_pmt(
-        mut self,
-        table_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
-        inject: bool,
-    ) -> Self {
-        self.pat_pmt_cache = table_cache;
-        self.inject_pat_pmt = inject;
         self
     }
 
@@ -649,14 +573,6 @@ impl ManualSegmenter {
         // Just counting bytes for fallback bitrate
         self.bytes_this_segment += data.len() as u64;
 
-        // We do not rely on pcr_tracker for final durations, but still handle these packets
-        let pkt_count = data.len() / 188;
-        for i in 0..pkt_count {
-            let idx_start = i * 188;
-            let pkt = &data[idx_start..(idx_start + 188)];
-            self.pcr_tracker.handle_ts_packet(pkt);
-        }
-
         // We'll do a simple "close if wall clock or byte-based logic says so"
         let desired_secs = get_segment_duration_seconds() as f64;
         let now = Instant::now();
@@ -695,7 +611,7 @@ impl ManualSegmenter {
     }
 
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
-        // Instead of using pcr_tracker, we measure real_elapsed from segment_open_time
+        // Measure real_elapsed from segment_open_time
         let real_elapsed = self
             .segment_open_time
             .map(|st| Instant::now().duration_since(st).as_secs_f64())
@@ -831,7 +747,6 @@ impl ManualSegmenter {
 
         // done, reset counters
         self.bytes_this_segment = 0;
-        self.pcr_tracker.reset();
         Ok(())
     }
 
@@ -873,14 +788,7 @@ impl ManualSegmenter {
         }
 
         let file = fs::File::create(&full_path)?;
-        let mut writer = BufWriter::new(file);
-
-        if self.inject_pat_pmt {
-            if let Some(cache) = &self.pat_pmt_cache {
-                let cache = cache.lock().unwrap();
-                cache.write_tables(&mut writer)?;
-            }
-        }
+        let writer = BufWriter::new(file);
 
         self.current_ts_file = Some(writer);
         if !self.m3u8_initialized {
@@ -969,9 +877,8 @@ impl Drop for ManualSegmenter {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // ADDED: Initialize env_logger so debug/info logs actually print
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .format_timestamp_secs()
         .init();
     debug!("Logging initialized. Starting main()...");
@@ -1048,12 +955,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("inject_pat_pmt")
-                .long("inject_pat_pmt")
-                .help("If using manual segmentation, prepend the latest PAT & PMT to each segment.")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
             Arg::new("hls_keep_segments")
                 .long("hls_keep_segments")
                 .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
@@ -1092,7 +993,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
     let manual_segment = matches.get_flag("manual_segment");
-    let inject_pat_pmt = matches.get_flag("inject_pat_pmt");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
 
     let hls_keep_segments: usize = matches
@@ -1111,7 +1011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
                 interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-                inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}, \
+                hls_keep_segments={}, generate_unsigned_urls={}, \
                 diskless_mode={}, diskless_ring_size={}",
         endpoint,
         region_name,
@@ -1123,7 +1023,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         output_dir,
         remove_local,
         manual_segment,
-        inject_pat_pmt,
         hls_keep_segments,
         generate_unsigned_urls,
         diskless_mode,
@@ -1216,7 +1115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (None, None)
     };
 
-    let table_cache = Arc::new(Mutex::new(MpegTsTableCache::default()));
     let s3_client_clone = s3_client.clone();
     let bucket_clone = bucket.clone();
     let output_dir_clone = output_dir.clone();
@@ -1283,7 +1181,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut manual_segmenter = if manual_segment {
         Some(
             ManualSegmenter::new(output_dir)
-                .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt)
                 .with_max_segments(hls_keep_segments)
                 .with_diskless_mode(diskless_mode, diskless_ring_size)
                 .with_s3(
@@ -1363,22 +1260,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ts_payload.len()
             );*/
 
-            if manual_segment && inject_pat_pmt {
-                let pkt_count = ts_payload.len() / 188;
-                let mut cache = table_cache.lock().unwrap();
-                for i in 0..pkt_count {
-                    let pkt = &ts_payload[i * 188..(i + 1) * 188];
-                    let pid = ((pkt[1] as u16 & 0x1F) << 8) | (pkt[2] as u16);
-                    if pid == 0 {
-                        cache.update_pat(pkt);
-                    } else if let Some(pp) = cache.pmt_pid {
-                        if pid == pp {
-                            cache.update_pmt(pkt);
-                        }
-                    }
-                }
-            }
-
             // If not manual, feed TS to FFmpeg
             if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
                 if let Err(e) = buf.write_all(ts_payload) {
@@ -1450,45 +1331,6 @@ fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> Notify
         }
     }
     Ok(())
-}
-
-// ---------------- FILE STABILITY CHECK ----------------
-
-async fn wait_for_file_stable(
-    path: &Path,
-    check_interval_ms: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut retries = 30; // Increase retries significantly
-    let mut previous_size = 0;
-    let mut same_size_count = 0;
-    const REQUIRED_STABLE_CHECKS: u32 = 3; // Must be stable for this many checks
-
-    while retries > 0 {
-        match fs::metadata(path) {
-            Ok(metadata) => {
-                let current_size = metadata.len();
-                if current_size > 0 {
-                    if current_size == previous_size {
-                        same_size_count += 1;
-                        if same_size_count >= REQUIRED_STABLE_CHECKS {
-                            return Ok(());
-                        }
-                    } else {
-                        same_size_count = 0;
-                    }
-                }
-                previous_size = current_size;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                retries -= 1;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        sleep(Duration::from_millis(check_interval_ms)).await;
-        retries -= 1;
-    }
-
-    Err("File did not stabilize within retry limit".into())
 }
 
 // ---------------- File-Event -> S3-Upload ----------------
