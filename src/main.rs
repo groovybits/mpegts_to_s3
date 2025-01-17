@@ -324,28 +324,7 @@ impl HourlyIndexCreator {
     }
 }
 
-/// Attempt to join `multicast_addr` + `port` on a given `interface_name`
-pub fn join_multicast_on_iface(
-    multicast_addr: &str,
-    port: u16,
-    interface_name: &str,
-) -> Result<Socket, Box<dyn std::error::Error>> {
-    let group_v4: Ipv4Addr = multicast_addr.parse()?;
-    let local_iface_ip = find_ipv4_for_interface(interface_name)?;
-
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-    sock.bind(&bind_addr.into())?;
-    sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
-
-    println!(
-        "Joined multicast group {} on interface {}, local IP: {}, port {}",
-        multicast_addr, interface_name, local_iface_ip, port
-    );
-    Ok(sock)
-}
-
+/// Finds the first IPv4 address associated with `interface_name`
 fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
     let ifaces = get_if_addrs()?;
     for iface in ifaces {
@@ -355,7 +334,41 @@ fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std
             }
         }
     }
-    Err(format!("No IPv4 found for interface '{}'", interface_name).into())
+    Err(format!("No IPv4 address found for interface '{}'", interface_name).into())
+}
+
+/// Attempt to join `multicast_addr` + `port` on a given `interface_name`
+pub fn join_multicast_on_iface(
+    multicast_addr: &str,
+    port: u16,
+    interface_name: &str,
+) -> Result<Socket, Box<dyn std::error::Error>> {
+    let group_v4: Ipv4Addr = multicast_addr.parse()?;
+    let local_iface_ip = find_ipv4_for_interface(interface_name)?;
+
+    // Create a UDP/IPv4 socket
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // Allow re-binding to the same address (needed for multicast on many OSes)
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    sock.set_reuse_port(true)?;
+
+    // Bind specifically to the local interface's IP (instead of 0.0.0.0)
+    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(local_iface_ip), port);
+    sock.bind(&bind_addr.into())?;
+
+    // Tell the kernel which interface to use for outbound multicast traffic
+    sock.set_multicast_if_v4(&local_iface_ip)?;
+
+    // Finally, join the multicast group on that interface
+    sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
+
+    println!(
+        "Joined multicast group {} on interface {}, local IP: {}, port {}",
+        multicast_addr, interface_name, local_iface_ip, port
+    );
+    Ok(sock)
 }
 
 struct FileTracker {
