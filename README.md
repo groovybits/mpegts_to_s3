@@ -108,7 +108,7 @@ mpegts_to_s3 [OPTIONS]
 ### Options:
 - **General Settings:**
   - `-e`, `--endpoint`: S3-compatible endpoint (default: `http://127.0.0.1:9000`)
-  - `-r`, `--region`: S3 region (default: `us-west-2`)
+  - `-r`, `--region`: S3 region (default: `us-east-1`)
   - `-b`, `--bucket`: S3 bucket name (default: `ltnhls`)
 - **UDP Stream Capture:**
   - `-i`, `--udp_ip`: Multicast IP to filter (default: `227.1.1.102`)
@@ -116,11 +116,11 @@ mpegts_to_s3 [OPTIONS]
   - `-n`, `--interface`: Network interface for packet capture (default: `net1`)
   - `-t`, `--timeout`: Packet capture timeout in milliseconds (default: `1000`)
 - **HLS Output:**
-  - `-o`, `--output_dir`: Local directory for HLS output (default: `hls`)
+  - `-o`, `--output_dir`: Local directory for HLS output (default: `ts`)
   - `--remove_local`: Remove local `.ts` and `.m3u8` files after upload
   - `--manual_segment`: Use manual segmentation instead of FFmpeg
-  - `--inject_pat_pmt`: Prepend PAT & PMT tables to each segment (if manually segmented)
-  - `--hls_keep_segments`: Number of segments to keep in the `.m3u8` index (0 = unlimited, default: `0`)
+  - `--hls_keep_segments`: Number of segments to keep in the `.m3u8` index (0 = unlimited, default: `10`)
+  - `--diskless_mode`: Diskless mode avoids writing `.ts` segments to disk (default: `false`) requires --manual_segment arg.
 
 ---
 
