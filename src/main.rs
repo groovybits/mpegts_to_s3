@@ -1445,7 +1445,7 @@ async fn handle_file_events(
                                     )
                                     .await?;
                             } else {
-                                debug!("Skipping {}: already uploaded or too old", full_path_str);
+                                //debug!("Skipping {}: already uploaded or too old", full_path_str);
                             }
                         }
                     }
