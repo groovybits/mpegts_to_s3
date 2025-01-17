@@ -16,7 +16,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
-use futures::executor::block_on;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
 use notify::{
@@ -536,7 +535,7 @@ impl ManualSegmenter {
         self
     }
 
-    fn write_ts(&mut self, data: &[u8]) -> std::io::Result<()> {
+    async fn write_ts(&mut self, data: &[u8]) -> std::io::Result<()> {
         // If this is our first data in a new segment, note the wall-clock start time
         if self.segment_open_time.is_none() {
             self.segment_open_time = Some(Instant::now());
@@ -563,7 +562,7 @@ impl ManualSegmenter {
                     "[DISKLESS] buffer >= {} bytes, forcing segment close...",
                     self.diskless_max_bytes
                 );
-                self.close_current_segment_file()?;
+                self.close_current_segment_file().await?;
                 if !self.diskless_mode {
                     self.open_new_segment_file()?;
                 }
@@ -601,7 +600,7 @@ impl ManualSegmenter {
                  enough_bytes_based_on_bitrate,
                  fallback_time_expired
              );
-            self.close_current_segment_file()?;
+            self.close_current_segment_file().await?;
             if !self.diskless_mode {
                 self.open_new_segment_file()?;
             }
@@ -610,7 +609,7 @@ impl ManualSegmenter {
         Ok(())
     }
 
-    fn close_current_segment_file(&mut self) -> std::io::Result<()> {
+    async fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         // Measure real_elapsed from segment_open_time
         let real_elapsed = self
             .segment_open_time
@@ -681,14 +680,8 @@ impl ManualSegmenter {
                     object_key,
                     seg_data_clone.len()
                 );
-                let upload_res = block_on(upload_memory_segment_to_s3(
-                    s3c,
-                    buck,
-                    &object_key,
-                    &seg_data_clone,
-                ));
 
-                match upload_res {
+                match upload_memory_segment_to_s3(s3c, buck, &object_key, &seg_data_clone).await {
                     Ok(_) => {
                         debug!("[DISKLESS] S3 upload succeeded. Now build URL...");
                         if self.generate_unsigned_urls {
@@ -696,11 +689,16 @@ impl ManualSegmenter {
                                 final_path = format!("{}/{}/{}", endpoint, buck, object_key);
                             }
                         } else {
-                            let presign_res = block_on(self.generate_s3_url(&object_key));
-                            if let Ok(url_str) = presign_res {
-                                final_path = url_str;
-                            } else {
-                                warn!("[DISKLESS] presign failed, fallback to mem:// path");
+                            match self.generate_s3_url(&object_key).await {
+                                Ok(url_str) => {
+                                    final_path = url_str;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "[DISKLESS] presign failed: {:?}, fallback to mem:// path",
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
@@ -1279,7 +1277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // If manual, feed TS data to our segmenter
             if let Some(seg) = manual_segmenter.as_mut() {
-                if let Err(e) = seg.write_ts(ts_payload) {
+                if let Err(e) = seg.write_ts(ts_payload).await {
                     eprintln!("Error writing manual TS segment: {:?}", e);
                     break;
                 }
