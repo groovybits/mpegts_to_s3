@@ -43,7 +43,7 @@ fn get_segment_duration_seconds() -> u64 {
     std::env::var("SEGMENT_DURATION_SECONDS")
         .unwrap_or_else(|_| "10".to_string())
         .parse()
-        .unwrap_or(10)
+        .unwrap_or(2)
 }
 
 fn get_file_max_age_seconds() -> u64 {
@@ -55,9 +55,9 @@ fn get_file_max_age_seconds() -> u64 {
 
 fn get_url_signing_seconds() -> u64 {
     std::env::var("URL_SIGNING_SECONDS")
-        .unwrap_or_else(|_| "3600".to_string())
+        .unwrap_or_else(|_| "31104004".to_string())
         .parse()
-        .unwrap_or(3600)
+        .unwrap_or(31104004)
 }
 
 fn get_s3_username() -> String {
@@ -946,7 +946,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("output_dir")
                 .short('o')
                 .long("output_dir")
-                .default_value("hls")
+                .default_value("ts")
                 .help("Local dir for HLS output"),
         )
         .arg(
@@ -965,7 +965,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("hls_keep_segments")
                 .long("hls_keep_segments")
                 .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
-                .default_value("0"),
+                .default_value("10"),
         )
         .arg(
             Arg::new("unsigned_urls")
@@ -984,7 +984,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("diskless_ring_size")
                 .long("diskless_ring_size")
                 .help("Number of diskless segments to keep in memory ring buffer.")
-                .default_value("20"),
+                .default_value("1"),
         )
         .get_matches();
 

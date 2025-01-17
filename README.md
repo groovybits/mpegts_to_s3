@@ -57,10 +57,15 @@ mkdir hls && cd hls
 #### 3. Capture and Segment UDP Stream
 ```bash
 # Capture multicast stream from udp://227.1.1.102:4102 on interface net1
-# Segments are saved to ./ts/ directory with 10-second duration and uploaded to MinIO
+# Segments can be saved to ./ts/ directory with 2-second duration and uploaded to S3/MinIO
 SEGMENT_DURATION_SECONDS=10 \
-../target/release/mpegts_to_s3 -i 227.1.1.102 -p 4102 \
-    -o ts -n net1 --manual_segment --hls_keep_segments 3
+../target/release/mpegts_to_s3 \
+    -n net1 \         # Network interface for packet capture
+    -i 227.1.1.102 \  # Multicast IP to filter
+    -p 4102 \         # UDP port to filter
+    --manual_segment \ # Use manual segmentation instead of FFmpeg
+    -o ts \           # Output directory for .ts segments
+    --diskless_mode   # Diskless mode avoids writing .ts segments to disk
 ```
 
 #### 4. Playback
