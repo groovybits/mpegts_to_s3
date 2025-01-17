@@ -423,7 +423,7 @@ async fn ensure_bucket_exists(
 }
 
 // --------------------- MpegTsTableCache ---------------------
-// (Optional: keeps latest PAT/PMT for re-injection.)
+// (Keeps latest PAT/PMT for re-injection.)
 
 #[derive(Default)]
 struct MpegTsTableCache {
@@ -889,7 +889,7 @@ impl ManualSegmenter {
         let file = fs::File::create(&full_path)?;
         let mut writer = BufWriter::new(file);
 
-        // Optionally inject latest PAT/PMT at the start of each new segment
+        // Inject latest PAT/PMT at the start of each new segment
         if self.inject_pat_pmt {
             if let Some(cache) = &self.pat_pmt_cache {
                 let cache = cache.lock().unwrap();
@@ -1231,11 +1231,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    let pcap_packet_count = 7;
+    let pcap_packet_size = 188;
+    let pcap_packet_header_size = 42;
+    let snaplen = (pcap_packet_count * pcap_packet_size) + pcap_packet_header_size;
+    let buffer_size = 1024 * 1024 * 4;
+
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
-        .buffer_size(8 * 1024 * 1024)
-        .snaplen(65535)
-        .timeout(100)
+        .buffer_size(buffer_size)
+        .snaplen(snaplen)
         .timeout(timeout)
         .open()?;
 
@@ -1282,7 +1287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
-            // Optionally update table cache for re-injection
+            // Update table cache for re-injection
             if manual_segment && inject_pat_pmt {
                 let pkt_count = ts_payload.len() / 188;
                 let mut cache = table_cache.lock().unwrap();
