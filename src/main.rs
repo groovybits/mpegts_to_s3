@@ -674,7 +674,8 @@ impl ManualSegmenter {
             // Optionally upload to S3
             let mut final_path = format!("mem://segment_{}", self.segment_index + 1);
             if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
-                let object_key = format!("diskless_segment_{:04}.ts", self.segment_index + 1);
+                let segment_path = self.current_segment_path(self.segment_index + 1);
+                let object_key = format!("{}", segment_path.to_string_lossy());
                 debug!(
                     "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
                     object_key,
@@ -1242,7 +1243,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Possibly no packet arrived in the last 'timeout' ms
                 // so check if we want to forcibly close a segment on a timer, etc.
                 if let Some(_seg) = manual_segmenter.as_mut() {
-                    // optionally _seg.check_fallback_timeout() if you implement it
+                    if let Err(e) = _seg.close_current_segment_file().await {
+                        eprintln!("Error closing segment: {:?}", e);
+                        break;
+                    }
                 }
                 if let Some(child) = ffmpeg_child.as_mut() {
                     if let Some(exit_status) = child.try_wait()? {
