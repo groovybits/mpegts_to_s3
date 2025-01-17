@@ -16,6 +16,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
+use futures::executor::block_on;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
 use notify::{
@@ -23,7 +24,7 @@ use notify::{
 };
 use pcap::Capture;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -32,8 +33,10 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::time::sleep;
+
+use env_logger;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
@@ -73,13 +76,11 @@ fn get_actual_file_duration(path: &Path) -> f64 {
         if let Ok(created_time) = metadata.created() {
             if let Ok(modified_time) = metadata.modified() {
                 if let Ok(elapsed) = modified_time.duration_since(created_time) {
-                    // Return measured duration
                     return elapsed.as_secs_f64();
                 }
             }
         }
     }
-    // Fallback
     get_segment_duration_seconds() as f64
 }
 
@@ -97,15 +98,11 @@ pub struct HourlyIndexCreator {
     generate_unsigned_urls: bool,
     endpoint: String,
 
-    // Keyed by "YYYY/mm/dd/HH" => a vector of HourlyIndexEntry
     hour_map: std::collections::HashMap<String, Vec<HourlyIndexEntry>>,
-
-    // This ensures each new segment gets a strictly increasing sequence
     global_sequence_id: u64,
 }
 
 impl HourlyIndexCreator {
-    /// Build the HourlyIndexCreator, storing the endpoint string
     pub fn new(
         s3_client: aws_sdk_s3::Client,
         bucket: String,
@@ -122,7 +119,6 @@ impl HourlyIndexCreator {
         }
     }
 
-    /// Called each time we finish uploading a segment
     pub async fn record_segment(
         &mut self,
         hour_dir: &str,
@@ -131,47 +127,35 @@ impl HourlyIndexCreator {
         custom_lines: Vec<String>,
         output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 1) Bump the global sequence ID so it never goes backward
         self.global_sequence_id += 1;
-
-        // 2) Generate the URL (signed or unsigned)
         let signed_url = self.generate_url(segment_key).await?;
 
-        // 3) Build the new HourlyIndexEntry
         let entry = HourlyIndexEntry {
             sequence_id: self.global_sequence_id,
             duration,
             signed_url,
             custom_lines,
         };
-
-        // 4) Store it in hour_map
         let entries = self.hour_map.entry(hour_dir.to_string()).or_default();
         entries.push(entry);
 
-        // 5) Rewrite the "hourly_index.m3u8" for that hour
         self.write_hourly_index(hour_dir, output_dir).await?;
-
         Ok(())
     }
 
-    /// Writes/updates "hourly_index.m3u8" in that hour folder, then uploads it to S3
     async fn write_hourly_index(
         &mut self,
         hour_dir: &str,
         output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Build local output paths
         let local_dir = std::path::Path::new(output_dir).join(hour_dir);
         let index_path = local_dir.join("hourly_index.m3u8");
         let temp_path = local_dir.join("hourly_index_temp.m3u8");
 
         std::fs::create_dir_all(&local_dir)?;
 
-        // Grab all entries for this hour
         let entries = self.hour_map.get(hour_dir);
 
-        // Write the new .m3u8 to a temporary file
         {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -179,11 +163,9 @@ impl HourlyIndexCreator {
                 .truncate(true)
                 .open(&temp_path)?;
 
-            // Standard HLS boilerplate
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
 
-            // Per HLS spec, #EXT-X-TARGETDURATION >= the ceiling of any segment's duration.
             let target_duration = if let Some(vec) = entries {
                 let max_seg = vec
                     .iter()
@@ -196,7 +178,6 @@ impl HourlyIndexCreator {
             };
             writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration)?;
 
-            // If we have entries, compute the lowest sequence_id
             let media_seq = if let Some(vec) = entries {
                 vec.iter().map(|e| e.sequence_id).min().unwrap_or(0)
             } else {
@@ -204,7 +185,6 @@ impl HourlyIndexCreator {
             };
             writeln!(file, "#EXT-X-MEDIA-SEQUENCE:{}", media_seq)?;
 
-            // Then write each segment in ascending sequence_id order
             if let Some(vec) = entries {
                 let mut sorted = vec.clone();
                 sorted.sort_by_key(|e| e.sequence_id);
@@ -218,10 +198,8 @@ impl HourlyIndexCreator {
             }
         }
 
-        // Atomic rename to final
         std::fs::rename(&temp_path, &index_path)?;
 
-        // Upload the new index to S3
         self.upload_local_file_to_s3(
             &index_path,
             &format!("{}/hourly_index.m3u8", hour_dir),
@@ -229,16 +207,13 @@ impl HourlyIndexCreator {
         )
         .await?;
 
-        // Update local `urls.log`
         let final_index_url = self
             .presign_get_url(&format!("{}/hourly_index.m3u8", hour_dir))
             .await?;
         self.rewrite_urls_log(hour_dir, &final_index_url, output_dir)?;
-
         Ok(())
     }
 
-    /// Rewrites `urls.log` in the local output dir
     fn rewrite_urls_log(
         &mut self,
         hour_dir: &str,
@@ -324,7 +299,6 @@ impl HourlyIndexCreator {
     }
 }
 
-/// Finds the first IPv4 address associated with `interface_name`
 fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
     let ifaces = get_if_addrs()?;
     for iface in ifaces {
@@ -337,7 +311,6 @@ fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std
     Err(format!("No IPv4 address found for interface '{}'", interface_name).into())
 }
 
-/// Attempt to join `multicast_addr` + `port` on a given `interface_name`
 pub fn join_multicast_on_iface(
     multicast_addr: &str,
     port: u16,
@@ -346,22 +319,15 @@ pub fn join_multicast_on_iface(
     let group_v4: Ipv4Addr = multicast_addr.parse()?;
     let local_iface_ip = find_ipv4_for_interface(interface_name)?;
 
-    // Create a UDP/IPv4 socket
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-
-    // Allow re-binding to the same address (needed for multicast on many OSes)
     sock.set_reuse_address(true)?;
     #[cfg(unix)]
     sock.set_reuse_port(true)?;
 
-    // Bind specifically to the local interface's IP (instead of 0.0.0.0)
     let bind_addr = SocketAddr::new(std::net::IpAddr::V4(local_iface_ip), port);
     sock.bind(&bind_addr.into())?;
 
-    // Tell the kernel which interface to use for outbound multicast traffic
     sock.set_multicast_if_v4(&local_iface_ip)?;
-
-    // Finally, join the multicast group on that interface
     sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
 
     println!(
@@ -422,342 +388,65 @@ async fn ensure_bucket_exists(
     }
 }
 
-// --------------------- MpegTsTableCache ---------------------
-// (Keeps latest PAT/PMT for re-injection.)
+// ------------- DISKLESS MODE SUPPORT -------------
 
-#[derive(Default)]
-struct MpegTsTableCache {
-    latest_pat: Option<[u8; 188]>,
-    latest_pmt: Option<[u8; 188]>,
-    pmt_pid: Option<u16>,
+#[derive(Clone)]
+struct InMemorySegment {
+    data: Vec<u8>,
+    duration: f64,
 }
 
-impl MpegTsTableCache {
-    fn update_pat(&mut self, pkt: &[u8]) {
-        if pkt.len() != 188 {
-            return;
-        }
-        let mut arr = [0u8; 188];
-        arr.copy_from_slice(pkt);
-        self.latest_pat = Some(arr);
-
-        let transport_error_indicator = (pkt[1] & 0x80) != 0;
-        if transport_error_indicator {
-            return;
-        }
-        let adaptation_control = (pkt[3] >> 4) & 0x3;
-        let mut payload_offset = 4;
-        if adaptation_control == 0b10 || adaptation_control == 0b11 {
-            let adaptation_length = pkt[payload_offset] as usize;
-            payload_offset += 1;
-            if payload_offset + adaptation_length > 188 {
-                return;
-            }
-            payload_offset += adaptation_length;
-        }
-        if payload_offset >= 188 {
-            return;
-        }
-        let pointer_field = pkt[payload_offset] as usize;
-        payload_offset += 1;
-        if payload_offset + pointer_field >= 188 {
-            return;
-        }
-        payload_offset += pointer_field;
-
-        if payload_offset + 8 > 188 {
-            return;
-        }
-        let table_id = pkt[payload_offset];
-        if table_id != 0x00 {
-            return;
-        }
-        let section_length =
-            u16::from_be_bytes([pkt[payload_offset + 1] & 0x0F, pkt[payload_offset + 2]]);
-        if (section_length as usize) > 1021 {
-            return;
-        }
-
-        let _transport_stream_id =
-            u16::from_be_bytes([pkt[payload_offset + 3], pkt[payload_offset + 4]]);
-        let _version_number = (pkt[payload_offset + 5] & 0x3E) >> 1;
-        let mut program_info_offset = payload_offset + 8;
-        let pat_section_end = payload_offset + 3 + (section_length as usize);
-        while program_info_offset + 4 <= pat_section_end.saturating_sub(4) {
-            let program_number =
-                u16::from_be_bytes([pkt[program_info_offset], pkt[program_info_offset + 1]]);
-            let pid_hi = pkt[program_info_offset + 2] & 0x1F;
-            let pid_lo = pkt[program_info_offset + 3];
-            let pmt_pid = ((pid_hi as u16) << 8) | (pid_lo as u16);
-            if program_number != 0 {
-                self.pmt_pid = Some(pmt_pid);
-                break;
-            }
-            program_info_offset += 4;
-        }
-    }
-
-    fn update_pmt(&mut self, pkt: &[u8]) {
-        if pkt.len() == 188 {
-            let mut arr = [0u8; 188];
-            arr.copy_from_slice(pkt);
-            self.latest_pmt = Some(arr);
-        }
-    }
-
-    fn write_tables<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        if let Some(ref pat) = self.latest_pat {
-            writer.write_all(pat)?;
-        }
-        if let Some(ref pmt) = self.latest_pmt {
-            writer.write_all(pmt)?;
-        }
-        Ok(())
-    }
+struct DisklessBuffer {
+    queue: VecDeque<InMemorySegment>,
+    max_segments: usize,
 }
 
-// ----------------------------------------------------------------
-// PAT/PMT parsing for the single authoritative PCR PID
-// ----------------------------------------------------------------
-
-/// Try to parse the PMT PID out of this PAT packet (PID=0).
-/// Returns Some(pmt_pid) if successful.
-fn parse_pat_for_pmt_pid(pkt: &[u8]) -> Option<u16> {
-    if pkt.len() < 188 {
-        return None;
-    }
-    let transport_error_indicator = (pkt[1] & 0x80) != 0;
-    if transport_error_indicator {
-        return None;
-    }
-
-    let adaptation_control = (pkt[3] >> 4) & 0x03;
-    let mut payload_offset = 4;
-    if adaptation_control == 0b10 || adaptation_control == 0b11 {
-        let adaptation_length = pkt[payload_offset] as usize;
-        payload_offset += 1 + adaptation_length;
-        if payload_offset >= 188 {
-            return None;
+impl DisklessBuffer {
+    fn new(max_segments: usize) -> Self {
+        DisklessBuffer {
+            queue: VecDeque::new(),
+            max_segments,
         }
     }
 
-    if payload_offset >= 188 {
-        return None;
-    }
-    let pointer_field = pkt[payload_offset];
-    payload_offset += 1 + pointer_field as usize;
-    if payload_offset + 8 > 188 {
-        return None;
-    }
-
-    // table_id = 0x00 for PAT
-    if pkt[payload_offset] != 0x00 {
-        return None;
-    }
-
-    let section_length =
-        u16::from_be_bytes([pkt[payload_offset + 1] & 0x0f, pkt[payload_offset + 2]]) as usize;
-    let pat_section_end = payload_offset + 3 + section_length;
-    let mut program_info_offset = payload_offset + 8;
-
-    while program_info_offset + 4 <= pat_section_end.saturating_sub(4) {
-        let program_number =
-            u16::from_be_bytes([pkt[program_info_offset], pkt[program_info_offset + 1]]);
-        let pid_hi = pkt[program_info_offset + 2] & 0x1F;
-        let pid_lo = pkt[program_info_offset + 3];
-        let candidate_pmt_pid = ((pid_hi as u16) << 8) | (pid_lo as u16);
-
-        // nonzero program_number => real PMT PID
-        if program_number != 0 {
-            return Some(candidate_pmt_pid);
-        }
-        program_info_offset += 4;
-    }
-
-    None
-}
-
-/// Try to parse the PCR PID out of the PMT packet (PID = the one from parse_pat_for_pmt_pid).
-fn parse_pmt_for_pcr_pid(pkt: &[u8]) -> Option<u16> {
-    if pkt.len() < 188 {
-        return None;
-    }
-
-    let adaptation_control = (pkt[3] >> 4) & 0x3;
-    let mut payload_offset = 4;
-
-    // Skip adaptation field if present
-    if adaptation_control == 0b10 || adaptation_control == 0b11 {
-        let adaptation_length = pkt[payload_offset] as usize;
-        payload_offset += 1 + adaptation_length;
-        if payload_offset >= 188 {
-            return None;
-        }
-    }
-
-    // If there's no payload, bail
-    if adaptation_control == 0b00 || adaptation_control == 0b10 {
-        return None;
-    }
-
-    // Skip pointer_field
-    if payload_offset >= 188 {
-        return None;
-    }
-    let pointer_field = pkt[payload_offset];
-    payload_offset += 1 + pointer_field as usize;
-    if payload_offset + 8 > 188 {
-        return None;
-    }
-
-    // table_id = 0x02 => PMT
-    if pkt[payload_offset] != 0x02 {
-        return None;
-    }
-
-    // The PCR PID is at [payload_offset + 8..+10]
-    let pcr_pid = ((pkt[payload_offset + 8] as u16 & 0x1F) << 8) | pkt[payload_offset + 9] as u16;
-    Some(pcr_pid)
-}
-
-// ----------------------------------------------------------------
-// PCR tracker with single PID-based logic
-// ----------------------------------------------------------------
-
-#[derive(Default)]
-struct PcrTracker {
-    earliest_pcr: Option<f64>,
-    latest_pcr: Option<f64>,
-    pcr_first_idx: Option<usize>,
-    pcr_last_idx: Option<usize>,
-    total_packets: usize,
-
-    // Key addition: we only track PCR from the authoritative "primary" PID
-    primary_pcr_pid: Option<u16>,
-
-    // We might store "discovered PMT PID" if you want to parse it in steps
-    discovered_pmt_pid: Option<u16>,
-}
-
-impl PcrTracker {
-    fn handle_ts_packet(&mut self, pkt: &[u8]) {
-        if pkt.len() != 188 {
-            return;
-        }
-
-        // Which PID is this packet?
-        let pid = ((pkt[1] as u16 & 0x1F) << 8) | (pkt[2] as u16);
-
-        // ---------------------------------------------------------
-        // 1) If we don't yet know the PCR PID, try to parse PAT/PMT
-        // ---------------------------------------------------------
-        if self.primary_pcr_pid.is_none() {
-            // If it's a PAT (PID=0), parse to find PMT PID
-            if pid == 0 {
-                if let Some(pmt_pid) = parse_pat_for_pmt_pid(pkt) {
-                    self.discovered_pmt_pid = Some(pmt_pid);
-                }
-            }
-            // If it's the PMT PID we discovered, parse to find the real PCR PID
-            else if Some(pid) == self.discovered_pmt_pid {
-                if let Some(pcr_pid) = parse_pmt_for_pcr_pid(pkt) {
-                    println!("Found primary PCR PID = 0x{:04x} from PMT", pcr_pid);
-                    self.primary_pcr_pid = Some(pcr_pid);
-                }
-            }
-        }
-
-        // ---------------------------------------
-        // 2) Only track PCR if pid == primary_pcr_pid
-        // ---------------------------------------
-        if let Some(pcr_pid) = self.primary_pcr_pid {
-            if pid == pcr_pid {
-                self.total_packets += 1;
-
-                let adaptation_control = (pkt[3] >> 4) & 0b11;
-                if adaptation_control == 0b10 || adaptation_control == 0b11 {
-                    let adaptation_len = pkt[4] as usize;
-                    if adaptation_len > 0 && adaptation_len <= 183 {
-                        let adaptation_flags = pkt[5];
-                        let pcr_flag = (adaptation_flags & 0x10) != 0;
-                        if pcr_flag && adaptation_len >= 7 {
-                            if let Some(pcr_value) = parse_pcr(&pkt[6..12]) {
-                                // First PCR?
-                                if self.earliest_pcr.is_none() {
-                                    self.earliest_pcr = Some(pcr_value);
-                                    self.pcr_first_idx = Some(self.total_packets - 1);
-                                }
-                                // Check discontinuity
-                                if let Some(prev) = self.latest_pcr {
-                                    if pcr_value < prev {
-                                        println!("PCR discontinuity: {} -> {}", prev, pcr_value);
-                                        // You might choose to reset or skip
-                                    }
-                                }
-                                self.latest_pcr = Some(pcr_value);
-                                self.pcr_last_idx = Some(self.total_packets - 1);
-                            }
-                        }
-                    }
-                }
+    fn push_segment(&mut self, seg: InMemorySegment) {
+        debug!(
+            "Pushing segment into ring buffer, length={}, dur={}",
+            seg.data.len(),
+            seg.duration
+        );
+        self.queue.push_back(seg);
+        if self.max_segments > 0 {
+            while self.queue.len() > self.max_segments {
+                self.queue.pop_front();
             }
         }
     }
-
-    /// Use a conservative partial compensation to yield the final segment duration
-    fn compensated_duration(&self) -> f64 {
-        match (self.earliest_pcr, self.latest_pcr) {
-            (Some(start), Some(end)) if end > start => {
-                let raw = end - start;
-                let first_idx = self.pcr_first_idx.unwrap_or(0);
-                let last_idx = self.pcr_last_idx.unwrap_or(0);
-                if last_idx <= first_idx || raw <= 0.0 {
-                    return raw;
-                }
-
-                let packet_range = (last_idx - first_idx) as f64;
-                let time_per_pkt = if packet_range > 0.0 {
-                    raw / packet_range
-                } else {
-                    0.0
-                };
-                // limit pre/post to 5 packets
-                let packets_before = first_idx.min(5) as f64;
-                let packets_after = (self.total_packets.saturating_sub(last_idx + 1)).min(5) as f64;
-
-                // partial multiplier
-                (raw + (packets_before + packets_after) * time_per_pkt * 0.8) * 1.2
-            }
-            _ => 0.0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.earliest_pcr = None;
-        self.latest_pcr = None;
-        self.pcr_first_idx = None;
-        self.pcr_last_idx = None;
-        self.total_packets = 0;
-    }
 }
 
-/// Parse raw 42-bit base + 9-bit extension => f64 seconds
-fn parse_pcr(data: &[u8]) -> Option<f64> {
-    if data.len() < 6 {
-        return None;
-    }
-    let pcr_base = ((data[0] as u64) << 25)
-        | ((data[1] as u64) << 17)
-        | ((data[2] as u64) << 9)
-        | ((data[3] as u64) << 1)
-        | ((data[4] as u64) >> 7);
-
-    let pcr_ext = ((data[4] & 0x01) as u16) << 8 | data[5] as u16;
-    let total_27mhz_ticks = pcr_base * 300 + pcr_ext as u64;
-    Some(total_27mhz_ticks as f64 / 27_000_000.0)
+async fn upload_memory_segment_to_s3(
+    s3_client: &Client,
+    bucket: &str,
+    object_key: &str,
+    segment_data: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    debug!(
+        "Starting S3 upload of in-memory segment to object key='{}', length={}",
+        object_key,
+        segment_data.len()
+    );
+    let body_stream = ByteStream::from(segment_data.to_vec());
+    s3_client
+        .put_object()
+        .bucket(bucket)
+        .key(object_key)
+        .body(body_stream)
+        .content_type("video/mp2t")
+        .send()
+        .await?;
+    debug!("Completed S3 upload of object key='{}'", object_key);
+    Ok(())
 }
-
-// ------------- MANUAL SEGMENTER -------------
 
 struct PlaylistEntry {
     duration: f64,
@@ -771,14 +460,25 @@ struct ManualSegmenter {
     playlist_path: PathBuf,
     m3u8_initialized: bool,
 
-    pat_pmt_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
-    inject_pat_pmt: bool,
-
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
 
-    // Our brand-new selective PcrTracker
-    pcr_tracker: PcrTracker,
+    diskless_mode: bool,
+    diskless_buffer: Arc<Mutex<DisklessBuffer>>,
+
+    segment_open_time: Option<Instant>,
+    bytes_this_segment: u64,
+    last_measured_bitrate: f64,
+
+    current_segment_buffer: Vec<u8>,
+
+    s3_client: Option<Client>,
+    s3_bucket: Option<String>,
+    generate_unsigned_urls: bool,
+    s3_endpoint: Option<String>,
+
+    // If zero => no forced split
+    diskless_max_bytes: usize,
 }
 
 impl ManualSegmenter {
@@ -790,12 +490,34 @@ impl ManualSegmenter {
             segment_index: 0,
             playlist_path,
             m3u8_initialized: false,
-            pat_pmt_cache: None,
-            inject_pat_pmt: false,
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
-            pcr_tracker: PcrTracker::default(),
+            diskless_mode: false,
+            diskless_buffer: Arc::new(Mutex::new(DisklessBuffer::new(0))),
+            segment_open_time: None,
+            bytes_this_segment: 0,
+            last_measured_bitrate: 0.0,
+            current_segment_buffer: Vec::new(),
+            s3_client: None,
+            s3_bucket: None,
+            generate_unsigned_urls: false,
+            s3_endpoint: None,
+            diskless_max_bytes: 25_000_000,
         }
+    }
+
+    fn with_s3(
+        mut self,
+        s3_client: Option<Client>,
+        s3_bucket: Option<String>,
+        generate_unsigned_urls: bool,
+        s3_endpoint: Option<String>,
+    ) -> Self {
+        self.s3_client = s3_client;
+        self.s3_bucket = s3_bucket;
+        self.generate_unsigned_urls = generate_unsigned_urls;
+        self.s3_endpoint = s3_endpoint;
+        self
     }
 
     fn with_max_segments(mut self, max_segments: usize) -> Self {
@@ -803,83 +525,262 @@ impl ManualSegmenter {
         self
     }
 
-    fn with_pat_pmt(
-        mut self,
-        table_cache: Option<Arc<Mutex<MpegTsTableCache>>>,
-        inject: bool,
-    ) -> Self {
-        self.pat_pmt_cache = table_cache;
-        self.inject_pat_pmt = inject;
+    fn with_diskless_mode(mut self, diskless: bool, ring_size: usize) -> Self {
+        self.diskless_mode = diskless;
+        self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
+        self
+    }
+
+    fn with_diskless_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.diskless_max_bytes = max_bytes;
         self
     }
 
     fn write_ts(&mut self, data: &[u8]) -> std::io::Result<()> {
-        if self.current_ts_file.is_none() {
-            self.open_new_segment_file()?;
-        }
-        if let Some(file) = self.current_ts_file.as_mut() {
-            file.write_all(data)?;
-            file.flush()?;
+        // If this is our first data in a new segment, note the wall-clock start time
+        if self.segment_open_time.is_none() {
+            self.segment_open_time = Some(Instant::now());
         }
 
-        // Update PCR from these packets (if any)
-        let pkt_count = data.len() / 188;
-        for i in 0..pkt_count {
-            let idx_start = i * 188;
-            let pkt = &data[idx_start..(idx_start + 188)];
-            self.pcr_tracker.handle_ts_packet(pkt);
+        // If not diskless, write to an actual file
+        if !self.diskless_mode {
+            if self.current_ts_file.is_none() {
+                self.open_new_segment_file()?;
+            }
+            if let Some(file) = self.current_ts_file.as_mut() {
+                file.write_all(data)?;
+                file.flush()?;
+            }
+        } else {
+            // If diskless, accumulate in self.current_segment_buffer
+            self.current_segment_buffer.extend_from_slice(data);
+
+            // If user set a max size for each segment, forcibly cut once we exceed it
+            if self.diskless_max_bytes > 0
+                && self.current_segment_buffer.len() >= self.diskless_max_bytes
+            {
+                debug!(
+                    "[DISKLESS] buffer >= {} bytes, forcing segment close...",
+                    self.diskless_max_bytes
+                );
+                self.close_current_segment_file()?;
+                if !self.diskless_mode {
+                    self.open_new_segment_file()?;
+                }
+            }
         }
 
-        // Use the (new) compensated duration for segment cutting
-        let current_duration = self.pcr_tracker.compensated_duration();
-        if current_duration >= get_segment_duration_seconds() as f64 {
+        // Just counting bytes for fallback bitrate
+        self.bytes_this_segment += data.len() as u64;
+
+        // We'll do a simple "close if wall clock or byte-based logic says so"
+        let desired_secs = get_segment_duration_seconds() as f64;
+        let now = Instant::now();
+        let elapsed_wall = self
+            .segment_open_time
+            .map(|st| now.duration_since(st).as_secs_f64())
+            .unwrap_or(0.0);
+
+        // if we've measured a "bitrate"
+        let mut enough_bytes_based_on_bitrate = false;
+        if self.last_measured_bitrate > 0.0 {
+            let needed_bytes = self.last_measured_bitrate * desired_secs;
+            if self.bytes_this_segment as f64 >= needed_bytes {
+                enough_bytes_based_on_bitrate = true;
+            }
+        }
+
+        // if we exceed 1.5x desired wall time, forcibly close
+        let fallback_time_expired = elapsed_wall >= desired_secs * 1.5;
+
+        if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
+            debug!(
+                 "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
+                 elapsed_wall,
+                 desired_secs,
+                 enough_bytes_based_on_bitrate,
+                 fallback_time_expired
+             );
             self.close_current_segment_file()?;
-            self.open_new_segment_file()?;
+            if !self.diskless_mode {
+                self.open_new_segment_file()?;
+            }
         }
+
         Ok(())
     }
 
     fn close_current_segment_file(&mut self) -> std::io::Result<()> {
-        if let Some(mut writer) = self.current_ts_file.take() {
-            writer.flush()?;
-            drop(writer);
+        // Measure real_elapsed from segment_open_time
+        let real_elapsed = self
+            .segment_open_time
+            .map(|st| Instant::now().duration_since(st).as_secs_f64())
+            .unwrap_or(0.0);
 
-            // Use compensated duration
-            let duration = self.pcr_tracker.compensated_duration();
-            let segment_path = self.current_segment_path(self.segment_index + 1);
+        debug!(
+            "Closing segment {}, measured wall-clock duration={:.3}s",
+            self.segment_index + 1,
+            real_elapsed
+        );
 
-            // Write the duration to a companion file
-            let duration_path = segment_path.with_extension("dur");
-            let full_dur_path = Path::new(&self.output_dir).join(&duration_path);
-            fs::write(full_dur_path, duration.to_string())?;
+        // If not diskless, finalize file-based approach
+        if !self.diskless_mode {
+            if let Some(mut writer) = self.current_ts_file.take() {
+                writer.flush()?;
+                drop(writer);
 
+                // Write sidecar
+                let segment_path = self.current_segment_path(self.segment_index + 1);
+                let duration_path = segment_path.with_extension("dur");
+                let full_dur_path = Path::new(&self.output_dir).join(&duration_path);
+                fs::write(full_dur_path, format!("{:.3}", real_elapsed))?;
+
+                // Add to playlist
+                self.playlist_entries.push(PlaylistEntry {
+                    duration: real_elapsed,
+                    path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
+                });
+
+                if self.max_segments_in_index > 0
+                    && self.playlist_entries.len() > self.max_segments_in_index
+                {
+                    let removed = self.playlist_entries.remove(0);
+                    let old_path = Path::new(&removed.path);
+                    if old_path.exists() {
+                        let _ = fs::remove_file(old_path);
+                        let dur_path = old_path.with_extension("dur");
+                        let _ = fs::remove_file(dur_path);
+                    }
+                }
+            }
+        } else {
+            // diskless mode => finalize the chunk in memory
+            let seg_data_clone = self.current_segment_buffer.clone();
+            self.current_segment_buffer.clear();
+            debug!(
+                "[DISKLESS] Finalizing seg#{} in memory, length={}, wall-clock dur={:.3}",
+                self.segment_index + 1,
+                seg_data_clone.len(),
+                real_elapsed
+            );
+
+            {
+                let mut buf = self.diskless_buffer.lock().unwrap();
+                buf.push_segment(InMemorySegment {
+                    data: seg_data_clone.clone(),
+                    duration: real_elapsed,
+                });
+            }
+
+            // Optionally upload to S3
+            let mut final_path = format!("mem://segment_{}", self.segment_index + 1);
+            if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
+                let object_key = format!("diskless_segment_{:04}.ts", self.segment_index + 1);
+                debug!(
+                    "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
+                    object_key,
+                    seg_data_clone.len()
+                );
+                let upload_res = block_on(upload_memory_segment_to_s3(
+                    s3c,
+                    buck,
+                    &object_key,
+                    &seg_data_clone,
+                ));
+
+                match upload_res {
+                    Ok(_) => {
+                        debug!("[DISKLESS] S3 upload succeeded. Now build URL...");
+                        if self.generate_unsigned_urls {
+                            if let Some(ref endpoint) = self.s3_endpoint {
+                                final_path = format!("{}/{}/{}", endpoint, buck, object_key);
+                            }
+                        } else {
+                            let presign_res = block_on(self.generate_s3_url(&object_key));
+                            if let Ok(url_str) = presign_res {
+                                final_path = url_str;
+                            } else {
+                                warn!("[DISKLESS] presign failed, fallback to mem:// path");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[DISKLESS] S3 upload of object_key='{}' failed: {:?}",
+                            object_key, e
+                        );
+                    }
+                }
+            }
+
+            // Add to playlist
             self.playlist_entries.push(PlaylistEntry {
-                duration,
-                path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
+                duration: real_elapsed,
+                path: final_path,
             });
 
             if self.max_segments_in_index > 0
                 && self.playlist_entries.len() > self.max_segments_in_index
             {
-                let removed = self.playlist_entries.remove(0);
-                let old_path = Path::new(&removed.path);
-                if old_path.exists() {
-                    let _ = fs::remove_file(old_path);
-                    let dur_path = old_path.with_extension("dur");
-                    let _ = fs::remove_file(dur_path);
-                }
+                let _ = self.playlist_entries.remove(0);
             }
-
-            self.segment_index += 1;
-            self.rewrite_m3u8()?;
-
-            // Reset PCR each time a segment ends
-            self.pcr_tracker.reset();
         }
+
+        // bump segment index
+        self.segment_index += 1;
+
+        // rewrite local M3U8
+        if let Err(e) = self.rewrite_m3u8() {
+            warn!("Error rewriting m3u8: {:?}", e);
+        }
+
+        // measure overall "bitrate"
+        if let Some(st) = self.segment_open_time.take() {
+            let real_elapsed = Instant::now().duration_since(st).as_secs_f64();
+            if real_elapsed > 0.2 {
+                let segment_bitrate = self.bytes_this_segment as f64 / real_elapsed;
+                // simple smoothing
+                self.last_measured_bitrate =
+                    0.6 * self.last_measured_bitrate + 0.4 * segment_bitrate;
+            }
+        }
+
+        // done, reset counters
+        self.bytes_this_segment = 0;
         Ok(())
     }
 
+    async fn generate_s3_url(
+        &self,
+        object_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if self.generate_unsigned_urls {
+            if let (Some(ref endpoint), Some(ref buck)) = (&self.s3_endpoint, &self.s3_bucket) {
+                Ok(format!("{}/{}/{}", endpoint, buck, object_key))
+            } else {
+                Err("missing endpoint or bucket for generate_s3_url".into())
+            }
+        } else {
+            if let (Some(ref client), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
+                let config =
+                    PresigningConfig::expires_in(Duration::from_secs(get_url_signing_seconds()))?;
+                let presigned_req = client
+                    .get_object()
+                    .bucket(buck)
+                    .key(object_key)
+                    .presigned(config)
+                    .await?;
+                Ok(presigned_req.uri().to_string())
+            } else {
+                Err("No s3_client or s3_bucket for presigned url".into())
+            }
+        }
+    }
+
     fn open_new_segment_file(&mut self) -> std::io::Result<()> {
+        if self.diskless_mode {
+            return Ok(());
+        }
         let segment_path = self.current_segment_path(self.segment_index);
         let full_path = Path::new(&self.output_dir).join(&segment_path);
         if let Some(parent) = full_path.parent() {
@@ -887,15 +788,7 @@ impl ManualSegmenter {
         }
 
         let file = fs::File::create(&full_path)?;
-        let mut writer = BufWriter::new(file);
-
-        // Inject latest PAT/PMT at the start of each new segment
-        if self.inject_pat_pmt {
-            if let Some(cache) = &self.pat_pmt_cache {
-                let cache = cache.lock().unwrap();
-                cache.write_tables(&mut writer)?;
-            }
-        }
+        let writer = BufWriter::new(file);
 
         self.current_ts_file = Some(writer);
         if !self.m3u8_initialized {
@@ -914,7 +807,6 @@ impl ManualSegmenter {
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        // We'll refine target duration on rewrite
         writeln!(
             f,
             "#EXT-X-TARGETDURATION:{}",
@@ -925,6 +817,10 @@ impl ManualSegmenter {
     }
 
     fn rewrite_m3u8(&self) -> std::io::Result<()> {
+        debug!(
+            "Rewriting m3u8 with {} entries",
+            self.playlist_entries.len()
+        );
         let mut f = fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -981,6 +877,12 @@ impl Drop for ManualSegmenter {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Debug)
+        .format_timestamp_secs()
+        .init();
+    debug!("Logging initialized. Starting main()...");
+
     let matches = ClapCommand::new("mpegts_to_s3")
         .version("1.0")
         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
@@ -1053,12 +955,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("inject_pat_pmt")
-                .long("inject_pat_pmt")
-                .help("If using manual segmentation, prepend the latest PAT & PMT to each segment.")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
             Arg::new("hls_keep_segments")
                 .long("hls_keep_segments")
                 .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
@@ -1070,7 +966,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .help("Generate unsigned S3 URLs instead of presigned URLs.")
                 .action(clap::ArgAction::SetTrue),
         )
+        // diskless mode
+        .arg(
+            Arg::new("diskless_mode")
+                .long("diskless_mode")
+                .help("Keep TS segments in memory instead of writing them to disk.")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("diskless_ring_size")
+                .long("diskless_ring_size")
+                .help("Number of diskless segments to keep in memory ring buffer.")
+                .default_value("20"),
+        )
         .get_matches();
+
+    debug!("Command-line arguments parsed: {:?}", matches);
 
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
     let region_name = matches.get_one::<String>("region").unwrap();
@@ -1082,7 +993,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
     let manual_segment = matches.get_flag("manual_segment");
-    let inject_pat_pmt = matches.get_flag("inject_pat_pmt");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
 
     let hls_keep_segments: usize = matches
@@ -1091,10 +1001,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse()
         .unwrap_or(0);
 
+    let diskless_mode = matches.get_flag("diskless_mode");
+    let diskless_ring_size: usize = matches
+        .get_one::<String>("diskless_ring_size")
+        .unwrap()
+        .parse()
+        .unwrap_or(20);
+
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-              interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-              inject_pat_pmt={}, hls_keep_segments={}, generate_unsigned_urls={}",
+                interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+                hls_keep_segments={}, generate_unsigned_urls={}, \
+                diskless_mode={}, diskless_ring_size={}",
         endpoint,
         region_name,
         bucket,
@@ -1105,9 +1023,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         output_dir,
         remove_local,
         manual_segment,
-        inject_pat_pmt,
         hls_keep_segments,
-        generate_unsigned_urls
+        generate_unsigned_urls,
+        diskless_mode,
+        diskless_ring_size
     );
 
     fs::create_dir_all(output_dir)?;
@@ -1115,7 +1034,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Initializing S3 client with endpoint: {}", endpoint);
     let creds = Credentials::new(get_s3_username(), get_s3_password(), None, None, "dummy");
 
-    // Build shared config from aws_config
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(region_name.clone()))
         .endpoint_url(endpoint)
@@ -1123,16 +1041,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .load()
         .await;
 
-    // Then build S3 client
     let s3_config = aws_sdk_s3::config::Builder::from(&config)
         .force_path_style(true)
         .build();
     let s3_client = Client::from_conf(s3_config);
 
-    // Ensure S3 bucket
     ensure_bucket_exists(&s3_client, bucket).await?;
 
-    // Build HourlyIndexCreator
     let hourly_index_creator = HourlyIndexCreator::new(
         s3_client.clone(),
         bucket.to_string(),
@@ -1200,13 +1115,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (None, None)
     };
 
-    let table_cache = Arc::new(Mutex::new(MpegTsTableCache::default()));
     let s3_client_clone = s3_client.clone();
     let bucket_clone = bucket.clone();
     let output_dir_clone = output_dir.clone();
     let output_dir_for_task = output_dir.clone();
 
-    // Start async upload task
     let upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
             watch_rx,
@@ -1223,14 +1136,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
+    debug!(
+        "Attempting to join multicast {}:{} on interface={}",
+        filter_ip, filter_port, interface
+    );
     let _sock = match join_multicast_on_iface(filter_ip, filter_port, interface) {
-        Ok(s) => s,
+        Ok(s) => {
+            debug!("Successfully joined multicast group");
+            s
+        }
         Err(e) => {
             eprintln!("Failed to join multicast group or find interface IP: {}", e);
             return Ok(());
         }
     };
 
+    // Prepare for pcap capture
+    debug!(
+        "Opening PCAP on interface={} with snaplen=65535, buffer=8MB, timeout={}",
+        interface, timeout
+    );
     let pcap_packet_count = 7;
     let pcap_packet_size = 188;
     let pcap_packet_header_size = 42;
@@ -1245,6 +1170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .open()?;
 
     let filter_expr = format!("udp and host {} and port {}", filter_ip, filter_port);
+    debug!("Setting pcap filter to '{}'", filter_expr);
     cap.filter(&filter_expr, true)?;
 
     println!(
@@ -1255,14 +1181,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut manual_segmenter = if manual_segment {
         Some(
             ManualSegmenter::new(output_dir)
-                .with_pat_pmt(Some(table_cache.clone()), inject_pat_pmt)
-                .with_max_segments(hls_keep_segments),
+                .with_max_segments(hls_keep_segments)
+                .with_diskless_mode(diskless_mode, diskless_ring_size)
+                .with_s3(
+                    Some(s3_client.clone()),
+                    Some(bucket.clone()),
+                    generate_unsigned_urls,
+                    Some(endpoint.clone()),
+                )
+                .with_diskless_max_bytes(25_000_000),
         )
     } else {
         None
     };
 
-    // Main capture loop
+    let diskless_consumer = if diskless_mode {
+        if let Some(_seg_ref) = &manual_segmenter {
+            let buffer_ref = _seg_ref.diskless_buffer.clone();
+            let handle = thread::spawn(move || loop {
+                {
+                    let mut buf = buffer_ref.lock().unwrap();
+                    if let Some(front) = buf.queue.pop_front() {
+                        debug!(
+                            "Diskless consumer got a segment of len {}, dur={}",
+                            front.data.len(),
+                            front.duration
+                        );
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            });
+            Some(handle)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    debug!("Starting main capture loop now...");
     loop {
         // Check if FFmpeg died
         if let Some(child) = ffmpeg_child.as_mut() {
@@ -1275,7 +1232,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let packet = match cap.next_packet() {
             Ok(pkt) => pkt,
             Err(_) => {
-                // Check if FFmpeg ended
+                // Possibly no packet arrived in the last 'timeout' ms
+                // so check if we want to forcibly close a segment on a timer, etc.
+                if let Some(_seg) = manual_segmenter.as_mut() {
+                    // optionally _seg.check_fallback_timeout() if you implement it
+                }
                 if let Some(child) = ffmpeg_child.as_mut() {
                     if let Some(exit_status) = child.try_wait()? {
                         eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -1286,25 +1247,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
-            // Update table cache for re-injection
-            if manual_segment && inject_pat_pmt {
-                let pkt_count = ts_payload.len() / 188;
-                let mut cache = table_cache.lock().unwrap();
-                for i in 0..pkt_count {
-                    let pkt = &ts_payload[i * 188..(i + 1) * 188];
-                    let pid = ((pkt[1] as u16 & 0x1F) << 8) | (pkt[2] as u16);
-                    if pid == 0 {
-                        cache.update_pat(pkt);
-                    } else if let Some(pp) = cache.pmt_pid {
-                        if pid == pp {
-                            cache.update_pmt(pkt);
-                        }
-                    }
-                }
-            }
+        /*debug!(
+            "Got pcap packet of len={} ... checking if it's TS for {}:{}",
+            packet.data.len(),
+            filter_ip,
+            filter_port
+        );*/
 
-            // Feed TS data to FFmpeg if not manual
+        if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
+            /*debug!(
+                "extract_mpegts_payload returned {} bytes of TS data",
+                ts_payload.len()
+            );*/
+
+            // If not manual, feed TS to FFmpeg
             if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
                 if let Err(e) = buf.write_all(ts_payload) {
                     eprintln!("Error feeding data to FFmpeg: {:?}", e);
@@ -1312,13 +1268,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // If manual segmentation, write to segments ourselves
+            // If manual, feed TS data to our segmenter
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload) {
                     eprintln!("Error writing manual TS segment: {:?}", e);
                     break;
                 }
             }
+        } else {
+            debug!(
+                "extract_mpegts_payload returned None => not recognized as TS for {}:{}",
+                filter_ip, filter_port
+            );
         }
     }
 
@@ -1337,6 +1298,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     drop(manual_segmenter);
+
+    if let Some(handle) = diskless_consumer {
+        let _ = handle.thread().id();
+    }
+
     let _ = upload_task.await?;
     let _ = watch_thread.join();
     println!("Exiting normally.");
@@ -1367,24 +1333,6 @@ fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> Notify
     Ok(())
 }
 
-// ---------------- FILE STABILITY CHECK ----------------
-
-async fn wait_for_file_stable(
-    path: &Path,
-    check_interval_ms: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut previous_size = 0;
-    loop {
-        let current_size = fs::metadata(path)?.len();
-        if current_size > 0 && current_size == previous_size {
-            break;
-        }
-        previous_size = current_size;
-        sleep(Duration::from_millis(check_interval_ms)).await;
-    }
-    Ok(())
-}
-
 // ---------------- File-Event -> S3-Upload ----------------
 
 async fn handle_file_events(
@@ -1403,7 +1351,9 @@ async fn handle_file_events(
             EventKind::Create(_) | EventKind::Modify(_) => {
                 for path in event.paths {
                     if let Some(ext) = path.extension() {
-                        if ext == "ts" || ext == "m3u8" {
+                        if (ext == "ts" || ext == "m3u8")
+                            && !path.to_string_lossy().contains("_temp.")
+                        {
                             let full_path_str = path.to_string_lossy().to_string();
                             let tracker_clone = Arc::clone(&tracker);
 
@@ -1413,14 +1363,34 @@ async fn handle_file_events(
                             };
 
                             if should_upload {
-                                // Wait until stable
-                                if let Err(e) = wait_for_file_stable(&path, 300).await {
-                                    warn!(
-                                        "Skipping {}: error waiting for stable file: {}",
-                                        full_path_str, e
-                                    );
-                                    continue;
+                                // Skip file stability check for diskless mode paths
+                                if !full_path_str.starts_with("mem://") {
+                                    let mut retries = 30;
+                                    let mut stable_count = 0;
+                                    let mut last_size = 0;
+
+                                    while retries > 0 && stable_count < 3 {
+                                        if let Ok(metadata) = fs::metadata(&path) {
+                                            let current_size = metadata.len();
+                                            if current_size > 0 {
+                                                if current_size == last_size {
+                                                    stable_count += 1;
+                                                } else {
+                                                    stable_count = 0;
+                                                    last_size = current_size;
+                                                }
+                                            }
+                                        }
+                                        sleep(Duration::from_millis(300)).await;
+                                        retries -= 1;
+                                    }
+
+                                    if stable_count < 3 {
+                                        warn!("File {} did not stabilize, skipping", full_path_str);
+                                        continue;
+                                    }
                                 }
+
                                 let relative_path = match strip_base_dir(&path, &base_dir) {
                                     Ok(rp) => rp,
                                     Err(e) => {
@@ -1437,7 +1407,6 @@ async fn handle_file_events(
                                     .map(|p| p.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "".to_string());
 
-                                // Upload the file
                                 if let Ok(()) = upload_file_to_s3(
                                     &s3_client,
                                     &bucket,
@@ -1451,10 +1420,8 @@ async fn handle_file_events(
                                     tracker.mark_uploaded(full_path_str.clone());
                                 }
 
-                                // If we wrote a ".dur" side file, read it
                                 let pcr_dur_path = path.with_extension("dur");
                                 let actual_segment_duration = if pcr_dur_path.exists() {
-                                    // If parse fails, fallback
                                     if let Ok(dur_str) = fs::read_to_string(&pcr_dur_path) {
                                         dur_str
                                             .parse()
@@ -1463,13 +1430,11 @@ async fn handle_file_events(
                                         get_actual_file_duration(&path)
                                     }
                                 } else {
-                                    // fallback if no .dur
                                     get_actual_file_duration(&path)
                                 };
 
                                 let custom_lines = vec![];
 
-                                // Hourly index -> use PCR-based duration
                                 hourly_index_creator
                                     .record_segment(
                                         &hour_dir,
@@ -1502,7 +1467,6 @@ async fn upload_file_to_s3(
     let relative_path = strip_base_dir(path, base_dir)?;
     let key_str = relative_path.to_string_lossy().to_string();
 
-    // content-type by extension
     let mime_type = if let Some(ext) = path.extension() {
         if ext == "m3u8" {
             "application/vnd.apple.mpegurl"
@@ -1562,7 +1526,6 @@ async fn upload_file_to_s3(
                     if let Err(e) = fs::remove_file(path) {
                         eprintln!("Failed removing local file {}: {:?}", path.display(), e);
                     }
-                    // also remove .dur sidecar if it exists
                     let dur_sidecar = path.with_extension("dur");
                     if dur_sidecar.exists() {
                         if let Err(e) = fs::remove_file(&dur_sidecar) {
@@ -1657,7 +1620,6 @@ fn extract_mpegts_payload<'a>(
         return None;
     }
 
-    // Some streams wrap TS in RTP (0x80.. + 12 bytes, then 0x47).
     let (ts_payload, is_rtp) = if payload[0] == 0x80 && payload.len() > 12 && payload[12] == 0x47 {
         (&payload[12..], true)
     } else if payload[0] == 0x47 {
