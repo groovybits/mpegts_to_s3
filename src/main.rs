@@ -69,6 +69,41 @@ fn get_s3_password() -> String {
     std::env::var("S3_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
 }
 
+fn get_pcap_packet_count() -> usize {
+    std::env::var("PCAP_PACKET_COUNT")
+        .unwrap_or_else(|_| "7".to_string())
+        .parse()
+        .unwrap_or(7)
+}
+
+fn get_pcap_packet_size() -> usize {
+    std::env::var("PCAP_PACKET_SIZE")
+        .unwrap_or_else(|_| "188".to_string())
+        .parse()
+        .unwrap_or(188)
+}
+
+fn get_pcap_packet_header_size() -> usize {
+    std::env::var("PCAP_PACKET_HEADER_SIZE")
+        .unwrap_or_else(|_| "42".to_string())
+        .parse()
+        .unwrap_or(42)
+}
+
+fn get_snaplen() -> i32 {
+    let pcap_packet_count = get_pcap_packet_count();
+    let pcap_packet_size = get_pcap_packet_size();
+    let pcap_packet_header_size = get_pcap_packet_header_size();
+    ((pcap_packet_count * pcap_packet_size) + pcap_packet_header_size).try_into().unwrap()
+}
+
+fn get_buffer_size() -> i32 {
+    std::env::var("BUFFER_SIZE")
+        .unwrap_or_else(|_| "4194304".to_string())
+        .parse()
+        .unwrap_or(1024 * 1024 * 4)
+}
+
 /// Utility: Attempt to get the actual duration from file creation/modification times.
 /// Fallback to environment-based default if we can't measure it.
 fn get_actual_file_duration(path: &Path) -> f64 {
@@ -1042,14 +1077,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .get_one::<String>("hls_keep_segments")
         .unwrap()
         .parse()
-        .unwrap_or(0);
+        .unwrap_or(10);
 
     let diskless_mode = matches.get_flag("diskless_mode");
     let diskless_ring_size: usize = matches
         .get_one::<String>("diskless_ring_size")
         .unwrap()
         .parse()
-        .unwrap_or(20);
+        .unwrap_or(1);
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
@@ -1126,20 +1161,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .arg("-hide_banner")
             .arg("-nostats")
             .arg("-max_delay")
-            .arg("500000")
+            .arg("0")
             .arg("-f")
             .arg("hls")
             .arg("-map")
             .arg("0")
             // smaller segments
             .arg("-hls_time")
-            .arg("2")
+            .arg(get_segment_duration_seconds().to_string())
             .arg("-hls_segment_type")
             .arg("mpegts")
             .arg("-hls_playlist_type")
             .arg("event")
             .arg("-hls_list_size")
-            .arg("0")
+            .arg(hls_keep_segments.to_string())
             .arg("-strftime")
             .arg("1")
             .arg("-strftime_mkdir")
@@ -1201,16 +1236,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Opening PCAP on interface={} with snaplen=65535, buffer=8MB, timeout={}",
         interface, timeout
     );
-    let pcap_packet_count = 7;
-    let pcap_packet_size = 188;
-    let pcap_packet_header_size = 42;
-    let snaplen = (pcap_packet_count * pcap_packet_size) + pcap_packet_header_size;
-    let buffer_size = 1024 * 1024 * 4;
 
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
-        .buffer_size(buffer_size)
-        .snaplen(snaplen)
+        .buffer_size(get_buffer_size())
+        .snaplen(get_snaplen())
         .timeout(timeout)
         .open()?;
 
