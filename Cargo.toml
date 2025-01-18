@@ -1,5 +1,13 @@
 [package]
 name = "mpegts_to_s3"
+description = "MPEG-TS to S3"
+keywords = ["mpegts", "s3"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+license-file = "LICENSE"
+homepage = "https://github.com/groovybits/mpegts_to_s3"
+repository = "https://github.com/groovybits/mpegts_to_s3"
+authors = ["groovybits"]
 version = "0.1.1"
 edition = "2021"
 
