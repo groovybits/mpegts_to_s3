@@ -30,10 +30,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::sleep;
+use tokio::sync::Mutex;
 
 use env_logger;
 
@@ -478,6 +479,8 @@ struct ManualSegmenter {
 
     // If zero => no forced split
     diskless_max_bytes: usize,
+
+    hourly_index_creator: Option<Arc<Mutex<HourlyIndexCreator>>>,
 }
 
 impl ManualSegmenter {
@@ -502,6 +505,7 @@ impl ManualSegmenter {
             generate_unsigned_urls: false,
             s3_endpoint: None,
             diskless_max_bytes: 25_000_000,
+            hourly_index_creator: None,
         }
     }
 
@@ -532,6 +536,11 @@ impl ManualSegmenter {
 
     fn with_diskless_max_bytes(mut self, max_bytes: usize) -> Self {
         self.diskless_max_bytes = max_bytes;
+        self
+    }
+
+    fn with_hourly_index_creator(mut self, hic: Option<Arc<Mutex<HourlyIndexCreator>>>) -> Self {
+        self.hourly_index_creator = hic;
         self
     }
 
@@ -580,7 +589,6 @@ impl ManualSegmenter {
             .map(|st| now.duration_since(st).as_secs_f64())
             .unwrap_or(0.0);
 
-        // if we've measured a "bitrate"
         let mut enough_bytes_based_on_bitrate = false;
         if self.last_measured_bitrate > 0.0 {
             let needed_bytes = self.last_measured_bitrate * desired_secs;
@@ -589,17 +597,16 @@ impl ManualSegmenter {
             }
         }
 
-        // if we exceed 1.5x desired wall time, forcibly close
         let fallback_time_expired = elapsed_wall >= desired_secs * 1.5;
 
         if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
             debug!(
-                 "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
-                 elapsed_wall,
-                 desired_secs,
-                 enough_bytes_based_on_bitrate,
-                 fallback_time_expired
-             );
+                  "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
+                  elapsed_wall,
+                  desired_secs,
+                  enough_bytes_based_on_bitrate,
+                  fallback_time_expired
+              );
             self.close_current_segment_file().await?;
             if !self.diskless_mode {
                 self.open_new_segment_file()?;
@@ -664,7 +671,7 @@ impl ManualSegmenter {
             );
 
             {
-                let mut buf = self.diskless_buffer.lock().unwrap();
+                let mut buf = self.diskless_buffer.lock().await;
                 buf.push_segment(InMemorySegment {
                     data: seg_data_clone.clone(),
                     duration: real_elapsed,
@@ -723,15 +730,40 @@ impl ManualSegmenter {
             {
                 let _ = self.playlist_entries.remove(0);
             }
+        }
 
-            // If we're over the max ring size, drop the oldest segment
-            let mut buf = self.diskless_buffer.lock().unwrap();
-            if buf.queue.len() > self.max_segments_in_index {
-                buf.queue.pop_front();
+        // In diskless mode, notify HourlyIndexCreator about this segment
+        if self.diskless_mode {
+            if let (Some(ref hic_arc), Some(_buck)) = (&self.hourly_index_creator, &self.s3_bucket)
+            {
+                let now = chrono::Local::now();
+                let year = now.format("%Y").to_string();
+                let month = now.format("%m").to_string();
+                let day = now.format("%d").to_string();
+                let hour = now.format("%H").to_string();
+
+                let hour_dir = format!("{}/{}/{}/{}", year, month, day, hour);
+                let object_key = format!(
+                    "{}",
+                    self.current_segment_path(self.segment_index + 1)
+                        .to_string_lossy()
+                );
+                let custom_lines = vec![];
+
+                let mut guard = hic_arc.lock().await;
+                if let Err(e) = guard
+                    .record_segment(
+                        &hour_dir,
+                        &object_key,
+                        real_elapsed,
+                        custom_lines,
+                        &self.output_dir,
+                    )
+                    .await
+                {
+                    warn!("Failed to record segment in diskless mode: {:?}", e);
+                }
             }
-
-            // free the buffer we cloned
-            drop(seg_data_clone);
         }
 
         // bump segment index
@@ -747,7 +779,6 @@ impl ManualSegmenter {
             let real_elapsed = Instant::now().duration_since(st).as_secs_f64();
             if real_elapsed > 0.2 {
                 let segment_bitrate = self.bytes_this_segment as f64 / real_elapsed;
-                // simple smoothing
                 self.last_measured_bitrate =
                     0.6 * self.last_measured_bitrate + 0.4 * segment_bitrate;
             }
@@ -877,7 +908,11 @@ impl ManualSegmenter {
 
 impl Drop for ManualSegmenter {
     fn drop(&mut self) {
-        let _ = self.close_current_segment_file();
+        let _ = tokio::runtime::Handle::try_current().map(|handle| {
+            handle.block_on(async {
+                let _ = self.close_current_segment_file().await;
+            })
+        });
     }
 }
 
@@ -1018,9 +1053,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-                interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-                hls_keep_segments={}, generate_unsigned_urls={}, \
-                diskless_mode={}, diskless_ring_size={}",
+                 interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+                 hls_keep_segments={}, generate_unsigned_urls={}, \
+                 diskless_mode={}, diskless_ring_size={}",
         endpoint,
         region_name,
         bucket,
@@ -1062,6 +1097,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         generate_unsigned_urls,
         endpoint.clone(),
     );
+    // Wrap it in Arc<tokio::sync::Mutex<...>>
+    let hourly_index_creator = Arc::new(Mutex::new(hourly_index_creator));
 
     info!("Starting directory watcher on: {}", output_dir);
     let (watch_tx, watch_rx) = channel();
@@ -1128,6 +1165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir_clone = output_dir.clone();
     let output_dir_for_task = output_dir.clone();
 
+    let hic_for_task = hourly_index_creator.clone();
     let upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
             watch_rx,
@@ -1135,7 +1173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bucket_clone,
             output_dir_clone,
             remove_local,
-            hourly_index_creator,
+            hic_for_task,
             output_dir_for_task,
         )
         .await
@@ -1159,7 +1197,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // Prepare for pcap capture
     debug!(
         "Opening PCAP on interface={} with snaplen=65535, buffer=8MB, timeout={}",
         interface, timeout
@@ -1197,7 +1234,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     generate_unsigned_urls,
                     Some(endpoint.clone()),
                 )
-                .with_diskless_max_bytes(25_000_000),
+                .with_diskless_max_bytes(25_000_000)
+                .with_hourly_index_creator(Some(hourly_index_creator.clone())),
         )
     } else {
         None
@@ -1208,7 +1246,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let buffer_ref = _seg_ref.diskless_buffer.clone();
             let handle = thread::spawn(move || loop {
                 {
-                    let mut buf = buffer_ref.lock().unwrap();
+                    // This is a plain thread, but it's only popping from
+                    // the tokio::sync::Mutex in a blocking way.
+                    // For demonstration, it's okay.
+                    let mut buf = futures::executor::block_on(buffer_ref.lock());
                     if let Some(front) = buf.queue.pop_front() {
                         debug!(
                             "Diskless consumer got a segment of len {}, dur={}",
@@ -1229,7 +1270,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     debug!("Starting main capture loop now...");
     loop {
-        // Check if FFmpeg died
         if let Some(child) = ffmpeg_child.as_mut() {
             if let Some(exit_status) = child.try_wait()? {
                 eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
@@ -1258,20 +1298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        /*debug!(
-            "Got pcap packet of len={} ... checking if it's TS for {}:{}",
-            packet.data.len(),
-            filter_ip,
-            filter_port
-        );*/
-
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
-            /*debug!(
-                "extract_mpegts_payload returned {} bytes of TS data",
-                ts_payload.len()
-            );*/
-
-            // If not manual, feed TS to FFmpeg
             if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
                 if let Err(e) = buf.write_all(ts_payload) {
                     eprintln!("Error feeding data to FFmpeg: {:?}", e);
@@ -1279,7 +1306,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // If manual, feed TS data to our segmenter
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload).await {
                     eprintln!("Error writing manual TS segment: {:?}", e);
@@ -1294,7 +1320,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // Cleanup FFmpeg
     if let Some(mut buf) = ffmpeg_stdin_buf.take() {
         let _ = buf.flush();
         drop(buf);
@@ -1352,9 +1377,10 @@ async fn handle_file_events(
     bucket: String,
     base_dir: String,
     remove_local: bool,
-    mut hourly_index_creator: HourlyIndexCreator,
+    hourly_index_creator: Arc<Mutex<HourlyIndexCreator>>,
     output_dir: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Also use tokio::sync::Mutex for the tracker
     let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds())));
 
     while let Ok(event) = rx.recv() {
@@ -1366,87 +1392,94 @@ async fn handle_file_events(
                             && !path.to_string_lossy().contains("_temp.")
                         {
                             let full_path_str = path.to_string_lossy().to_string();
-                            let tracker_clone = Arc::clone(&tracker);
 
-                            let should_upload = {
-                                let tracker = tracker_clone.lock().unwrap();
-                                !tracker.is_uploaded(&full_path_str) && !tracker.is_too_old(&path)
-                            };
+                            // We lock the tracker to see if we have uploaded or if it's too old
+                            {
+                                let tr = tracker.lock().await;
+                                if tr.is_uploaded(&full_path_str) || tr.is_too_old(&path) {
+                                    // Already handled or too old
+                                    continue;
+                                }
+                            }
 
-                            if should_upload {
-                                // Skip file stability check for diskless mode paths
-                                if !full_path_str.starts_with("mem://") {
-                                    let mut retries = 30;
-                                    let mut stable_count = 0;
-                                    let mut last_size = 0;
+                            // If it's a normal file (not "mem://..."), wait for it to stabilize
+                            if !full_path_str.starts_with("mem://") {
+                                let mut retries = 30;
+                                let mut stable_count = 0;
+                                let mut last_size = 0;
 
-                                    while retries > 0 && stable_count < 3 {
-                                        if let Ok(metadata) = fs::metadata(&path) {
-                                            let current_size = metadata.len();
-                                            if current_size > 0 {
-                                                if current_size == last_size {
-                                                    stable_count += 1;
-                                                } else {
-                                                    stable_count = 0;
-                                                    last_size = current_size;
-                                                }
+                                while retries > 0 && stable_count < 3 {
+                                    if let Ok(metadata) = fs::metadata(&path) {
+                                        let current_size = metadata.len();
+                                        if current_size > 0 {
+                                            if current_size == last_size {
+                                                stable_count += 1;
+                                            } else {
+                                                stable_count = 0;
+                                                last_size = current_size;
                                             }
                                         }
-                                        sleep(Duration::from_millis(300)).await;
-                                        retries -= 1;
                                     }
-
-                                    if stable_count < 3 {
-                                        warn!("File {} did not stabilize, skipping", full_path_str);
-                                        continue;
-                                    }
+                                    sleep(Duration::from_millis(300)).await;
+                                    retries -= 1;
                                 }
 
-                                let relative_path = match strip_base_dir(&path, &base_dir) {
-                                    Ok(rp) => rp,
-                                    Err(e) => {
-                                        warn!(
-                                            "Skipping {}: strip_base_dir() error: {}",
-                                            full_path_str, e
-                                        );
-                                        continue;
-                                    }
-                                };
-                                let key_str = relative_path.to_string_lossy().to_string();
-                                let hour_dir = relative_path
-                                    .parent()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "".to_string());
-
-                                if let Ok(()) = upload_file_to_s3(
-                                    &s3_client,
-                                    &bucket,
-                                    &base_dir,
-                                    &path,
-                                    remove_local,
-                                )
-                                .await
-                                {
-                                    let mut tracker = tracker_clone.lock().unwrap();
-                                    tracker.mark_uploaded(full_path_str.clone());
+                                if stable_count < 3 {
+                                    warn!("File {} did not stabilize, skipping", full_path_str);
+                                    continue;
                                 }
+                            }
 
-                                let pcr_dur_path = path.with_extension("dur");
-                                let actual_segment_duration = if pcr_dur_path.exists() {
-                                    if let Ok(dur_str) = fs::read_to_string(&pcr_dur_path) {
-                                        dur_str
-                                            .parse()
-                                            .unwrap_or_else(|_| get_actual_file_duration(&path))
-                                    } else {
-                                        get_actual_file_duration(&path)
-                                    }
+                            let relative_path = match strip_base_dir(&path, &base_dir) {
+                                Ok(rp) => rp,
+                                Err(e) => {
+                                    warn!(
+                                        "Skipping {}: strip_base_dir() error: {}",
+                                        full_path_str, e
+                                    );
+                                    continue;
+                                }
+                            };
+                            let key_str = relative_path.to_string_lossy().to_string();
+                            let hour_dir = relative_path
+                                .parent()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "".to_string());
+
+                            if let Ok(()) = upload_file_to_s3(
+                                &s3_client,
+                                &bucket,
+                                &base_dir,
+                                &path,
+                                remove_local,
+                            )
+                            .await
+                            {
+                                // Mark uploaded
+                                let mut tr = tracker.lock().await;
+                                tr.mark_uploaded(full_path_str.clone());
+                            }
+
+                            // Compute the segment duration
+                            let pcr_dur_path = path.with_extension("dur");
+                            let actual_segment_duration = if pcr_dur_path.exists() {
+                                if let Ok(dur_str) = fs::read_to_string(&pcr_dur_path) {
+                                    dur_str
+                                        .parse()
+                                        .unwrap_or_else(|_| get_actual_file_duration(&path))
                                 } else {
                                     get_actual_file_duration(&path)
-                                };
+                                }
+                            } else {
+                                get_actual_file_duration(&path)
+                            };
 
-                                let custom_lines = vec![];
+                            let custom_lines = vec![];
 
-                                hourly_index_creator
+                            // Lock HourlyIndexCreator, update segment info
+                            {
+                                let mut hic = hourly_index_creator.lock().await;
+                                let _ = hic
                                     .record_segment(
                                         &hour_dir,
                                         &key_str,
@@ -1454,9 +1487,7 @@ async fn handle_file_events(
                                         custom_lines,
                                         &output_dir,
                                     )
-                                    .await?;
-                            } else {
-                                //debug!("Skipping {}: already uploaded or too old", full_path_str);
+                                    .await;
                             }
                         }
                     }
