@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y ffmpeg libpcap0.8 && rm -rf /var/lib/ap
 RUN mkdir -p /app/hls
 
 WORKDIR /app
-COPY --from=builder /app/target/release/mpegts_to_s3 /app/mpeg_to_s3
+COPY --from=builder /app/target/release/mpegts_to_s3 /app/mpegts_to_s3
 
-ENTRYPOINT ["/app/mpeg_to_s3"]
+ENTRYPOINT ["/app/mpegts_to_s3"]
 

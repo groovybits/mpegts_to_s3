@@ -4,9 +4,10 @@ services:
   ######################################
   # MinIO S3-Compatible Service
   ######################################
-  s3minio:
+  s3minio_container:
     image: "quay.io/minio/minio:latest"
-    container_name: "s3minio"
+    hostname: "s3minio-container"
+    container_name: "s3minio_container"
     env_file:
       - "config.env"
     environment:
@@ -45,30 +46,33 @@ services:
   ######################################
   # Rust-Based Capture & HLS Service
   ######################################
-  rust_capture:
+  mpegts_to_s3:
+    network_mode: "host"
+    hostname: "mpegts-to-s3"
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: "rust_capture"
+    container_name: "mpegts_to_s3"
     env_file:
       - "config.env"
 
     # Mount local 'hls' directory as the working directory
-    # where the application will write its files.
+    # where mpegts_to_s3 will write its files.
     volumes:
       - "./hls:/app/hls"
 
     working_dir: "/app/hls"
 
     command: >
-      /app/mpeg_to_s3
+      /app/mpegts_to_s3
       -n ${NETWORK_INTERFACE}
       -i ${UDP_IP}
       -p ${UDP_PORT}
+      -e ${S3_ENDPOINT}
       -o ts
       --diskless_mode
 
     depends_on:
-      - s3minio
+      - s3minio_container
     restart: unless-stopped
 
