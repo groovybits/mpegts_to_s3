@@ -1315,7 +1315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     generate_unsigned_urls,
                     Some(endpoint.clone()),
                 )
-                .with_diskless_max_bytes(25_000_000)
+                .with_diskless_max_bytes(get_max_segment_size_bytes())
                 .with_hourly_index_creator(Some(hourly_index_creator.clone())),
         )
     } else {
