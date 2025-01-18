@@ -1057,6 +1057,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .help("Number of diskless segments to keep in memory ring buffer.")
                 .default_value("1"),
         )
+        .arg(
+            Arg::new("encode")
+                .long("encode")
+                .help("Encode the video stream to H.264/AAC using FFmpeg.")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     debug!("Command-line arguments parsed: {:?}", matches);
@@ -1070,8 +1076,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let timeout: i32 = matches.get_one::<String>("timeout").unwrap().parse()?;
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
-    let manual_segment = matches.get_flag("manual_segment");
+    let mut manual_segment = matches.get_flag("manual_segment");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
+    let encode = matches.get_flag("encode");
+    let diskless_mode = matches.get_flag("diskless_mode");
+
+    if diskless_mode {
+        manual_segment = true;
+    }
+
+    if manual_segment && encode {
+        eprintln!("Cannot use --manual_segment and --encode together.");
+        std::process::exit(1);
+    }
 
     let hls_keep_segments: usize = matches
         .get_one::<String>("hls_keep_segments")
@@ -1079,7 +1096,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse()
         .unwrap_or(10);
 
-    let diskless_mode = matches.get_flag("diskless_mode");
     let diskless_ring_size: usize = matches
         .get_one::<String>("diskless_ring_size")
         .unwrap()
@@ -1090,7 +1106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
                  interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
                  hls_keep_segments={}, generate_unsigned_urls={}, \
-                 diskless_mode={}, diskless_ring_size={}",
+                 diskless_mode={}, diskless_ring_size={} encode={}",
         endpoint,
         region_name,
         bucket,
@@ -1104,7 +1120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hls_keep_segments,
         generate_unsigned_urls,
         diskless_mode,
-        diskless_ring_size
+        diskless_ring_size,
+        encode
     );
 
     fs::create_dir_all(output_dir)?;
@@ -1151,21 +1168,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         info!("Starting FFmpeg with output: {}", m3u8_output);
         let mut child = Command::new("ffmpeg")
+            .arg("-analyzeduration")
+            .arg("1000000")
+            .arg("-probesize")
+            .arg("1000000")
+            .arg("-f")
+            .arg("mpegts")
             .arg("-i")
             .arg("pipe:0")
-            .arg("-c")
-            .arg("copy")
+            .arg("-c:v")
+            .arg(if encode { "h264" } else { "copy" })
+            .arg("-c:a")
+            .arg(if encode { "aac" } else { "copy" })
             .arg("-loglevel")
-            .arg("error")
+            .arg("info")
             .arg("-y")
             .arg("-hide_banner")
-            .arg("-nostats")
+            //.arg("-nostats")
             .arg("-max_delay")
             .arg("0")
             .arg("-f")
             .arg("hls")
-            .arg("-map")
-            .arg("0")
+            .arg(if encode { "" } else { "-map" })
+            .arg(if encode { "" } else { "0" })
             // smaller segments
             .arg("-hls_time")
             .arg(get_segment_duration_seconds().to_string())
@@ -1183,8 +1208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .arg(&hls_segment_filename)
             .arg(&m3u8_output)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            //.stdout(Stdio::null())
+            //.stderr(Stdio::piped())
             .spawn()?;
 
         let child_stdin = child.stdin.take().ok_or("Failed to take FFmpeg stdin")?;
