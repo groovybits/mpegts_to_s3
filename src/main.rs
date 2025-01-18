@@ -204,8 +204,8 @@ impl HourlyIndexCreator {
         output_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let local_dir = std::path::Path::new(output_dir).join(hour_dir);
-        let index_path = local_dir.join("hourly_index.m3u8");
-        let temp_path = local_dir.join("hourly_index_temp.m3u8");
+        let index_path = local_dir.join("index.m3u8");
+        let temp_path = local_dir.join("index_temp.m3u8");
 
         std::fs::create_dir_all(&local_dir)?;
 
@@ -257,23 +257,19 @@ impl HourlyIndexCreator {
 
         self.upload_local_file_to_s3(
             &index_path,
-            &format!("{}/hourly_index.m3u8", hour_dir),
+            &format!("{}/index.m3u8", hour_dir),
             "application/vnd.apple.mpegurl",
         )
         .await?;
 
         let final_index_url = self
-            .presign_get_url(&format!("{}/hourly_index.m3u8", hour_dir))
+            .presign_get_url(&format!("{}/index.m3u8", hour_dir))
             .await?;
         self.rewrite_urls_log(hour_dir, &final_index_url)?;
         Ok(())
     }
 
-    fn rewrite_urls_log(
-        &mut self,
-        hour_dir: &str,
-        final_url: &str,
-    ) -> std::io::Result<()> {
+    fn rewrite_urls_log(&mut self, hour_dir: &str, final_url: &str) -> std::io::Result<()> {
         let log_path = std::path::Path::new("").join("urls.log");
         let temp_path = std::path::Path::new("").join("urls_temp.log");
 
