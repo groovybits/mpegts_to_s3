@@ -47,6 +47,13 @@ fn get_segment_duration_seconds() -> u64 {
         .unwrap_or(2)
 }
 
+fn get_max_segment_size_bytes() -> usize {
+    std::env::var("MAX_SEGMENT_SIZE_BYTES")
+        .unwrap_or_else(|_| "100000000".to_string())
+        .parse()
+        .unwrap_or(100_000_000)
+}
+
 fn get_file_max_age_seconds() -> u64 {
     std::env::var("FILE_MAX_AGE_SECONDS")
         .unwrap_or_else(|_| "30".to_string())
@@ -551,7 +558,7 @@ impl ManualSegmenter {
             s3_bucket: None,
             generate_unsigned_urls: false,
             s3_endpoint: None,
-            diskless_max_bytes: 25_000_000,
+            diskless_max_bytes: get_max_segment_size_bytes(),
             hourly_index_creator: None,
         }
     }
