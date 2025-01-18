@@ -258,7 +258,7 @@ impl HourlyIndexCreator {
         let final_index_url = self
             .presign_get_url(&format!("{}/hourly_index.m3u8", hour_dir))
             .await?;
-        self.rewrite_urls_log(hour_dir, &final_index_url, output_dir)?;
+        self.rewrite_urls_log(hour_dir, &final_index_url)?;
         Ok(())
     }
 
@@ -266,10 +266,9 @@ impl HourlyIndexCreator {
         &mut self,
         hour_dir: &str,
         final_url: &str,
-        output_dir: &str,
     ) -> std::io::Result<()> {
-        let log_path = std::path::Path::new(output_dir).join("urls.log");
-        let temp_path = std::path::Path::new(output_dir).join("urls_temp.log");
+        let log_path = std::path::Path::new("").join("urls.log");
+        let temp_path = std::path::Path::new("").join("urls_temp.log");
 
         let mut lines = vec![];
         if log_path.exists() {

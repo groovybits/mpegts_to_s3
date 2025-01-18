@@ -5,5 +5,6 @@
     -i ${SOURCE_IP} \
     -p ${SOURCE_PORT} \
     -e ${MINIO_SERVER_URL} \
+    -b ${MINIO_BUCKET_NAME} \
     -o ts \
     --diskless_mode $@
