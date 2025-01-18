@@ -33,8 +33,8 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::time::sleep;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 use env_logger;
 
@@ -94,7 +94,9 @@ fn get_snaplen() -> i32 {
     let pcap_packet_count = get_pcap_packet_count();
     let pcap_packet_size = get_pcap_packet_size();
     let pcap_packet_header_size = get_pcap_packet_header_size();
-    ((pcap_packet_count * pcap_packet_size) + pcap_packet_header_size).try_into().unwrap()
+    ((pcap_packet_count * pcap_packet_size) + pcap_packet_header_size)
+        .try_into()
+        .unwrap()
 }
 
 fn get_buffer_size() -> i32 {
@@ -102,6 +104,13 @@ fn get_buffer_size() -> i32 {
         .unwrap_or_else(|_| "4194304".to_string())
         .parse()
         .unwrap_or(1024 * 1024 * 4)
+}
+
+fn get_use_estimated_duration() -> bool {
+    std::env::var("USE_ESTIMATED_DURATION")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .unwrap_or(true)
 }
 
 /// Utility: Attempt to get the actual duration from file creation/modification times.
@@ -653,10 +662,17 @@ impl ManualSegmenter {
 
     async fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         // Measure real_elapsed from segment_open_time
-        let real_elapsed = self
-            .segment_open_time
-            .map(|st| Instant::now().duration_since(st).as_secs_f64())
-            .unwrap_or(0.0);
+        let mut real_elapsed = if get_use_estimated_duration() {
+            self.segment_open_time
+                .map(|st| Instant::now().duration_since(st).as_secs_f64())
+                .unwrap_or(0.0)
+        } else {
+            let d = get_segment_duration_seconds() as f64;
+            d + 1.0
+        };
+
+        // round up real_elapsed to nearest second
+        real_elapsed = real_elapsed.ceil();
 
         debug!(
             "Closing segment {}, measured wall-clock duration={:.3}s",
@@ -1303,7 +1319,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 {
                     // This is a plain thread, but it's only popping from
                     // the tokio::sync::Mutex in a blocking way.
-                    // For demonstration, it's okay.
                     let mut buf = futures::executor::block_on(buffer_ref.lock());
                     if let Some(front) = buf.queue.pop_front() {
                         debug!(
