@@ -1,6 +1,6 @@
 # Rust-Based Multicast MPEG-TS UDP Stream PCAP Capture for S3/MinIO HLS Hourly Archiving and Playback
 
-This Rust application enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback.
+This Rust application enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application.
 
 ```mermaid
 graph LR
@@ -27,7 +27,19 @@ graph LR
 
 ---
 
-## Quick Start Guide
+## Quick Start Guide (Containerized)
+```bash
+git clone https://github.com/groovybits/mpegts_to_s3.git
+cd mpegts_to_s3
+
+# Edit the config.env file to set the desired settings
+vim config.env
+
+# Start MinIO and the Mpeg_to_S3 capture using config.env values for settings
+podman-compose up --build
+```
+
+## Quick Start Guide (Local Build)
 
 ### Clone and Build the Project
 ```bash
@@ -56,13 +68,13 @@ mkdir hls && cd hls
 
 #### 3. Capture and Segment UDP Stream
 ```bash
-# Capture multicast stream from udp://227.1.1.102:4102 on interface net1
+# Capture multicast stream from udp://224.0.0.200:10001 on interface eth0
 # Segments can be saved to ./ts/ directory with 2-second duration and uploaded to S3/MinIO
 SEGMENT_DURATION_SECONDS=10 \
 ../target/release/mpegts_to_s3 \
-    -n net1 \         # Network interface for packet capture
-    -i 227.1.1.102 \  # Multicast IP to filter
-    -p 4102 \         # UDP port to filter
+    -n eth0 \         # Network interface for packet capture
+    -i 224.0.0.200 \  # Multicast IP to filter
+    -p 10001 \         # UDP port to filter
     --manual_segment \ # Use manual segmentation instead of FFmpeg
     -o ts \           # Output directory for .ts segments
     --diskless_mode   # Diskless mode avoids writing .ts segments to disk
@@ -71,13 +83,13 @@ SEGMENT_DURATION_SECONDS=10 \
 #### 4. Playback
 - **Direct Playback:**
 ```bash
-mpv -i http://192.168.130.93:3001/index.m3u8
+mpv -i http://127.0.0.1:3001/index.m3u8
 ```
 
 - **MinIO Playback:**
   1. Retrieve the signed URL for the desired hour:
      ```bash
-     curl -s http://192.168.130.93:3001/ts/urls.log | tail -1
+     curl -s http://127.0.0.1:3001/ts/urls.log | tail -1
      ```
   2. Setup an SSH tunnel for the HTTP server:
      ```bash
