@@ -1,0 +1,55 @@
+version: "3.8"
+
+services:
+  ######################################
+  # MinIO S3-Compatible Service
+  ######################################
+  s3minio:
+    image: "quay.io/minio/minio:latest"
+    network_mode: "host"
+    hostname: "s3minio"
+    container_name: "s3minio"
+    env_file:
+      - "config.env"
+
+    volumes:
+      - "./data:/data"
+      - "./certs:/root/.minio/certs"
+
+    command: >
+      server /data
+      --console-address ":9001"
+      --anonymous --json --quiet
+      --certs-dir /root/.minio/certs
+
+    # This ensures the Rust app does not start
+    # before MinIO is ready (simple dependency).
+    healthcheck:
+      test: ["CMD", "curl", "-f", "${MINIO_SERVER_URL}/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  ######################################
+  # Rust-Based Capture & HLS Service
+  ######################################
+  mpegts_to_s3:
+    network_mode: "host"
+    hostname: "mpegts-to-s3"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: "mpegts_to_s3"
+    env_file:
+      - "config.env"
+
+    # Mount local 'hls' directory as the working directory
+    # where mpegts_to_s3 will write its files.
+    volumes:
+      - "./hls:/app/hls"
+
+    depends_on:
+      - s3minio
+    restart: unless-stopped
+
