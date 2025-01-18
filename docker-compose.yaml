@@ -4,29 +4,17 @@ services:
   ######################################
   # MinIO S3-Compatible Service
   ######################################
-  s3minio_container:
+  s3minio:
     image: "quay.io/minio/minio:latest"
-    hostname: "s3minio-container"
-    container_name: "s3minio_container"
+    network_mode: "host"
+    hostname: "s3minio"
+    container_name: "s3minio"
     env_file:
       - "config.env"
-    environment:
-      # Map environment variables to MinIO's required env vars
-      MINIO_ROOT_USER: "${S3_USERNAME}"
-      MINIO_ROOT_PASSWORD: "${S3_PASSWORD}"
-      MINIO_REGION_NAME: "${S3_REGION}"
-      MINIO_DOMAIN: "${MINIO_DOMAIN}"
-      MINIO_SERVER_URL: "${MINIO_SERVER_URL}"
-      MINIO_BROWSER_REDIRECT_URL: "${MINIO_BROWSER_REDIRECT_URL}"
-
-    # Bind to localhost:9000 and localhost:9001
-    ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
 
     volumes:
-      - "${DATA_DIR}:/data"
-      - "${CERTS_DIR}:/root/.minio/certs"
+      - "./data:/data"
+      - "./certs:/root/.minio/certs"
 
     command: >
       server /data
@@ -37,7 +25,7 @@ services:
     # This ensures the Rust app does not start
     # before MinIO is ready (simple dependency).
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9001/minio/health/live"]
+      test: ["CMD", "curl", "-f", "${MINIO_SERVER_URL}/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -61,18 +49,7 @@ services:
     volumes:
       - "./hls:/app/hls"
 
-    working_dir: "/app/hls"
-
-    command: >
-      /app/mpegts_to_s3
-      -n ${NETWORK_INTERFACE}
-      -i ${UDP_IP}
-      -p ${UDP_PORT}
-      -e ${S3_ENDPOINT}
-      -o ts
-      --diskless_mode
-
     depends_on:
-      - s3minio_container
+      - s3minio
     restart: unless-stopped
 

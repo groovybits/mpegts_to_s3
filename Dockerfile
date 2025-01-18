@@ -17,8 +17,11 @@ FROM debian:stable-slim
 RUN apt-get update && apt-get install -y ffmpeg libpcap0.8 && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /app/hls
 
-WORKDIR /app
+WORKDIR /app/hls
 COPY --from=builder /app/target/release/mpegts_to_s3 /app/mpegts_to_s3
+COPY scripts/entrypoint.sh /app/entrypoint.sh
 
-ENTRYPOINT ["/app/mpegts_to_s3"]
+RUN /app/mpegts_to_s3 --version
+
+ENTRYPOINT ["/app/entrypoint.sh"]
 

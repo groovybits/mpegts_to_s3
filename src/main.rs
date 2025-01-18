@@ -42,7 +42,7 @@ use env_logger;
 
 fn get_segment_duration_seconds() -> u64 {
     std::env::var("SEGMENT_DURATION_SECONDS")
-        .unwrap_or_else(|_| "10".to_string())
+        .unwrap_or_else(|_| "2".to_string())
         .parse()
         .unwrap_or(2)
 }
@@ -56,17 +56,17 @@ fn get_file_max_age_seconds() -> u64 {
 
 fn get_url_signing_seconds() -> u64 {
     std::env::var("URL_SIGNING_SECONDS")
-        .unwrap_or_else(|_| "31104004".to_string())
+        .unwrap_or_else(|_| "604800".to_string())
         .parse()
-        .unwrap_or(31104004)
+        .unwrap_or(604800)
 }
 
 fn get_s3_username() -> String {
-    std::env::var("S3_USERNAME").unwrap_or_else(|_| "minioadmin".to_string())
+    std::env::var("MINIO_ROOT_USER").unwrap_or_else(|_| "minioadmin".to_string())
 }
 
 fn get_s3_password() -> String {
-    std::env::var("S3_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
+    std::env::var("MINIO_ROOT_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
 }
 
 fn get_pcap_packet_count() -> usize {
@@ -111,6 +111,10 @@ fn get_use_estimated_duration() -> bool {
         .unwrap_or_else(|_| "true".to_string())
         .parse()
         .unwrap_or(true)
+}
+
+fn get_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 /// Utility: Attempt to get the actual duration from file creation/modification times.
@@ -611,7 +615,7 @@ impl ManualSegmenter {
             if self.diskless_max_bytes > 0
                 && self.current_segment_buffer.len() >= self.diskless_max_bytes
             {
-                debug!(
+                info!(
                     "[DISKLESS] buffer >= {} bytes, forcing segment close...",
                     self.diskless_max_bytes
                 );
@@ -644,7 +648,7 @@ impl ManualSegmenter {
         let fallback_time_expired = elapsed_wall >= desired_secs * 1.5;
 
         if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
-            debug!(
+            info!(
                   "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
                   elapsed_wall,
                   desired_secs,
@@ -714,7 +718,7 @@ impl ManualSegmenter {
             // diskless mode => finalize the chunk in memory
             let seg_data_clone = self.current_segment_buffer.clone();
             self.current_segment_buffer.clear();
-            debug!(
+            info!(
                 "[DISKLESS] Finalizing seg#{} in memory, length={}, wall-clock dur={:.3}",
                 self.segment_index + 1,
                 seg_data_clone.len(),
@@ -734,7 +738,7 @@ impl ManualSegmenter {
             if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
                 let segment_path = self.current_segment_path(self.segment_index + 1);
                 let object_key = format!("{}", segment_path.to_string_lossy());
-                debug!(
+                info!(
                     "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
                     object_key,
                     seg_data_clone.len()
@@ -972,13 +976,13 @@ impl Drop for ManualSegmenter {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Info)
         .format_timestamp_secs()
         .init();
     debug!("Logging initialized. Starting main()...");
 
     let matches = ClapCommand::new("mpegts_to_s3")
-        .version("1.0")
+        .version(get_version())
         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
         .arg(
             Arg::new("endpoint")
