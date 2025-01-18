@@ -33,8 +33,8 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::time::sleep;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 use env_logger;
 
@@ -67,6 +67,50 @@ fn get_s3_username() -> String {
 
 fn get_s3_password() -> String {
     std::env::var("S3_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
+}
+
+fn get_pcap_packet_count() -> usize {
+    std::env::var("PCAP_PACKET_COUNT")
+        .unwrap_or_else(|_| "7".to_string())
+        .parse()
+        .unwrap_or(7)
+}
+
+fn get_pcap_packet_size() -> usize {
+    std::env::var("PCAP_PACKET_SIZE")
+        .unwrap_or_else(|_| "188".to_string())
+        .parse()
+        .unwrap_or(188)
+}
+
+fn get_pcap_packet_header_size() -> usize {
+    std::env::var("PCAP_PACKET_HEADER_SIZE")
+        .unwrap_or_else(|_| "42".to_string())
+        .parse()
+        .unwrap_or(42)
+}
+
+fn get_snaplen() -> i32 {
+    let pcap_packet_count = get_pcap_packet_count();
+    let pcap_packet_size = get_pcap_packet_size();
+    let pcap_packet_header_size = get_pcap_packet_header_size();
+    ((pcap_packet_count * pcap_packet_size) + pcap_packet_header_size)
+        .try_into()
+        .unwrap()
+}
+
+fn get_buffer_size() -> i32 {
+    std::env::var("BUFFER_SIZE")
+        .unwrap_or_else(|_| "4194304".to_string())
+        .parse()
+        .unwrap_or(1024 * 1024 * 4)
+}
+
+fn get_use_estimated_duration() -> bool {
+    std::env::var("USE_ESTIMATED_DURATION")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .unwrap_or(true)
 }
 
 /// Utility: Attempt to get the actual duration from file creation/modification times.
@@ -618,10 +662,17 @@ impl ManualSegmenter {
 
     async fn close_current_segment_file(&mut self) -> std::io::Result<()> {
         // Measure real_elapsed from segment_open_time
-        let real_elapsed = self
-            .segment_open_time
-            .map(|st| Instant::now().duration_since(st).as_secs_f64())
-            .unwrap_or(0.0);
+        let mut real_elapsed = if get_use_estimated_duration() {
+            self.segment_open_time
+                .map(|st| Instant::now().duration_since(st).as_secs_f64())
+                .unwrap_or(0.0)
+        } else {
+            let d = get_segment_duration_seconds() as f64;
+            d + 1.0
+        };
+
+        // round up real_elapsed to nearest second
+        real_elapsed = real_elapsed.ceil();
 
         debug!(
             "Closing segment {}, measured wall-clock duration={:.3}s",
@@ -1022,6 +1073,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .help("Number of diskless segments to keep in memory ring buffer.")
                 .default_value("1"),
         )
+        .arg(
+            Arg::new("encode")
+                .long("encode")
+                .help("Encode the video stream to H.264/AAC using FFmpeg.")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     debug!("Command-line arguments parsed: {:?}", matches);
@@ -1035,27 +1092,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let timeout: i32 = matches.get_one::<String>("timeout").unwrap().parse()?;
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
-    let manual_segment = matches.get_flag("manual_segment");
+    let mut manual_segment = matches.get_flag("manual_segment");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
+    let encode = matches.get_flag("encode");
+    let diskless_mode = matches.get_flag("diskless_mode");
+
+    if diskless_mode {
+        manual_segment = true;
+    }
+
+    if manual_segment && encode {
+        eprintln!("Cannot use --manual_segment and --encode together.");
+        std::process::exit(1);
+    }
 
     let hls_keep_segments: usize = matches
         .get_one::<String>("hls_keep_segments")
         .unwrap()
         .parse()
-        .unwrap_or(0);
+        .unwrap_or(10);
 
-    let diskless_mode = matches.get_flag("diskless_mode");
     let diskless_ring_size: usize = matches
         .get_one::<String>("diskless_ring_size")
         .unwrap()
         .parse()
-        .unwrap_or(20);
+        .unwrap_or(1);
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
                  interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
                  hls_keep_segments={}, generate_unsigned_urls={}, \
-                 diskless_mode={}, diskless_ring_size={}",
+                 diskless_mode={}, diskless_ring_size={} encode={}",
         endpoint,
         region_name,
         bucket,
@@ -1069,7 +1136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hls_keep_segments,
         generate_unsigned_urls,
         diskless_mode,
-        diskless_ring_size
+        diskless_ring_size,
+        encode
     );
 
     fs::create_dir_all(output_dir)?;
@@ -1116,30 +1184,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         info!("Starting FFmpeg with output: {}", m3u8_output);
         let mut child = Command::new("ffmpeg")
+            .arg("-analyzeduration")
+            .arg("1000000")
+            .arg("-probesize")
+            .arg("1000000")
+            .arg("-f")
+            .arg("mpegts")
             .arg("-i")
             .arg("pipe:0")
-            .arg("-c")
-            .arg("copy")
+            .arg("-c:v")
+            .arg(if encode { "h264" } else { "copy" })
+            .arg("-c:a")
+            .arg(if encode { "aac" } else { "copy" })
             .arg("-loglevel")
-            .arg("error")
+            .arg("info")
             .arg("-y")
             .arg("-hide_banner")
-            .arg("-nostats")
+            //.arg("-nostats")
             .arg("-max_delay")
-            .arg("500000")
+            .arg("0")
             .arg("-f")
             .arg("hls")
-            .arg("-map")
-            .arg("0")
+            .arg(if encode { "" } else { "-map" })
+            .arg(if encode { "" } else { "0" })
             // smaller segments
             .arg("-hls_time")
-            .arg("2")
+            .arg(get_segment_duration_seconds().to_string())
             .arg("-hls_segment_type")
             .arg("mpegts")
             .arg("-hls_playlist_type")
             .arg("event")
             .arg("-hls_list_size")
-            .arg("0")
+            .arg(hls_keep_segments.to_string())
             .arg("-strftime")
             .arg("1")
             .arg("-strftime_mkdir")
@@ -1148,8 +1224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .arg(&hls_segment_filename)
             .arg(&m3u8_output)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            //.stdout(Stdio::null())
+            //.stderr(Stdio::piped())
             .spawn()?;
 
         let child_stdin = child.stdin.take().ok_or("Failed to take FFmpeg stdin")?;
@@ -1201,16 +1277,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Opening PCAP on interface={} with snaplen=65535, buffer=8MB, timeout={}",
         interface, timeout
     );
-    let pcap_packet_count = 7;
-    let pcap_packet_size = 188;
-    let pcap_packet_header_size = 42;
-    let snaplen = (pcap_packet_count * pcap_packet_size) + pcap_packet_header_size;
-    let buffer_size = 1024 * 1024 * 4;
 
     let mut cap = Capture::from_device(interface.as_str())?
         .promisc(true)
-        .buffer_size(buffer_size)
-        .snaplen(snaplen)
+        .buffer_size(get_buffer_size())
+        .snaplen(get_snaplen())
         .timeout(timeout)
         .open()?;
 
@@ -1248,7 +1319,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 {
                     // This is a plain thread, but it's only popping from
                     // the tokio::sync::Mutex in a blocking way.
-                    // For demonstration, it's okay.
                     let mut buf = futures::executor::block_on(buffer_ref.lock());
                     if let Some(front) = buf.queue.pop_front() {
                         debug!(

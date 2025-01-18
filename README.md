@@ -122,6 +122,18 @@ mpegts_to_s3 [OPTIONS]
   - `--hls_keep_segments`: Number of segments to keep in the `.m3u8` index (0 = unlimited, default: `10`)
   - `--diskless_mode`: Diskless mode avoids writing `.ts` segments to disk (default: `false`) requires --manual_segment arg.
 
+### Environment Variables:
+  - `SEGMENT_DURATION_SECONDS`: Duration of each segment in seconds (default: `2`)
+  - `FILE_MAX_AGE_SECONDS`: Maximum age of files in seconds to upload (default: `30`)
+  - `URL_SIGNING_SECONDS`: Duration of signed URLs in seconds (default: `31104004`)
+  - `S3_USERNAME`: S3 username / access key ID (default: `minioadmin`)
+  - `S3_PASSWORD`: S3 password / secret access key (default: `ThisIsSecret12345.`)
+  - `PCAP_PACKET_COUNT`: Number of packets to capture at a time (default: `7`)
+  - `PCAP_PACKET_SIZE`: Size of mpegts packets to capture (default: `188`)
+  - `PCAP_PACKET_HEADER_SIZE`: Size of mpegts packet ip/eth header (default: `42`)
+  - `PACAP_BUFFER_SIZE`: Size of the pcap buffer (default: `4194304`)
+  - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `true`)
+
 ---
 
 ## How It Works
@@ -162,6 +174,6 @@ For questions or issues, refer to the repository's issue tracker.
 
 ---
 
-**Author:** Chris Kennedy  
+**Author:** wizard@groovy.org
 **Date:** January 15, 2025
 
