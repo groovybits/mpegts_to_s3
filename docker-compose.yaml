@@ -25,7 +25,7 @@ services:
     # This ensures the Rust app does not start
     # before MinIO is ready (simple dependency).
     healthcheck:
-      test: ["CMD", "curl", "-f", "${MINIO_SERVER_URL}/minio/health/live"]
+      test: ["CMD", "curl", "-f", "127.0.0.1:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 5
