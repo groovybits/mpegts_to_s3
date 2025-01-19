@@ -15,7 +15,6 @@ extern crate ffmpeg_next as ffmpeg;
 use std::sync::mpsc::Receiver;
 use std::thread;
 
-// -------------- Old Imports Unmodified --------------
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
@@ -635,7 +634,7 @@ impl ManualSegmenter {
         // Just counting bytes for fallback bitrate
         self.bytes_this_segment += data.len() as u64;
 
-        // We'll do a simple "close if wall clock or byte-based logic says so"
+        // Do a simple "close if wall clock or byte-based logic says so"
         let desired_secs = get_segment_duration_seconds() as f64;
         let now = Instant::now();
         let elapsed_wall = self
@@ -998,7 +997,7 @@ fn create_fifo_pipe(pipe_path: &str) -> std::io::Result<()> {
 use ffmpeg::{codec, format, media};
 
 /// Our "native HLS segmenter" uses the named FIFO.
-/// We assume TS data is being written to that FIFO by a separate thread.
+/// TS data is being written to that FIFO by a separate thread.
 fn native_hls_segmenter(
     fifo_path: &str,
     m3u8_output: &str,
@@ -1087,7 +1086,25 @@ fn native_hls_segmenter(
             }
         } else if medium == media::Type::Audio && encode {
             unsafe {
-                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::AAC.into();
+                let params = ost.parameters().as_mut_ptr();
+                if encode {
+                    (*params).codec_id = codec::Id::AAC.into();
+                }
+                // Set AAC format to ADTS
+                (*params).format = ffmpeg_sys::AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32;
+                // Set ADTS extradata if needed
+                if (*params).extradata.is_null() {
+                    let extradata_size = 2;
+                    (*params).extradata = ffmpeg_sys::av_mallocz(
+                        extradata_size + ffmpeg_sys::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+                    ) as *mut u8;
+                    (*params).extradata_size = extradata_size as i32;
+                    let extradata =
+                        std::slice::from_raw_parts_mut((*params).extradata, extradata_size);
+                    // Set AAC LC profile
+                    extradata[0] = 0x12; // AAC LC profile
+                    extradata[1] = 0x10; // 44.1kHz, stereo
+                }
             }
         }
         unsafe {
@@ -1249,14 +1266,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let timeout: i32 = matches.get_one::<String>("timeout").unwrap().parse()?;
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
-    let mut manual_segment = matches.get_flag("manual_segment");
+    let manual_segment = matches.get_flag("manual_segment");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
     let encode = matches.get_flag("encode");
     let diskless_mode = matches.get_flag("diskless_mode");
 
-    if diskless_mode {
+    /*if diskless_mode {
         manual_segment = true;
-    }
+    }*/
 
     if manual_segment && encode {
         eprintln!("Cannot use --manual_segment and --encode together.");
