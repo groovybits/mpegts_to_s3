@@ -7,7 +7,11 @@ COPY Cargo.toml Cargo.toml
 
 # Install build-time dependencies for pcap & ffmpeg
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpcap-dev
+    libpcap-dev ffmpeg libavcodec-dev \
+    libavfilter-dev libavformat-dev \
+    libavutil-dev libpostproc-dev \
+    libswresample-dev libswscale-dev \
+    libavdevice-dev libclang-dev
 
 RUN cargo build --release
 

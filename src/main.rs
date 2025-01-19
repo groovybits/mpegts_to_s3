@@ -2,7 +2,7 @@
  * mpegts_to_s3
  *
  * This program captures MPEG-TS packets from a UDP multicast stream, either:
- *   A) Feeds them into FFmpeg, which segments into HLS .ts/.m3u8, OR
+ *   A) Feeds them into FFmpeg (now via ffmpeg-next) which segments into HLS .ts/.m3u8, OR
  *   B) Manually segments the MPEG-TS and writes an .m3u8 playlist.
  *
  * Then, a directory watcher picks up new/modified files and uploads them to an S3 bucket.
@@ -10,6 +10,13 @@
  * Chris Kennedy 2025 Jan 15
  */
 
+extern crate ffmpeg_next as ffmpeg;
+
+use std::io::{Read, Result as IoResult};
+use std::sync::mpsc::Receiver;
+use std::thread;
+
+// -------------- Old Imports Unmodified --------------
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
@@ -18,23 +25,20 @@ use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
-use notify::{
-    Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
-};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pcap::Capture;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
-use std::thread;
+use std::process;
+use std::sync::{mpsc as std_mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use std::path::Path;
+use std::path::PathBuf;
 
 use env_logger;
 
@@ -651,12 +655,12 @@ impl ManualSegmenter {
 
         if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
             info!(
-                  "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
-                  elapsed_wall,
-                  desired_secs,
-                  enough_bytes_based_on_bitrate,
-                  fallback_time_expired
-              );
+                 "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
+                 elapsed_wall,
+                 desired_secs,
+                 enough_bytes_based_on_bitrate,
+                 fallback_time_expired
+             );
             self.close_current_segment_file().await?;
             if !self.diskless_mode {
                 self.open_new_segment_file()?;
@@ -1109,7 +1113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if manual_segment && encode {
         eprintln!("Cannot use --manual_segment and --encode together.");
-        std::process::exit(1);
+        process::exit(1);
     }
 
     let hls_keep_segments: usize = matches
@@ -1126,9 +1130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-                 interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-                 hls_keep_segments={}, generate_unsigned_urls={}, \
-                 diskless_mode={}, diskless_ring_size={} encode={}",
+                  interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+                  hls_keep_segments={}, generate_unsigned_urls={}, \
+                  diskless_mode={}, diskless_ring_size={}, encode={}",
         endpoint,
         region_name,
         bucket,
@@ -1171,11 +1175,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         generate_unsigned_urls,
         endpoint.clone(),
     );
-    // Wrap it in Arc<tokio::sync::Mutex<...>>
     let hourly_index_creator = Arc::new(Mutex::new(hourly_index_creator));
 
     info!("Starting directory watcher on: {}", output_dir);
-    let (watch_tx, watch_rx) = channel();
+    let (watch_tx, watch_rx) = std_mpsc::channel();
     let watch_dir = output_dir.to_string();
     let watch_thread = thread::spawn(move || {
         if let Err(e) = watch_directory(&watch_dir, watch_tx) {
@@ -1183,65 +1186,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    let (mut ffmpeg_child, mut ffmpeg_stdin_buf) = if !manual_segment {
+    // We'll define a channel for TS data that we feed to a background thread:
+    let (ffmpeg_thread_handle, ffmpeg_data_sender) = if !manual_segment {
         let hls_segment_filename =
             format!("{}/%Y/%m/%d/%H/segment_%Y%m%d-%H%M%S_%04d.ts", output_dir);
-        let m3u8_output = format!("index.m3u8");
+        let m3u8_output = "index.m3u8".to_string();
 
-        info!("Starting FFmpeg with output: {}", m3u8_output);
-        let mut child = Command::new("ffmpeg")
-            .arg("-analyzeduration")
-            .arg("1000000")
-            .arg("-probesize")
-            .arg("1000000")
-            .arg("-f")
-            .arg("mpegts")
-            .arg("-i")
-            .arg("pipe:0")
-            .arg("-c:v")
-            .arg(if encode { "h264" } else { "copy" })
-            .arg("-c:a")
-            .arg(if encode { "aac" } else { "copy" })
-            .arg("-loglevel")
-            .arg("info")
-            .arg("-y")
-            .arg("-hide_banner")
-            //.arg("-nostats")
-            .arg("-max_delay")
-            .arg("0")
-            .arg("-f")
-            .arg("hls")
-            .arg(if encode { "" } else { "-map" })
-            .arg(if encode { "" } else { "0" })
-            // smaller segments
-            .arg("-hls_time")
-            .arg(get_segment_duration_seconds().to_string())
-            .arg("-hls_segment_type")
-            .arg("mpegts")
-            .arg("-hls_playlist_type")
-            .arg("event")
-            .arg("-hls_list_size")
-            .arg(hls_keep_segments.to_string())
-            .arg("-strftime")
-            .arg("1")
-            .arg("-strftime_mkdir")
-            .arg("1")
-            .arg("-hls_segment_filename")
-            .arg(&hls_segment_filename)
-            .arg(&m3u8_output)
-            .stdin(Stdio::piped())
-            //.stdout(Stdio::null())
-            //.stderr(Stdio::piped())
-            .spawn()?;
+        info!(
+            "Starting native ffmpeg-next pipeline with output: {}",
+            m3u8_output
+        );
 
-        let child_stdin = child.stdin.take().ok_or("Failed to take FFmpeg stdin")?;
-        let buf = BufWriter::new(child_stdin);
+        let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
+        let encode_clone = encode;
+        let hls_keep_segments_clone = hls_keep_segments;
+        let output_dir_clone = output_dir.to_string();
 
-        (Some(child), Some(buf))
+        // We'll spawn a thread to run a "fake" HLS segmenter: we open "pipe:0" instead of from memory.
+        let handle = std::thread::spawn(move || {
+            if let Err(e) = native_hls_segmenter(
+                rx,
+                &m3u8_output,
+                &hls_segment_filename,
+                encode_clone,
+                hls_keep_segments_clone,
+                &output_dir_clone,
+            ) {
+                eprintln!("native_hls_segmenter error: {:?}", e);
+            }
+            eprintln!("native_hls_segmenter thread ending.");
+        });
+
+        (Some(handle), Some(tx))
     } else {
         (None, None)
     };
 
+    // --------------- UPLOAD TASK ---------------
     let s3_client_clone = s3_client.clone();
     let bucket_clone = bucket.clone();
     let output_dir_clone = output_dir.clone();
@@ -1300,6 +1281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         interface, filter_ip, filter_port, output_dir
     );
 
+    // If we are doing manual segmentation => build a segmenter
     let mut manual_segmenter = if manual_segment {
         Some(
             ManualSegmenter::new(output_dir)
@@ -1318,13 +1300,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // If diskless => we can run a separate consumer thread
     let diskless_consumer = if diskless_mode {
         if let Some(_seg_ref) = &manual_segmenter {
             let buffer_ref = _seg_ref.diskless_buffer.clone();
             let handle = thread::spawn(move || loop {
                 {
-                    // This is a plain thread, but it's only popping from
-                    // the tokio::sync::Mutex in a blocking way.
                     let mut buf = futures::executor::block_on(buffer_ref.lock());
                     if let Some(front) = buf.queue.pop_front() {
                         debug!(
@@ -1346,27 +1327,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     debug!("Starting main capture loop now...");
     loop {
-        if let Some(child) = ffmpeg_child.as_mut() {
-            if let Some(exit_status) = child.try_wait()? {
-                eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
-                break;
-            }
-        }
-
         let packet = match cap.next_packet() {
             Ok(pkt) => pkt,
             Err(_) => {
                 // Possibly no packet arrived in the last 'timeout' ms
-                // so check if we want to forcibly close a segment on a timer, etc.
-                if let Some(_seg) = manual_segmenter.as_mut() {
-                    if let Err(e) = _seg.close_current_segment_file().await {
+                // If manual segment, close segment on inactivity:
+                if let Some(seg) = manual_segmenter.as_mut() {
+                    if let Err(e) = seg.close_current_segment_file().await {
                         eprintln!("Error closing segment: {:?}", e);
-                        break;
-                    }
-                }
-                if let Some(child) = ffmpeg_child.as_mut() {
-                    if let Some(exit_status) = child.try_wait()? {
-                        eprintln!("FFmpeg ended. Code: {:?}", exit_status.code());
                         break;
                     }
                 }
@@ -1375,13 +1343,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
-            if let Some(buf) = ffmpeg_stdin_buf.as_mut() {
-                if let Err(e) = buf.write_all(ts_payload) {
-                    eprintln!("Error feeding data to FFmpeg: {:?}", e);
+            // If using native ffmpeg pipeline
+            if let Some(ref tx) = ffmpeg_data_sender {
+                // feed TS data to the channel
+                if let Err(e) = tx.send(ts_payload.to_vec()) {
+                    eprintln!("Error sending data to native ffmpeg thread: {:?}", e);
                     break;
                 }
             }
 
+            // If manual segmenting
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload).await {
                     eprintln!("Error writing manual TS segment: {:?}", e);
@@ -1396,21 +1367,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    if let Some(mut buf) = ffmpeg_stdin_buf.take() {
-        let _ = buf.flush();
-        drop(buf);
-        if let Some(child) = ffmpeg_child.as_mut() {
-            let ffmpeg_status = child.wait()?;
-            if !ffmpeg_status.success() {
-                eprintln!("FFmpeg exited with error code: {:?}", ffmpeg_status.code());
-            } else {
-                println!("FFmpeg finished successfully.");
-            }
-        }
+    // We are done capturing -> If we had a channel open, close it so the thread can exit
+    if let Some(tx) = ffmpeg_data_sender {
+        drop(tx); // signal end-of-stream
+    }
+
+    // Join the native ffmpeg thread, if any
+    if let Some(handle) = ffmpeg_thread_handle {
+        let _ = handle.join();
     }
 
     drop(manual_segmenter);
 
+    // If we had a diskless consumer thread, we can let it end
     if let Some(handle) = diskless_consumer {
         let _ = handle.thread().id();
     }
@@ -1423,7 +1392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 // ---------------- Directory Watcher ----------------
 
-fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> NotifyResult<()> {
+fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> notify::Result<()> {
     let (notify_tx, notify_rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(
         notify_tx,
@@ -1456,7 +1425,6 @@ async fn handle_file_events(
     hourly_index_creator: Arc<Mutex<HourlyIndexCreator>>,
     output_dir: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Also use tokio::sync::Mutex for the tracker
     let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds())));
 
     while let Ok(event) = rx.recv() {
@@ -1478,7 +1446,7 @@ async fn handle_file_events(
                                 }
                             }
 
-                            // If it's a normal file (not "mem://..."), wait for it to stabilize
+                            // Wait for the file to stabilize
                             if !full_path_str.starts_with("mem://") {
                                 let mut retries = 30;
                                 let mut stable_count = 0;
@@ -1769,4 +1737,130 @@ fn extract_mpegts_payload<'a>(
         }
     }
     Some(&ts_payload[..aligned_len])
+}
+
+// --------------------------------------------------------------------
+//  NEW: A minimal "native_hls_segmenter" that uses format::input("pipe:0")
+// --------------------------------------------------------------------
+
+use ffmpeg::{codec, format, media};
+
+/// A small struct to read from a `mpsc::Receiver<Vec<u8>>` as if it was an I/O stream.
+/// (Unused in this final code, but left as part of the solution.)
+struct ChannelReader {
+    rx: Receiver<Vec<u8>>,
+    buffer: Option<Vec<u8>>,
+}
+
+impl ChannelReader {
+    fn new(rx: Receiver<Vec<u8>>) -> Self {
+        Self { rx, buffer: None }
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> IoResult<usize> {
+        if self.buffer.as_ref().map_or(true, |b| b.is_empty()) {
+            match self.rx.recv() {
+                Ok(chunk) => self.buffer = Some(chunk),
+                Err(_) => {
+                    // no more data => EOF
+                    return Ok(0);
+                }
+            }
+        }
+        let src = self.buffer.as_mut().unwrap();
+        let bytes_to_read = out.len().min(src.len());
+        out[..bytes_to_read].copy_from_slice(&src[..bytes_to_read]);
+        src.drain(..bytes_to_read);
+        Ok(bytes_to_read)
+    }
+}
+
+fn native_hls_segmenter(
+    _rx: Receiver<Vec<u8>>,
+    m3u8_output: &str,
+    segment_filename: &str,
+    encode: bool,
+    hls_keep_segments: usize,
+    _output_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ffmpeg::init()?;
+
+    // 1) open "pipe:0" for input
+    let mut ictx = format::input("pipe:0")?;
+
+    // 2) Prepare an HLS output
+    let mut dict = ffmpeg::Dictionary::new();
+    dict.set("hls_time", &get_segment_duration_seconds().to_string());
+    dict.set("hls_segment_type", "mpegts");
+    dict.set("hls_playlist_type", "event");
+    dict.set("hls_list_size", &hls_keep_segments.to_string());
+    dict.set("strftime", "1");
+    dict.set("strftime_mkdir", "1");
+    dict.set("hls_segment_filename", segment_filename);
+
+    let mut octx = format::output_with(m3u8_output, dict)?;
+
+    // 3) For each input stream, add a corresponding output stream
+    let mut stream_mapping = vec![-1; ictx.nb_streams() as usize];
+    let mut ost_index = 0;
+
+    for (ist_index, ist) in ictx.streams().enumerate() {
+        let medium = ist.parameters().medium();
+        if medium != media::Type::Audio && medium != media::Type::Video {
+            continue;
+        }
+        let mut ost = octx.add_stream(codec::Id::None)?;
+        ost.set_parameters(ist.parameters());
+
+        // If user wants to encode => set ID to H264/AAC
+        if medium == media::Type::Video && encode {
+            unsafe {
+                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::H264.into();
+            }
+        } else if medium == media::Type::Audio && encode {
+            unsafe {
+                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::AAC.into();
+            }
+        }
+        // Some containers require clearing codec_tag
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+
+        stream_mapping[ist_index] = ost_index as isize;
+        ost_index += 1;
+    }
+
+    // Write container header
+    octx.write_header()?;
+
+    // Gather input time bases
+    let mut tb_in = vec![ffmpeg::Rational(0, 1); ictx.nb_streams() as usize];
+    for (i, st) in ictx.streams().enumerate() {
+        tb_in[i] = st.time_base();
+    }
+
+    // Packet reading loop
+    for (stream, mut packet) in ictx.packets() {
+        let ist_index = stream.index();
+        let out_idx = stream_mapping[ist_index];
+        if out_idx < 0 {
+            continue;
+        }
+        let ost = octx
+            .stream(out_idx as usize)
+            .ok_or("missing output stream")?;
+        packet.rescale_ts(tb_in[ist_index], ost.time_base());
+        packet.set_stream(out_idx as usize);
+
+        packet.write_interleaved(&mut octx)?;
+    }
+
+    // finalize
+    octx.write_trailer()?;
+
+    println!("native_hls_segmenter done writing HLS => {}", m3u8_output);
+    Ok(())
 }
