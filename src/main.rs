@@ -12,7 +12,6 @@
 
 extern crate ffmpeg_next as ffmpeg;
 
-use std::io::{Read, Result as IoResult};
 use std::sync::mpsc::Receiver;
 use std::thread;
 
@@ -1305,7 +1304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
 
         // 1) Start a "FIFO writer" thread: read from rx, write to the FIFO
-        let fifo_writer_thread = std::thread::spawn({
+        let _fifo_writer_thread = std::thread::spawn({
             let pipe_clone = fifo_path.to_string();
             move || {
                 let mut fifo_file = std::fs::OpenOptions::new()
