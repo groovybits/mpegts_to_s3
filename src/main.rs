@@ -1207,9 +1207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let encode = matches.get_flag("encode");
     let diskless_mode = matches.get_flag("diskless_mode");
 
-    /*if diskless_mode {
+    if diskless_mode {
         manual_segment = true;
-    }*/
+    }
 
     if manual_segment && encode {
         eprintln!("Cannot use --manual_segment and --encode together.");
@@ -1861,37 +1861,4 @@ fn extract_mpegts_payload<'a>(
         }
     }
     Some(&ts_payload[..aligned_len])
-}
-
-// ---------------- CHANNEL READER (unused now, but left in place) ----------------
-
-/// A small struct to read from a `mpsc::Receiver<Vec<u8>>` as if it was an I/O stream.
-struct ChannelReader {
-    rx: Receiver<Vec<u8>>,
-    buffer: Option<Vec<u8>>,
-}
-
-impl ChannelReader {
-    fn new(rx: Receiver<Vec<u8>>) -> Self {
-        Self { rx, buffer: None }
-    }
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, out: &mut [u8]) -> IoResult<usize> {
-        if self.buffer.as_ref().map_or(true, |b| b.is_empty()) {
-            match self.rx.recv() {
-                Ok(chunk) => self.buffer = Some(chunk),
-                Err(_) => {
-                    // no more data => EOF
-                    return Ok(0);
-                }
-            }
-        }
-        let src = self.buffer.as_mut().unwrap();
-        let bytes_to_read = out.len().min(src.len());
-        out[..bytes_to_read].copy_from_slice(&src[..bytes_to_read]);
-        src.drain(..bytes_to_read);
-        Ok(bytes_to_read)
-    }
 }
