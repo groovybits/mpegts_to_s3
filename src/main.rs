@@ -22,6 +22,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
+use ffmpeg_sys_next as ffmpeg_sys;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -1009,16 +1010,63 @@ fn native_hls_segmenter(
 
     let mut ictx = format::input(fifo_path)?;
 
-    let mut dict = ffmpeg::Dictionary::new();
-    dict.set("hls_time", &get_segment_duration_seconds().to_string());
-    dict.set("hls_segment_type", "mpegts");
-    dict.set("hls_playlist_type", "event");
-    dict.set("hls_list_size", &hls_keep_segments.to_string());
-    dict.set("strftime", "1");
-    dict.set("strftime_mkdir", "1");
-    dict.set("hls_segment_filename", segment_filename);
-
+    let dict = ffmpeg::Dictionary::new();
     let mut octx = format::output_with(m3u8_output, dict)?;
+
+    unsafe {
+        let fmt_ctx = octx.as_mut_ptr();
+        if !(*fmt_ctx).priv_data.is_null() {
+            // Set all HLS muxer options
+            ffmpeg_sys::av_opt_set(
+                (*fmt_ctx).priv_data,
+                "hls_time\0".as_ptr() as *const i8,
+                get_segment_duration_seconds().to_string().as_ptr() as *const i8,
+                0,
+            );
+
+            ffmpeg_sys::av_opt_set(
+                (*fmt_ctx).priv_data,
+                "hls_segment_type\0".as_ptr() as *const i8,
+                "mpegts\0".as_ptr() as *const i8,
+                0,
+            );
+
+            ffmpeg_sys::av_opt_set(
+                (*fmt_ctx).priv_data,
+                "hls_playlist_type\0".as_ptr() as *const i8,
+                "event\0".as_ptr() as *const i8,
+                0,
+            );
+
+            ffmpeg_sys::av_opt_set(
+                (*fmt_ctx).priv_data,
+                "hls_list_size\0".as_ptr() as *const i8,
+                hls_keep_segments.to_string().as_ptr() as *const i8,
+                0,
+            );
+
+            ffmpeg_sys::av_opt_set(
+                (*fmt_ctx).priv_data,
+                "strftime\0".as_ptr() as *const i8,
+                "1\0".as_ptr() as *const i8,
+                0,
+            );
+
+            ffmpeg_sys::av_opt_set(
+                (*fmt_ctx).priv_data,
+                "strftime_mkdir\0".as_ptr() as *const i8,
+                "1\0".as_ptr() as *const i8,
+                0,
+            );
+
+            ffmpeg_sys::av_opt_set(
+                (*fmt_ctx).priv_data,
+                "hls_segment_filename\0".as_ptr() as *const i8,
+                segment_filename.as_ptr() as *const i8,
+                0,
+            );
+        }
+    }
 
     // For each input stream, add output stream
     let mut stream_mapping = vec![-1; ictx.nb_streams() as usize];
@@ -1107,7 +1155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("bucket")
                 .short('b')
                 .long("bucket")
-                .default_value("ltnhls")
+                .default_value("hls")
                 .help("S3 bucket name"),
         )
         .arg(
@@ -1297,15 +1345,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
 
         // Create a named FIFO to feed TS data
-        let fifo_path = "/tmp/hls_input.ts";
-        create_fifo_pipe(fifo_path).expect("Failed to create named pipe at /tmp/hls_input.ts");
+        let fifo_path = format!("/tmp/hls_input_{}.ts", std::process::id());
+        create_fifo_pipe(&fifo_path).expect("Failed to create named pipe at /tmp/hls_input.ts");
 
         // Next, we create the channel
         let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
 
         // 1) Start a "FIFO writer" thread: read from rx, write to the FIFO
         let _fifo_writer_thread = std::thread::spawn({
-            let pipe_clone = fifo_path.to_string();
+            let pipe_clone = fifo_path.clone();
             move || {
                 let mut fifo_file = std::fs::OpenOptions::new()
                     .write(true)
@@ -1321,12 +1369,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
 
+        let fifo_path_clone = fifo_path.clone();
+
         // 2) Start a second thread for the actual HLS muxer reading from that FIFO
         let hls_thread = std::thread::spawn({
             let hls_segfile = hls_segment_filename.clone();
             move || {
                 if let Err(e) = native_hls_segmenter(
-                    fifo_path,
+                    &fifo_path_clone,
                     &m3u8_output,
                     &hls_segfile,
                     encode,
