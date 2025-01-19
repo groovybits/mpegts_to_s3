@@ -7,4 +7,5 @@
     -e ${MINIO_SERVER_URL} \
     -b ${MINIO_BUCKET_NAME} \
     -o ts \
-    --encode 
+    --encode \
+    --diskless_mode $@

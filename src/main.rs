@@ -32,13 +32,12 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::process;
+use std::path::{Path, PathBuf};
+use std::process::{self, Command};
 use std::sync::{mpsc as std_mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use std::path::Path;
-use std::path::PathBuf;
 
 use env_logger;
 
@@ -143,6 +142,7 @@ fn get_actual_file_duration(path: &Path) -> f64 {
     get_segment_duration_seconds() as f64
 }
 
+// ------------- HOURLY INDEX CREATOR -------------
 #[derive(Debug, Clone)]
 pub struct HourlyIndexEntry {
     pub sequence_id: u64,
@@ -977,6 +977,106 @@ impl Drop for ManualSegmenter {
     }
 }
 
+// --------------------------------------------------------------------
+//  CREATE A FIFO, THEN let ffmpeg read from it
+// --------------------------------------------------------------------
+
+/// Creates or replaces a FIFO at the given path.
+fn create_fifo_pipe(pipe_path: &str) -> std::io::Result<()> {
+    let _ = fs::remove_file(pipe_path); // remove old file if any
+    let status = Command::new("mkfifo").arg(pipe_path).status()?;
+    if !status.success() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to create FIFO: {}", pipe_path),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+use ffmpeg::{codec, format, media};
+
+/// Our "native HLS segmenter" uses the named FIFO.
+/// We assume TS data is being written to that FIFO by a separate thread.
+fn native_hls_segmenter(
+    fifo_path: &str,
+    m3u8_output: &str,
+    segment_filename: &str,
+    encode: bool,
+    hls_keep_segments: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ffmpeg::init()?;
+
+    let mut ictx = format::input(fifo_path)?;
+
+    let mut dict = ffmpeg::Dictionary::new();
+    dict.set("hls_time", &get_segment_duration_seconds().to_string());
+    dict.set("hls_segment_type", "mpegts");
+    dict.set("hls_playlist_type", "event");
+    dict.set("hls_list_size", &hls_keep_segments.to_string());
+    dict.set("strftime", "1");
+    dict.set("strftime_mkdir", "1");
+    dict.set("hls_segment_filename", segment_filename);
+
+    let mut octx = format::output_with(m3u8_output, dict)?;
+
+    // For each input stream, add output stream
+    let mut stream_mapping = vec![-1; ictx.nb_streams() as usize];
+    let mut ost_index = 0;
+
+    for (ist_index, ist) in ictx.streams().enumerate() {
+        let medium = ist.parameters().medium();
+        if medium != media::Type::Audio && medium != media::Type::Video {
+            continue;
+        }
+        let mut ost = octx.add_stream(codec::Id::None)?;
+        ost.set_parameters(ist.parameters());
+
+        // If encode => set ID = H264 or AAC
+        if medium == media::Type::Video && encode {
+            unsafe {
+                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::H264.into();
+            }
+        } else if medium == media::Type::Audio && encode {
+            unsafe {
+                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::AAC.into();
+            }
+        }
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+
+        stream_mapping[ist_index] = ost_index as isize;
+        ost_index += 1;
+    }
+
+    octx.write_header()?;
+
+    let mut tb_in = vec![ffmpeg::Rational(0, 1); ictx.nb_streams() as usize];
+    for (i, st) in ictx.streams().enumerate() {
+        tb_in[i] = st.time_base();
+    }
+
+    for (stream, mut packet) in ictx.packets() {
+        let ist_index = stream.index();
+        let out_idx = stream_mapping[ist_index];
+        if out_idx < 0 {
+            continue;
+        }
+        let ost = octx
+            .stream(out_idx as usize)
+            .ok_or("missing output stream")?;
+        packet.rescale_ts(tb_in[ist_index], ost.time_base());
+        packet.set_stream(out_idx as usize);
+
+        packet.write_interleaved(&mut octx)?;
+    }
+
+    octx.write_trailer()?;
+    Ok(())
+}
+
 // ------------- MAIN -------------
 
 #[tokio::main]
@@ -1107,9 +1207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let encode = matches.get_flag("encode");
     let diskless_mode = matches.get_flag("diskless_mode");
 
-    if diskless_mode {
+    /*if diskless_mode {
         manual_segment = true;
-    }
+    }*/
 
     if manual_segment && encode {
         eprintln!("Cannot use --manual_segment and --encode together.");
@@ -1130,9 +1230,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-                  interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-                  hls_keep_segments={}, generate_unsigned_urls={}, \
-                  diskless_mode={}, diskless_ring_size={}, encode={}",
+                   interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+                   hls_keep_segments={}, generate_unsigned_urls={}, \
+                   diskless_mode={}, diskless_ring_size={}, encode={}",
         endpoint,
         region_name,
         bucket,
@@ -1197,27 +1297,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             m3u8_output
         );
 
-        let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
-        let encode_clone = encode;
-        let hls_keep_segments_clone = hls_keep_segments;
-        let output_dir_clone = output_dir.to_string();
+        // Create a named FIFO to feed TS data
+        let fifo_path = "/tmp/hls_input.ts";
+        create_fifo_pipe(fifo_path).expect("Failed to create named pipe at /tmp/hls_input.ts");
 
-        // We'll spawn a thread to run a "fake" HLS segmenter: we open "pipe:0" instead of from memory.
-        let handle = std::thread::spawn(move || {
-            if let Err(e) = native_hls_segmenter(
-                rx,
-                &m3u8_output,
-                &hls_segment_filename,
-                encode_clone,
-                hls_keep_segments_clone,
-                &output_dir_clone,
-            ) {
-                eprintln!("native_hls_segmenter error: {:?}", e);
+        // Next, we create the channel
+        let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
+
+        // 1) Start a "FIFO writer" thread: read from rx, write to the FIFO
+        let fifo_writer_thread = std::thread::spawn({
+            let pipe_clone = fifo_path.to_string();
+            move || {
+                let mut fifo_file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&pipe_clone)
+                    .expect("Could not open FIFO for writing");
+                while let Ok(ts_chunk) = rx.recv() {
+                    if let Err(e) = fifo_file.write_all(&ts_chunk) {
+                        eprintln!("Error writing TS data to FIFO: {:?}", e);
+                        break;
+                    }
+                }
+                eprintln!("FIFO writer thread done => no more TS data.");
             }
-            eprintln!("native_hls_segmenter thread ending.");
         });
 
-        (Some(handle), Some(tx))
+        // 2) Start a second thread for the actual HLS muxer reading from that FIFO
+        let hls_thread = std::thread::spawn({
+            let hls_segfile = hls_segment_filename.clone();
+            move || {
+                if let Err(e) = native_hls_segmenter(
+                    fifo_path,
+                    &m3u8_output,
+                    &hls_segfile,
+                    encode,
+                    hls_keep_segments,
+                ) {
+                    eprintln!("native_hls_segmenter error: {:?}", e);
+                }
+                eprintln!("native_hls_segmenter thread ending.");
+            }
+        });
+
+        // We only store the "HLS thread" handle for minimal changes,
+        // the writer thread we just let run on its own.
+        (Some(hls_thread), Some(tx))
     } else {
         (None, None)
     };
@@ -1345,7 +1469,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
             // If using native ffmpeg pipeline
             if let Some(ref tx) = ffmpeg_data_sender {
-                // feed TS data to the channel
+                // feed TS data to the channel => the FIFO writer => the named pipe => FFmpeg
                 if let Err(e) = tx.send(ts_payload.to_vec()) {
                     eprintln!("Error sending data to native ffmpeg thread: {:?}", e);
                     break;
@@ -1739,14 +1863,9 @@ fn extract_mpegts_payload<'a>(
     Some(&ts_payload[..aligned_len])
 }
 
-// --------------------------------------------------------------------
-//  NEW: A minimal "native_hls_segmenter" that uses format::input("pipe:0")
-// --------------------------------------------------------------------
-
-use ffmpeg::{codec, format, media};
+// ---------------- CHANNEL READER (unused now, but left in place) ----------------
 
 /// A small struct to read from a `mpsc::Receiver<Vec<u8>>` as if it was an I/O stream.
-/// (Unused in this final code, but left as part of the solution.)
 struct ChannelReader {
     rx: Receiver<Vec<u8>>,
     buffer: Option<Vec<u8>>,
@@ -1775,92 +1894,4 @@ impl Read for ChannelReader {
         src.drain(..bytes_to_read);
         Ok(bytes_to_read)
     }
-}
-
-fn native_hls_segmenter(
-    _rx: Receiver<Vec<u8>>,
-    m3u8_output: &str,
-    segment_filename: &str,
-    encode: bool,
-    hls_keep_segments: usize,
-    _output_dir: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    ffmpeg::init()?;
-
-    // 1) open "pipe:0" for input
-    let mut ictx = format::input("pipe:0")?;
-
-    // 2) Prepare an HLS output
-    let mut dict = ffmpeg::Dictionary::new();
-    dict.set("hls_time", &get_segment_duration_seconds().to_string());
-    dict.set("hls_segment_type", "mpegts");
-    dict.set("hls_playlist_type", "event");
-    dict.set("hls_list_size", &hls_keep_segments.to_string());
-    dict.set("strftime", "1");
-    dict.set("strftime_mkdir", "1");
-    dict.set("hls_segment_filename", segment_filename);
-
-    let mut octx = format::output_with(m3u8_output, dict)?;
-
-    // 3) For each input stream, add a corresponding output stream
-    let mut stream_mapping = vec![-1; ictx.nb_streams() as usize];
-    let mut ost_index = 0;
-
-    for (ist_index, ist) in ictx.streams().enumerate() {
-        let medium = ist.parameters().medium();
-        if medium != media::Type::Audio && medium != media::Type::Video {
-            continue;
-        }
-        let mut ost = octx.add_stream(codec::Id::None)?;
-        ost.set_parameters(ist.parameters());
-
-        // If user wants to encode => set ID to H264/AAC
-        if medium == media::Type::Video && encode {
-            unsafe {
-                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::H264.into();
-            }
-        } else if medium == media::Type::Audio && encode {
-            unsafe {
-                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::AAC.into();
-            }
-        }
-        // Some containers require clearing codec_tag
-        unsafe {
-            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
-        }
-
-        stream_mapping[ist_index] = ost_index as isize;
-        ost_index += 1;
-    }
-
-    // Write container header
-    octx.write_header()?;
-
-    // Gather input time bases
-    let mut tb_in = vec![ffmpeg::Rational(0, 1); ictx.nb_streams() as usize];
-    for (i, st) in ictx.streams().enumerate() {
-        tb_in[i] = st.time_base();
-    }
-
-    // Packet reading loop
-    for (stream, mut packet) in ictx.packets() {
-        let ist_index = stream.index();
-        let out_idx = stream_mapping[ist_index];
-        if out_idx < 0 {
-            continue;
-        }
-        let ost = octx
-            .stream(out_idx as usize)
-            .ok_or("missing output stream")?;
-        packet.rescale_ts(tb_in[ist_index], ost.time_base());
-        packet.set_stream(out_idx as usize);
-
-        packet.write_interleaved(&mut octx)?;
-    }
-
-    // finalize
-    octx.write_trailer()?;
-
-    println!("native_hls_segmenter done writing HLS => {}", m3u8_output);
-    Ok(())
 }
