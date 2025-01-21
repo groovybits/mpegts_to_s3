@@ -142,7 +142,6 @@ fn get_actual_file_duration(path: &Path) -> f64 {
 }
 
 // ------------- HOURLY INDEX CREATOR -------------
-
 #[derive(Debug, Clone)]
 pub struct HourlyIndexEntry {
     pub sequence_id: u64,
@@ -353,18 +352,635 @@ impl HourlyIndexCreator {
     }
 }
 
-// ------------- MULTICAST JOIN + FILETRACKER + BUCKET CHECK -------------
-// (unchanged)...
+fn find_ipv4_for_interface(interface_name: &str) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+    let ifaces = get_if_addrs()?;
+    for iface in ifaces {
+        if iface.name == interface_name {
+            if let IpAddr::V4(ipv4) = iface.ip() {
+                return Ok(ipv4);
+            }
+        }
+    }
+    Err(format!("No IPv4 address found for interface '{}'", interface_name).into())
+}
+
+pub fn join_multicast_on_iface(
+    multicast_addr: &str,
+    port: u16,
+    interface_name: &str,
+) -> Result<Socket, Box<dyn std::error::Error>> {
+    let group_v4: Ipv4Addr = multicast_addr.parse()?;
+    let local_iface_ip = find_ipv4_for_interface(interface_name)?;
+
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    sock.set_reuse_port(true)?;
+
+    let bind_addr = SocketAddr::new(std::net::IpAddr::V4(local_iface_ip), port);
+    sock.bind(&bind_addr.into())?;
+
+    sock.set_multicast_if_v4(&local_iface_ip)?;
+    sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
+
+    println!(
+        "Joined multicast group {} on interface {}, local IP: {}, port {}",
+        multicast_addr, interface_name, local_iface_ip, port
+    );
+    Ok(sock)
+}
+
+struct FileTracker {
+    uploaded_files: HashSet<String>,
+    max_age: Duration,
+}
+
+impl FileTracker {
+    fn new(max_age_secs: u64) -> Self {
+        FileTracker {
+            uploaded_files: HashSet::new(),
+            max_age: Duration::from_secs(max_age_secs),
+        }
+    }
+
+    fn is_uploaded(&self, path: &str) -> bool {
+        self.uploaded_files.contains(path)
+    }
+
+    fn mark_uploaded(&mut self, path: String) {
+        self.uploaded_files.insert(path);
+    }
+
+    fn is_too_old(&self, path: &Path) -> bool {
+        if let Ok(metadata) = path.metadata() {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(age) = SystemTime::now().duration_since(modified) {
+                    return age > self.max_age;
+                }
+            }
+        }
+        false
+    }
+}
+
+async fn ensure_bucket_exists(
+    client: &Client,
+    bucket: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match client.head_bucket().bucket(bucket).send().await {
+        Ok(_) => {
+            info!("Bucket {} exists", bucket);
+            Ok(())
+        }
+        Err(_) => {
+            info!("Creating bucket {}", bucket);
+            client.create_bucket().bucket(bucket).send().await?;
+            info!("Successfully created bucket {}", bucket);
+            Ok(())
+        }
+    }
+}
 
 // ------------- DISKLESS MODE SUPPORT -------------
-// (unchanged)...
 
-// ------------- MANUAL SEGMENTER -------------
-// (unchanged)...
+#[derive(Clone)]
+struct InMemorySegment {
+    data: Vec<u8>,
+    duration: f64,
+}
+
+struct DisklessBuffer {
+    queue: VecDeque<InMemorySegment>,
+    max_segments: usize,
+}
+
+impl DisklessBuffer {
+    fn new(max_segments: usize) -> Self {
+        DisklessBuffer {
+            queue: VecDeque::new(),
+            max_segments,
+        }
+    }
+
+    fn push_segment(&mut self, seg: InMemorySegment) {
+        debug!(
+            "Pushing segment into ring buffer, length={}, dur={}",
+            seg.data.len(),
+            seg.duration
+        );
+        self.queue.push_back(seg);
+        if self.max_segments > 0 {
+            while self.queue.len() > self.max_segments {
+                self.queue.pop_front();
+            }
+        }
+    }
+}
+
+async fn upload_memory_segment_to_s3(
+    s3_client: &Client,
+    bucket: &str,
+    object_key: &str,
+    segment_data: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    debug!(
+        "Starting S3 upload of in-memory segment to object key='{}', length={}",
+        object_key,
+        segment_data.len()
+    );
+    let body_stream = ByteStream::from(segment_data.to_vec());
+    s3_client
+        .put_object()
+        .bucket(bucket)
+        .key(object_key)
+        .body(body_stream)
+        .content_type("video/mp2t")
+        .send()
+        .await?;
+    debug!("Completed S3 upload of object key='{}'", object_key);
+    Ok(())
+}
+
+struct PlaylistEntry {
+    duration: f64,
+    path: String,
+}
+
+struct ManualSegmenter {
+    output_dir: String,
+    current_ts_file: Option<BufWriter<fs::File>>,
+    segment_index: u64,
+    playlist_path: PathBuf,
+    m3u8_initialized: bool,
+
+    max_segments_in_index: usize,
+    playlist_entries: Vec<PlaylistEntry>,
+
+    diskless_mode: bool,
+    diskless_buffer: Arc<Mutex<DisklessBuffer>>,
+
+    segment_open_time: Option<Instant>,
+    bytes_this_segment: u64,
+    last_measured_bitrate: f64,
+
+    current_segment_buffer: Vec<u8>,
+
+    s3_client: Option<Client>,
+    s3_bucket: Option<String>,
+    generate_unsigned_urls: bool,
+    s3_endpoint: Option<String>,
+
+    // If zero => no forced split
+    diskless_max_bytes: usize,
+
+    hourly_index_creator: Option<Arc<Mutex<HourlyIndexCreator>>>,
+}
+
+impl ManualSegmenter {
+    fn new(output_dir: &str) -> Self {
+        let playlist_path = Path::new("").join("index.m3u8");
+        Self {
+            output_dir: output_dir.to_string(),
+            current_ts_file: None,
+            segment_index: 0,
+            playlist_path,
+            m3u8_initialized: false,
+            max_segments_in_index: 0,
+            playlist_entries: Vec::new(),
+            diskless_mode: false,
+            diskless_buffer: Arc::new(Mutex::new(DisklessBuffer::new(0))),
+            segment_open_time: None,
+            bytes_this_segment: 0,
+            last_measured_bitrate: 0.0,
+            current_segment_buffer: Vec::new(),
+            s3_client: None,
+            s3_bucket: None,
+            generate_unsigned_urls: false,
+            s3_endpoint: None,
+            diskless_max_bytes: get_max_segment_size_bytes(),
+            hourly_index_creator: None,
+        }
+    }
+
+    fn with_s3(
+        mut self,
+        s3_client: Option<Client>,
+        s3_bucket: Option<String>,
+        generate_unsigned_urls: bool,
+        s3_endpoint: Option<String>,
+    ) -> Self {
+        self.s3_client = s3_client;
+        self.s3_bucket = s3_bucket;
+        self.generate_unsigned_urls = generate_unsigned_urls;
+        self.s3_endpoint = s3_endpoint;
+        self
+    }
+
+    fn with_max_segments(mut self, max_segments: usize) -> Self {
+        self.max_segments_in_index = max_segments;
+        self
+    }
+
+    fn with_diskless_mode(mut self, diskless: bool, ring_size: usize) -> Self {
+        self.diskless_mode = diskless;
+        self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
+        self
+    }
+
+    fn with_diskless_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.diskless_max_bytes = max_bytes;
+        self
+    }
+
+    fn with_hourly_index_creator(mut self, hic: Option<Arc<Mutex<HourlyIndexCreator>>>) -> Self {
+        self.hourly_index_creator = hic;
+        self
+    }
+
+    async fn write_ts(&mut self, data: &[u8]) -> std::io::Result<()> {
+        // If this is our first data in a new segment, note the wall-clock start time
+        if self.segment_open_time.is_none() {
+            self.segment_open_time = Some(Instant::now());
+        }
+
+        // If not diskless, write to an actual file
+        if !self.diskless_mode {
+            if self.current_ts_file.is_none() {
+                self.open_new_segment_file()?;
+            }
+            if let Some(file) = self.current_ts_file.as_mut() {
+                file.write_all(data)?;
+                file.flush()?;
+            }
+        } else {
+            // If diskless, accumulate in self.current_segment_buffer
+            self.current_segment_buffer.extend_from_slice(data);
+
+            // If user set a max size for each segment, forcibly cut once we exceed it
+            if self.diskless_max_bytes > 0
+                && self.current_segment_buffer.len() >= self.diskless_max_bytes
+            {
+                info!(
+                    "[DISKLESS] buffer >= {} bytes, forcing segment close...",
+                    self.diskless_max_bytes
+                );
+                self.close_current_segment_file().await?;
+                if !self.diskless_mode {
+                    self.open_new_segment_file()?;
+                }
+            }
+        }
+
+        // Just counting bytes for fallback bitrate
+        self.bytes_this_segment += data.len() as u64;
+
+        // Do a simple "close if wall clock or byte-based logic says so"
+        let desired_secs = get_segment_duration_seconds() as f64;
+        let now = Instant::now();
+        let elapsed_wall = self
+            .segment_open_time
+            .map(|st| now.duration_since(st).as_secs_f64())
+            .unwrap_or(0.0);
+
+        let mut enough_bytes_based_on_bitrate = false;
+        if self.last_measured_bitrate > 0.0 {
+            let needed_bytes = self.last_measured_bitrate * desired_secs;
+            if self.bytes_this_segment as f64 >= needed_bytes {
+                enough_bytes_based_on_bitrate = true;
+            }
+        }
+
+        let fallback_time_expired = elapsed_wall >= desired_secs * 1.5;
+
+        if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
+            info!(
+                 "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
+                 elapsed_wall,
+                 desired_secs,
+                 enough_bytes_based_on_bitrate,
+                 fallback_time_expired
+             );
+            self.close_current_segment_file().await?;
+            if !self.diskless_mode {
+                self.open_new_segment_file()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn close_current_segment_file(&mut self) -> std::io::Result<()> {
+        // Measure real_elapsed from segment_open_time
+        let mut real_elapsed = if get_use_estimated_duration() {
+            self.segment_open_time
+                .map(|st| Instant::now().duration_since(st).as_secs_f64())
+                .unwrap_or(0.0)
+        } else {
+            let d = get_segment_duration_seconds() as f64;
+            d + 1.0
+        };
+
+        // round up real_elapsed to nearest second
+        real_elapsed = real_elapsed.ceil();
+
+        debug!(
+            "Closing segment {}, measured wall-clock duration={:.3}s",
+            self.segment_index + 1,
+            real_elapsed
+        );
+
+        // If not diskless, finalize file-based approach
+        if !self.diskless_mode {
+            if let Some(mut writer) = self.current_ts_file.take() {
+                writer.flush()?;
+                drop(writer);
+
+                // Write sidecar
+                let segment_path = self.current_segment_path(self.segment_index + 1);
+                let duration_path = segment_path.with_extension("dur");
+                let full_dur_path = Path::new(&self.output_dir).join(&duration_path);
+                fs::write(full_dur_path, format!("{:.3}", real_elapsed))?;
+
+                // Add to playlist
+                self.playlist_entries.push(PlaylistEntry {
+                    duration: real_elapsed,
+                    path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
+                });
+
+                if self.max_segments_in_index > 0
+                    && self.playlist_entries.len() > self.max_segments_in_index
+                {
+                    let removed = self.playlist_entries.remove(0);
+                    let old_path = Path::new(&removed.path);
+                    if old_path.exists() {
+                        let _ = fs::remove_file(old_path);
+                        let dur_path = old_path.with_extension("dur");
+                        let _ = fs::remove_file(dur_path);
+                    }
+                }
+            }
+        } else {
+            // diskless mode => finalize the chunk in memory
+            let seg_data_clone = self.current_segment_buffer.clone();
+            self.current_segment_buffer.clear();
+            info!(
+                "[DISKLESS] Finalizing seg#{} in memory, length={}, wall-clock dur={:.3}",
+                self.segment_index + 1,
+                seg_data_clone.len(),
+                real_elapsed
+            );
+
+            {
+                let mut buf = self.diskless_buffer.lock().await;
+                buf.push_segment(InMemorySegment {
+                    data: seg_data_clone.clone(),
+                    duration: real_elapsed,
+                });
+            }
+
+            // Optionally upload to S3
+            let mut final_path = format!("mem://segment_{}", self.segment_index + 1);
+            if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
+                let segment_path = self.current_segment_path(self.segment_index + 1);
+                let object_key = format!("{}", segment_path.to_string_lossy());
+                info!(
+                    "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
+                    object_key,
+                    seg_data_clone.len()
+                );
+
+                match upload_memory_segment_to_s3(s3c, buck, &object_key, &seg_data_clone).await {
+                    Ok(_) => {
+                        debug!("[DISKLESS] S3 upload succeeded. Now build URL...");
+                        if self.generate_unsigned_urls {
+                            if let Some(ref endpoint) = self.s3_endpoint {
+                                final_path = format!("{}/{}/{}", endpoint, buck, object_key);
+                            }
+                        } else {
+                            match self.generate_s3_url(&object_key).await {
+                                Ok(url_str) => {
+                                    final_path = url_str;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "[DISKLESS] presign failed: {:?}, fallback to mem:// path",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[DISKLESS] S3 upload of object_key='{}' failed: {:?}",
+                            object_key, e
+                        );
+                    }
+                }
+            }
+
+            // Add to playlist
+            self.playlist_entries.push(PlaylistEntry {
+                duration: real_elapsed,
+                path: final_path,
+            });
+
+            if self.max_segments_in_index > 0
+                && self.playlist_entries.len() > self.max_segments_in_index
+            {
+                let _ = self.playlist_entries.remove(0);
+            }
+        }
+
+        // In diskless mode, notify HourlyIndexCreator about this segment
+        if self.diskless_mode {
+            if let (Some(ref hic_arc), Some(_buck)) = (&self.hourly_index_creator, &self.s3_bucket)
+            {
+                let now = chrono::Local::now();
+                let year = now.format("%Y").to_string();
+                let month = now.format("%m").to_string();
+                let day = now.format("%d").to_string();
+                let hour = now.format("%H").to_string();
+
+                let hour_dir = format!("{}/{}/{}/{}", year, month, day, hour);
+                let object_key = format!(
+                    "{}",
+                    self.current_segment_path(self.segment_index + 1)
+                        .to_string_lossy()
+                );
+                let custom_lines = vec![];
+
+                let mut guard = hic_arc.lock().await;
+                if let Err(e) = guard
+                    .record_segment(
+                        &hour_dir,
+                        &object_key,
+                        real_elapsed,
+                        custom_lines,
+                        &self.output_dir,
+                    )
+                    .await
+                {
+                    warn!("Failed to record segment in diskless mode: {:?}", e);
+                }
+            }
+        }
+
+        // bump segment index
+        self.segment_index += 1;
+
+        // rewrite local M3U8
+        if let Err(e) = self.rewrite_m3u8() {
+            warn!("Error rewriting m3u8: {:?}", e);
+        }
+
+        // measure overall "bitrate"
+        if let Some(st) = self.segment_open_time.take() {
+            let real_elapsed = Instant::now().duration_since(st).as_secs_f64();
+            if real_elapsed > 0.2 {
+                let segment_bitrate = self.bytes_this_segment as f64 / real_elapsed;
+                self.last_measured_bitrate =
+                    0.6 * self.last_measured_bitrate + 0.4 * segment_bitrate;
+            }
+        }
+
+        // done, reset counters
+        self.bytes_this_segment = 0;
+        Ok(())
+    }
+
+    async fn generate_s3_url(
+        &self,
+        object_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if self.generate_unsigned_urls {
+            if let (Some(ref endpoint), Some(ref buck)) = (&self.s3_endpoint, &self.s3_bucket) {
+                Ok(format!("{}/{}/{}", endpoint, buck, object_key))
+            } else {
+                Err("missing endpoint or bucket for generate_s3_url".into())
+            }
+        } else {
+            if let (Some(ref client), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
+                let config =
+                    PresigningConfig::expires_in(Duration::from_secs(get_url_signing_seconds()))?;
+                let presigned_req = client
+                    .get_object()
+                    .bucket(buck)
+                    .key(object_key)
+                    .presigned(config)
+                    .await?;
+                Ok(presigned_req.uri().to_string())
+            } else {
+                Err("No s3_client or s3_bucket for presigned url".into())
+            }
+        }
+    }
+
+    fn open_new_segment_file(&mut self) -> std::io::Result<()> {
+        if self.diskless_mode {
+            return Ok(());
+        }
+        let segment_path = self.current_segment_path(self.segment_index);
+        let full_path = Path::new(&self.output_dir).join(&segment_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = fs::File::create(&full_path)?;
+        let writer = BufWriter::new(file);
+
+        self.current_ts_file = Some(writer);
+        if !self.m3u8_initialized {
+            self.init_m3u8()?;
+            self.m3u8_initialized = true;
+        }
+        Ok(())
+    }
+
+    fn init_m3u8(&self) -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.playlist_path)?;
+
+        writeln!(f, "#EXTM3U")?;
+        writeln!(f, "#EXT-X-VERSION:3")?;
+        writeln!(
+            f,
+            "#EXT-X-TARGETDURATION:{}",
+            get_segment_duration_seconds() + 1
+        )?;
+        writeln!(f, "#EXT-X-MEDIA-SEQUENCE:0")?;
+        Ok(())
+    }
+
+    fn rewrite_m3u8(&self) -> std::io::Result<()> {
+        debug!(
+            "Rewriting m3u8 with {} entries",
+            self.playlist_entries.len()
+        );
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.playlist_path)?;
+
+        writeln!(f, "#EXTM3U")?;
+        writeln!(f, "#EXT-X-VERSION:3")?;
+
+        let max_seg = self
+            .playlist_entries
+            .iter()
+            .map(|e| e.duration.ceil() as u64)
+            .max()
+            .unwrap_or_else(|| get_segment_duration_seconds());
+        writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg)?;
+
+        let seq_start = self
+            .segment_index
+            .saturating_sub(self.playlist_entries.len() as u64);
+        writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
+
+        for entry in &self.playlist_entries {
+            writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
+            writeln!(f, "{}", entry.path)?;
+        }
+        Ok(())
+    }
+
+    fn current_segment_path(&self, index: u64) -> PathBuf {
+        use chrono::Local;
+        let now = Local::now();
+        let year = now.format("%Y").to_string();
+        let month = now.format("%m").to_string();
+        let day = now.format("%d").to_string();
+        let hour = now.format("%H").to_string();
+        let timestamp = now.format("%Y%m%d-%H%M%S").to_string();
+        let filename = format!("segment_{}__{:04}.ts", timestamp, index);
+        Path::new(&year)
+            .join(&month)
+            .join(&day)
+            .join(&hour)
+            .join(filename)
+    }
+}
+
+impl Drop for ManualSegmenter {
+    fn drop(&mut self) {
+        let _ = tokio::runtime::Handle::try_current().map(|handle| {
+            handle.block_on(async {
+                let _ = self.close_current_segment_file().await;
+            })
+        });
+    }
+}
 
 // --------------------------------------------------------------------
-// CREATE A FIFO, THEN let ffmpeg read from it
+//  CREATE A FIFO, THEN let ffmpeg read from it
 // --------------------------------------------------------------------
+
+/// Creates or replaces a FIFO at the given path.
 fn create_fifo_pipe(pipe_path: &str) -> std::io::Result<()> {
     let _ = fs::remove_file(pipe_path); // remove old file if any
     let status = Command::new("mkfifo").arg(pipe_path).status()?;
@@ -378,118 +994,10 @@ fn create_fifo_pipe(pipe_path: &str) -> std::io::Result<()> {
     }
 }
 
-// --------------------------------------------------------------------
-// Minimal decode->encode pipeline injection
-// --------------------------------------------------------------------
-use ffmpeg::Packet as FfPacket;
-use ffmpeg::Rational as FfRational;
 use ffmpeg::{codec, format, media};
-use ffmpeg_sys::{
-    av_frame_alloc, av_frame_free, av_opt_set, av_packet_alloc, av_packet_unref,
-    avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder, avcodec_open2,
-    avcodec_parameters_from_context, avcodec_parameters_to_context, avcodec_receive_frame,
-    avcodec_receive_packet, avcodec_send_frame, avcodec_send_packet, AVCodecContext, AVCodecID,
-    AVPixelFormat,
-};
 
-/// Minimal: open a video decoder
-unsafe fn open_video_decoder(in_par: *const ffmpeg_sys::AVCodecParameters) -> *mut AVCodecContext {
-    let dec = avcodec_find_decoder((*in_par).codec_id);
-    if dec.is_null() {
-        warn!("No video decoder found => fallback to copy?");
-        return std::ptr::null_mut();
-    }
-    let dec_ctx = avcodec_alloc_context3(dec);
-    if dec_ctx.is_null() {
-        warn!("alloc dec ctx fail");
-        return std::ptr::null_mut();
-    }
-    let r = avcodec_parameters_to_context(dec_ctx, in_par);
-    if r < 0 {
-        warn!("avcodec_parameters_to_context => {}", r);
-    }
-    let r2 = avcodec_open2(dec_ctx, dec, std::ptr::null_mut());
-    if r2 < 0 {
-        warn!("avcodec_open2(dec) => {}", r2);
-    }
-    dec_ctx
-}
-/// Minimal: open H.264 encoder
-unsafe fn open_video_encoder() -> *mut AVCodecContext {
-    let enc = avcodec_find_encoder(AVCodecID::AV_CODEC_ID_H264);
-    if enc.is_null() {
-        warn!("No h264 encoder found => fallback to copy?");
-        return std::ptr::null_mut();
-    }
-    let enc_ctx = avcodec_alloc_context3(enc);
-    if enc_ctx.is_null() {
-        warn!("alloc enc ctx fail");
-        return std::ptr::null_mut();
-    }
-    // set resolution, AR, bitrate
-    (*enc_ctx).width = 1280;
-    (*enc_ctx).height = 720;
-    (*enc_ctx).pix_fmt = AVPixelFormat::AV_PIX_FMT_YUV420P;
-    (*enc_ctx).time_base.num = 1;
-    (*enc_ctx).time_base.den = 30; // e.g. 30 fps
-    (*enc_ctx).sample_aspect_ratio.num = 16;
-    (*enc_ctx).sample_aspect_ratio.den = 9;
-    (*enc_ctx).bit_rate = 2_000_000;
-
-    let mut opts = std::ptr::null_mut();
-    let r = avcodec_open2(enc_ctx, enc, &mut opts);
-    if r < 0 {
-        warn!("avcodec_open2(enc) => {}", r);
-    }
-    enc_ctx
-}
-
-/// feed TS packet -> decode -> re-encode -> write to container
-unsafe fn decode_encode_video_packet(
-    dec_ctx: *mut AVCodecContext,
-    enc_ctx: *mut AVCodecContext,
-    packet: &mut FfPacket,
-    octx: &mut format::context::Output,
-    out_idx: i32,
-    tb_in: ffmpeg::Rational,
-    tb_out: ffmpeg::Rational,
-) {
-    let mut avpkt = packet.as_av_packet_mut();
-    avpkt.pts = packet.pts().unwrap_or(0) as i64;
-    avpkt.dts = packet.dts().unwrap_or(0) as i64;
-    let r = avcodec_send_packet(dec_ctx, &mut *avpkt);
-    if r < 0 {
-        warn!("avcodec_send_packet => {}", r);
-    }
-    av_packet_unref(&mut *avpkt);
-
-    let mut frame = av_frame_alloc();
-    while avcodec_receive_frame(dec_ctx, frame) == 0 {
-        let r2 = avcodec_send_frame(enc_ctx, frame);
-        if r2 < 0 {
-            warn!("avcodec_send_frame => {}", r2);
-        }
-        let mut enc_pkt = av_packet_alloc();
-        while avcodec_receive_packet(enc_ctx, enc_pkt) == 0 {
-            let mut out_pkt = ffmpeg::Packet::empty();
-            out_pkt.set_stream(out_idx);
-            out_pkt.set_pts((*enc_pkt).pts as i64);
-            out_pkt.set_dts((*enc_pkt).dts as i64);
-            out_pkt.set_position(-1);
-            let data_slice = std::slice::from_raw_parts((*enc_pkt).data, (*enc_pkt).size as usize);
-            out_pkt.set_data(data_slice.to_vec());
-            out_pkt.rescale_ts(tb_in, tb_out);
-            out_pkt.write_interleaved(octx).ok();
-            av_packet_unref(enc_pkt);
-        }
-        av_packet_unref(enc_pkt);
-        ffmpeg_sys::av_packet_free(&mut enc_pkt);
-    }
-    av_frame_free(&mut frame);
-}
-
-/// Our "native_hls_segmenter" uses the named FIFO => TS data => HLS
-/// With minimal decode->encode logic for video if `encode=true`.
+/// Our "native HLS segmenter" uses the named FIFO.
+/// TS data is being written to that FIFO by a separate thread.
 fn native_hls_segmenter(
     fifo_path: &str,
     m3u8_output: &str,
@@ -504,46 +1012,52 @@ fn native_hls_segmenter(
     let dict = ffmpeg::Dictionary::new();
     let mut octx = format::output_with(m3u8_output, dict)?;
 
-    // set HLS muxer options (unchanged)
     unsafe {
         let fmt_ctx = octx.as_mut_ptr();
         if !(*fmt_ctx).priv_data.is_null() {
+            // Set all HLS muxer options
             ffmpeg_sys::av_opt_set(
                 (*fmt_ctx).priv_data,
                 "hls_time\0".as_ptr() as *const i8,
                 get_segment_duration_seconds().to_string().as_ptr() as *const i8,
                 0,
             );
+
             ffmpeg_sys::av_opt_set(
                 (*fmt_ctx).priv_data,
                 "hls_segment_type\0".as_ptr() as *const i8,
                 "mpegts\0".as_ptr() as *const i8,
                 0,
             );
+
             ffmpeg_sys::av_opt_set(
                 (*fmt_ctx).priv_data,
                 "hls_playlist_type\0".as_ptr() as *const i8,
                 "event\0".as_ptr() as *const i8,
                 0,
             );
+
             ffmpeg_sys::av_opt_set(
                 (*fmt_ctx).priv_data,
                 "hls_list_size\0".as_ptr() as *const i8,
                 hls_keep_segments.to_string().as_ptr() as *const i8,
                 0,
             );
+
             ffmpeg_sys::av_opt_set(
                 (*fmt_ctx).priv_data,
                 "strftime\0".as_ptr() as *const i8,
                 "1\0".as_ptr() as *const i8,
                 0,
             );
+
             ffmpeg_sys::av_opt_set(
                 (*fmt_ctx).priv_data,
                 "strftime_mkdir\0".as_ptr() as *const i8,
                 "1\0".as_ptr() as *const i8,
                 0,
             );
+
             ffmpeg_sys::av_opt_set(
                 (*fmt_ctx).priv_data,
                 "hls_segment_filename\0".as_ptr() as *const i8,
@@ -553,12 +1067,8 @@ fn native_hls_segmenter(
         }
     }
 
-    // Build out streams
+    // For each input stream, add output stream
     let mut stream_mapping = vec![-1; ictx.nb_streams() as usize];
-    let mut video_dec_ctx: *mut AVCodecContext = std::ptr::null_mut();
-    let mut video_enc_ctx: *mut AVCodecContext = std::ptr::null_mut();
-    let mut video_in_index = -1;
-    let mut video_out_index = -1;
     let mut ost_index = 0;
 
     for (ist_index, ist) in ictx.streams().enumerate() {
@@ -567,40 +1077,40 @@ fn native_hls_segmenter(
             continue;
         }
         let mut ost = octx.add_stream(codec::Id::None)?;
-        if !encode {
-            // old style => just copy
-            ost.set_parameters(ist.parameters());
+        ost.set_parameters(ist.parameters());
+
+        // If encode => set ID = H264 or AAC
+        if medium == media::Type::Video && encode {
             unsafe {
-                (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+                (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::H264.into();
             }
-        } else {
-            // if video => do decode->encode
-            if medium == media::Type::Video {
-                video_in_index = ist_index as i32;
-                unsafe {
-                    video_dec_ctx = open_video_decoder(ist.parameters().as_ptr());
-                    video_enc_ctx = open_video_encoder();
-                    let r = avcodec_parameters_from_context(
-                        ost.parameters().as_mut_ptr(),
-                        video_enc_ctx,
-                    );
-                    if r < 0 {
-                        warn!("avcodec_parameters_from_context => {}", r);
-                    }
-                    (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        } else if medium == media::Type::Audio && encode {
+            unsafe {
+                let params = ost.parameters().as_mut_ptr();
+                if encode {
+                    (*params).codec_id = codec::Id::AAC.into();
                 }
-                video_out_index = ost_index;
-            } else {
-                // audio => we set it to AAC
-                unsafe {
-                    (*ost.parameters().as_mut_ptr()).codec_id = codec::Id::AAC.into();
-                }
-                ost.set_parameters(ist.parameters());
-                unsafe {
-                    (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+                // Set AAC format to ADTS
+                (*params).format = ffmpeg_sys::AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32;
+                // Set ADTS extradata if needed
+                if (*params).extradata.is_null() {
+                    let extradata_size = 2;
+                    (*params).extradata = ffmpeg_sys::av_mallocz(
+                        extradata_size + ffmpeg_sys::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+                    ) as *mut u8;
+                    (*params).extradata_size = extradata_size as i32;
+                    let extradata =
+                        std::slice::from_raw_parts_mut((*params).extradata, extradata_size);
+                    // Set AAC LC profile
+                    extradata[0] = 0x12; // AAC LC profile
+                    extradata[1] = 0x10; // 44.1kHz, stereo
                 }
             }
         }
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+
         stream_mapping[ist_index] = ost_index as isize;
         ost_index += 1;
     }
@@ -612,7 +1122,6 @@ fn native_hls_segmenter(
         tb_in[i] = st.time_base();
     }
 
-    // read packets
     for (stream, mut packet) in ictx.packets() {
         let ist_index = stream.index();
         let out_idx = stream_mapping[ist_index];
@@ -622,45 +1131,10 @@ fn native_hls_segmenter(
         let ost = octx
             .stream(out_idx as usize)
             .ok_or("missing output stream")?;
-        if encode
-            && ist_index as i32 == video_in_index
-            && !video_dec_ctx.is_null()
-            && !video_enc_ctx.is_null()
-        {
-            // decode->encode video
-            unsafe {
-                decode_encode_video_packet(
-                    video_dec_ctx,
-                    video_enc_ctx,
-                    &mut packet,
-                    &mut octx,
-                    out_idx as i32,
-                    tb_in[ist_index],
-                    ost.time_base(),
-                );
-            }
-        } else {
-            // copy
-            packet.rescale_ts(tb_in[ist_index], ost.time_base());
-            packet.set_stream(out_idx as i32);
-            packet.write_interleaved(&mut octx)?;
-        }
-    }
+        packet.rescale_ts(tb_in[ist_index], ost.time_base());
+        packet.set_stream(out_idx as usize);
 
-    // flush decode->encode if needed
-    if encode && !video_dec_ctx.is_null() && !video_enc_ctx.is_null() {
-        let mut flush_packet = ffmpeg::Packet::empty();
-        unsafe {
-            decode_encode_video_packet(
-                video_dec_ctx,
-                video_enc_ctx,
-                &mut flush_packet,
-                &mut octx,
-                video_out_index,
-                ffmpeg::Rational(1, 1),
-                ffmpeg::Rational(1, 1),
-            );
-        }
+        packet.write_interleaved(&mut octx)?;
     }
 
     octx.write_trailer()?;
@@ -797,6 +1271,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let encode = matches.get_flag("encode");
     let diskless_mode = matches.get_flag("diskless_mode");
 
+    /*if diskless_mode {
+        manual_segment = true;
+    }*/
+
     if manual_segment && encode {
         eprintln!("Cannot use --manual_segment and --encode together.");
         process::exit(1);
@@ -816,9 +1294,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-                    interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
-                    hls_keep_segments={}, generate_unsigned_urls={}, \
-                    diskless_mode={}, diskless_ring_size={}, encode={}",
+                   interface={}, timeout={}, output_dir={}, remove_local={}, manual_segment={}, \
+                   hls_keep_segments={}, generate_unsigned_urls={}, \
+                   diskless_mode={}, diskless_ring_size={}, encode={}",
         endpoint,
         region_name,
         bucket,
