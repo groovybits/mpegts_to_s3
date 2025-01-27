@@ -111,10 +111,12 @@ fn send_segment_by_pcr(
                     let diff_secs = diff as f64 / 27_000_000.0;
                     // Sleep if < 10s or so
                     if diff_secs > 0.0 && diff_secs < 10.0 {
+                        println!("Sleeping for {}s", diff_secs);
                         sleep(Duration::from_secs_f64(diff_secs));
                     }
                 } else {
                     // negative => discontinuity => do not sleep
+                    eprintln!("PCR discontinuity: {} -> {}", prev, cur);
                 }
             }
             *last_pcr = Some(cur);
