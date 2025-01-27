@@ -1,14 +1,14 @@
 [package]
 name = "hls-to-udp"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Fetch HLS segments and output as MPEG-TS over UDP rate controled for playback smoothness."
 keywords = ["mpegts", "s3"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 license = "MIT"
-homepage = "https://github.com/groovybits/mpegts_to_s3/client"
-repository = "https://github.com/groovybits/mpegts_to_s3/client"
+homepage = "https://github.com/groovybits/mpegts_to_s3/hls-to-udp"
+repository = "https://github.com/groovybits/mpegts_to_s3/hls-to-udp"
 authors = ["groovybits"]
 
 [dependencies]
