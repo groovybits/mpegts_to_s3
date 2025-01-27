@@ -50,7 +50,7 @@ struct TsChunk {
 /// found a previous PCR for pacing, store it here.
 fn send_ts_chunks_realtime(
     sock: &UdpSocket,
-    dst_addr: &str,              // e.g. "224.0.0.200:10001"
+    dst_addr: &str, // e.g. "224.0.0.200:10001"
     chunks: &[TsChunk],
     prev_pcr: &mut Option<u64>,
 ) -> Result<()> {
@@ -83,7 +83,8 @@ fn parse_pcr_from_ts_packet(packet: &[u8]) -> Option<u64> {
         return None;
     }
     let afc = (packet[3] >> 4) & 0b11; // adaptation_field_control
-    if afc == 0b01 { // payload only, no adaptation
+    if afc == 0b01 {
+        // payload only, no adaptation
         return None;
     }
     let adapt_len = packet[4] as usize;
@@ -135,7 +136,8 @@ fn parse_ts_segment_into_chunks(data: &[u8]) -> Vec<TsChunk> {
 
 /// Return a Url from base + relative path
 fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
-    base.join(seg_path).map_err(|e| anyhow!("Bad URL join: {}", e))
+    base.join(seg_path)
+        .map_err(|e| anyhow!("Bad URL join: {}", e))
 }
 
 fn main() -> Result<()> {
@@ -170,7 +172,7 @@ fn main() -> Result<()> {
                 .long("history-size")
                 .short('s')
                 .action(ArgAction::Set)
-                .default_value("2000")
+                .default_value("2000"),
         )
         .get_matches();
 
