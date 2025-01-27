@@ -125,8 +125,7 @@ fn main() -> Result<()> {
     println!("  History size   = {}", history_capacity);
 
     // Parse base URL for relative segment resolution
-    let base_url = Url::parse(m3u8_url)
-        .map_err(|e| anyhow!("Could not parse M3U8 URL: {}", e))?;
+    let base_url = Url::parse(m3u8_url).map_err(|e| anyhow!("Could not parse M3U8 URL: {}", e))?;
 
     // ----------------------------------------------------------------
     // 2) Create our segment history (do not re-download if seen)
@@ -143,10 +142,10 @@ fn main() -> Result<()> {
         // We'll feed an MPEG-TS stream from stdin:
         .arg("-f")
         .arg("mpegts")
-        .arg("-i")
-        .arg("pipe:0")
         // -re can be used to throttle output in real-time:
         .arg("-re")
+        .arg("-i")
+        .arg("pipe:0")
         .arg("-muxrate")
         .arg(matches.get_one::<String>("muxrate").unwrap())
         // Copy codecs (no transcoding):
@@ -178,7 +177,10 @@ fn main() -> Result<()> {
         let playlist_data = match client.get(m3u8_url).send() {
             Ok(resp) => {
                 if !resp.status().is_success() {
-                    eprintln!("Error fetching playlist (status = {}): retrying...", resp.status());
+                    eprintln!(
+                        "Error fetching playlist (status = {}): retrying...",
+                        resp.status()
+                    );
                     sleep(Duration::from_secs(5));
                     continue;
                 }
