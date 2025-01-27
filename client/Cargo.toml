@@ -3,8 +3,13 @@ name = "hls-to-udp"
 version = "1.0.0"
 edition = "2021"
 description = "Fetch HLS segments, feed them to FFmpeg, and output MPEG-TS over UDP."
+keywords = ["mpegts", "s3"]
+categories = ["command-line-utilities"]
+readme = "README.md"
 license = "MIT"
-authors = ["CK <ck@groovybits>"]
+homepage = "https://github.com/groovybits/mpegts_to_s3/client"
+repository = "https://github.com/groovybits/mpegts_to_s3/client"
+authors = ["groovybits"]
 
 [dependencies]
 anyhow = "1"
