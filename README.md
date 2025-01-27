@@ -82,9 +82,10 @@ SEGMENT_DURATION_SECONDS=10 \
 
 #### 4. Playback
 - **Direct Playback:**
-```bash
-mpv -i http://127.0.0.1:3001/index.m3u8
-```
+  1. Use the index.m3u8 for playback of the current live stream:
+     ```bash
+     mpv -i http://127.0.0.1:3001/index.m3u8
+     ```
 
 - **MinIO Playback:**
   1. Retrieve the signed URL for the desired hour:
@@ -100,6 +101,17 @@ mpv -i http://127.0.0.1:3001/index.m3u8
      mpv http://127.0.0.1:9000/ltnhls/2025/01/16/06/hourly_index.m3u8?...(signed_url_params)
      ```
 
+- **Custom Playback with hls-to-udp relay**
+  1. Start the hls-to-udp relay
+     ```bash
+     cd hls-to-udp
+     cargo build --release
+     ./target/release/hls-to-udp -u http://127.0.0.1:3001/index.m3u8 -o 224.0.0.200:10001
+     ```
+  2. Play the relayed stream
+     ```bash
+     mpv udp://224.0.0.200:10001
+     ```
 ---
 
 ## Prerequisites

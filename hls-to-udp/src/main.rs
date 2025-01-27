@@ -118,8 +118,7 @@ fn send_segment_by_pcr(
             if let Some(prev) = *last_pcr {
                 if cur > prev {
                     let diff = cur - prev;
-                    // Now we interpret 'diff' as a difference in "ticks".
-                    // If the TS is truly 90 kHz for base + extension => 27MHz,
+                    // We interpret 'diff' as a difference in "ticks".
                     let diff_secs = diff as f64 / 90_000.0;
                     if diff_secs > 0.0 && diff_secs < 10.0 {
                         // eprintln!("sleeping for {:.6}", diff_secs); // Debug
