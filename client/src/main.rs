@@ -5,21 +5,21 @@ use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::net::UdpSocket;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep, JoinHandle};
 use std::time::Duration;
 use url::Url;
 
 const TS_PACKET_SIZE: usize = 188;
 
-/// Holds the full segment data plus a "segment ID" for debugging
+// ----------------------------------------------------------------
+// 1) The "DownloadedSegment" and "SegmentHistory"
+// ----------------------------------------------------------------
 #[derive(Debug)]
 struct DownloadedSegment {
-    id: usize,
+    id:   usize,
     data: Vec<u8>,
 }
 
-/// Track which segments we've seen
 struct SegmentHistory {
     seen: HashSet<String>,
     queue: VecDeque<String>,
@@ -50,18 +50,21 @@ impl SegmentHistory {
     }
 }
 
-/// Convert HLS relative path to absolute URL
+// ----------------------------------------------------------------
+// 2) URL helper
+// ----------------------------------------------------------------
 fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
     base.join(seg_path)
         .map_err(|e| anyhow!("Failed URL join: {}", e))
 }
 
-/// Minimal parse of PCR from a 188-byte TS packet's adaptation field, if present.
+// ----------------------------------------------------------------
+// 3) The PCR parser (for 90 kHz TS).
+// ----------------------------------------------------------------
 fn parse_pcr(ts_packet: &[u8]) -> Option<u64> {
     if ts_packet.len() != TS_PACKET_SIZE || ts_packet[0] != 0x47 {
         return None;
     }
-    // Byte 3 top bits => adaptation_field_control
     let afc = (ts_packet[3] >> 4) & 0b11;
     if afc == 0b01 {
         // payload only, no adaptation => no PCR
@@ -76,21 +79,30 @@ fn parse_pcr(ts_packet: &[u8]) -> Option<u64> {
         // pcr_flag not set
         return None;
     }
-    // pcr is 6 bytes at [6..12]
     if 6 + 6 > ts_packet.len() {
         return None;
     }
+
     let p = &ts_packet[6..12];
     let pcr_base = ((p[0] as u64) << 25)
-        | ((p[1] as u64) << 17)
-        | ((p[2] as u64) << 9)
-        | ((p[3] as u64) << 1)
-        | ((p[4] as u64) >> 7);
-    let pcr_ext = (((p[4] & 0x01) as u64) << 8) | (p[5] as u64);
-    Some(pcr_base * 300 + pcr_ext)
+                 | ((p[1] as u64) << 17)
+                 | ((p[2] as u64) << 9)
+                 | ((p[3] as u64) << 1)
+                 | ((p[4] as u64) >> 7);
+    let pcr_ext  = (((p[4] & 0x01) as u64) << 8) | (p[5] as u64);
+
+    // treat 'pcr_base' as 90 kHz, plus the extension fraction:
+    //
+    // total  = pcr_base + (pcr_ext / 300.0)
+    //
+    // use an integer in "pcr_base*300 + pcr_ext"
+    let total_90k = pcr_base * 300 + pcr_ext;
+    Some(total_90k) 
 }
 
-/// This function sends the entire segment, packet by packet, sleeping by PCR diffs.
+// ----------------------------------------------------------------
+// 4) "sender" logic: We interpret the difference as 90k => seconds
+// ----------------------------------------------------------------
 fn send_segment_by_pcr(
     sock: &UdpSocket,
     dst_addr: &str,
@@ -103,32 +115,29 @@ fn send_segment_by_pcr(
         offset += TS_PACKET_SIZE;
 
         if let Some(cur) = parse_pcr(packet) {
-            // if we have a previous
             if let Some(prev) = *last_pcr {
                 if cur > prev {
                     let diff = cur - prev;
-                    // 27,000,000 ticks = 1 sec
-                    let diff_secs = diff as f64 / 27_000_000.0;
-                    // Sleep if < 10s or so
+                    // Now we interpret 'diff' as a difference in "ticks".
+                    // If the TS is truly 90 kHz for base + extension => 27MHz, 
+                    let diff_secs = diff as f64 / 90_000.0;  
                     if diff_secs > 0.0 && diff_secs < 10.0 {
-                        println!("Sleeping for {}s", diff_secs);
+                        // eprintln!("sleeping for {:.6}", diff_secs); // Debug
                         sleep(Duration::from_secs_f64(diff_secs));
                     }
-                } else {
-                    // negative => discontinuity => do not sleep
-                    eprintln!("PCR discontinuity: {} -> {}", prev, cur);
                 }
             }
             *last_pcr = Some(cur);
         }
 
-        // Send the packet
         sock.send_to(packet, dst_addr)?;
     }
     Ok(())
 }
 
-/// Thread that downloads new segments (frequent M3U8 checks) and sends them to a channel.
+// ----------------------------------------------------------------
+// 5) downloader thread
+// ----------------------------------------------------------------
 fn downloader_thread(
     m3u8_url: String,
     poll_interval_ms: u64,
@@ -148,7 +157,7 @@ fn downloader_thread(
         let mut next_seg_id: usize = 1;
 
         loop {
-            // 1) Fetch playlist
+            // 1) fetch M3U8
             let playlist_text = match client.get(&m3u8_url).send() {
                 Ok(r) => {
                     if !r.status().is_success() {
@@ -172,12 +181,11 @@ fn downloader_thread(
                 }
             };
 
-            // 2) Parse
-            let parsed = m3u8_rs::parse_playlist_res(playlist_text.as_bytes());
+            let parsed = parse_playlist_res(playlist_text.as_bytes());
             let media_pl = match parsed {
                 Ok(Playlist::MediaPlaylist(mp)) => mp,
                 Ok(_) => {
-                    eprintln!("Got Master/unknown playlist, ignoring...");
+                    eprintln!("Got Master/unknown playlist...");
                     thread::sleep(Duration::from_millis(poll_interval_ms));
                     continue;
                 }
@@ -188,7 +196,7 @@ fn downloader_thread(
                 }
             };
 
-            // 3) Download new segments
+            // 2) download new segments
             for seg in &media_pl.segments {
                 let uri = &seg.uri;
                 if seg_history.contains(uri) {
@@ -196,7 +204,6 @@ fn downloader_thread(
                 }
                 seg_history.insert(uri.to_string());
 
-                // Download
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
                     Err(e) => {
@@ -226,7 +233,6 @@ fn downloader_thread(
                     }
                 };
 
-                // Push into channel
                 let seg_struct = DownloadedSegment {
                     id: next_seg_id,
                     data: seg_bytes,
@@ -238,22 +244,24 @@ fn downloader_thread(
                 next_seg_id += 1;
             }
 
-            // 4) If it's VOD (#EXT-X-ENDLIST), we can optionally break
             if media_pl.end_list {
                 println!("ENDLIST found => done downloading.");
                 break;
             }
 
-            // Wait sub-second or user-defined ms
             thread::sleep(Duration::from_millis(poll_interval_ms));
         }
     })
 }
 
-/// Thread that reads from the channel, and sends each segment's TS packets by PCR over UDP.
-fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandle<()> {
+// ----------------------------------------------------------------
+// 6) The sender thread
+// ----------------------------------------------------------------
+fn sender_thread(
+    udp_addr: String,
+    rx: Receiver<DownloadedSegment>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
-        // Make a UDP socket
         let sock = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
             Err(e) => {
@@ -261,34 +269,33 @@ fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandl
                 return;
             }
         };
-        // If needed: sock.set_multicast_ttl_v4(2).ok();
-        // Keep track of lastPCR
+
         let mut last_pcr: Option<u64> = None;
 
         while let Ok(seg) = rx.recv() {
             println!("Sender got segment #{}", seg.id);
-            // Send it, packet by packet
             if let Err(e) = send_segment_by_pcr(&sock, &udp_addr, &seg.data, &mut last_pcr) {
                 eprintln!("Send error: {}", e);
                 break;
             }
         }
-
         println!("Sender done (channel closed).");
     })
 }
 
+// ----------------------------------------------------------------
+// 7) Main
+// ----------------------------------------------------------------
 fn main() -> Result<()> {
     let matches = ClapCommand::new("hls-udp-two-threads")
         .version("1.0")
-        .about("Download HLS segments in one thread, feed them out by PCR in another, sub-second poll.")
+        .about("Download HLS segments, parse TS PCR at 90k, feed over UDP.")
         .arg(
             Arg::new("m3u8_url")
                 .short('u')
                 .long("m3u8-url")
                 .action(ArgAction::Set)
                 .required(true)
-                .help("URL to your .m3u8"),
         )
         .arg(
             Arg::new("udp_output")
@@ -296,7 +303,6 @@ fn main() -> Result<()> {
                 .long("udp-output")
                 .action(ArgAction::Set)
                 .required(true)
-                .help("like 224.0.0.200:10001 (no udp:// prefix)"),
         )
         .arg(
             Arg::new("poll_ms")
@@ -304,7 +310,6 @@ fn main() -> Result<()> {
                 .long("poll-ms")
                 .action(ArgAction::Set)
                 .default_value("500")
-                .help("How many ms between M3U8 fetch (default=500)"),
         )
         .arg(
             Arg::new("history_size")
@@ -334,14 +339,11 @@ fn main() -> Result<()> {
     println!("  Poll ms      = {}", poll_ms);
     println!("  History size = {}", hist_cap);
 
-    // Channel between downloader -> sender
     let (tx, rx) = mpsc::channel::<DownloadedSegment>();
 
-    // Spawn threads
     let dl_handle = downloader_thread(m3u8_url, poll_ms, hist_cap, tx);
     let sender_handle = sender_thread(udp_out, rx);
 
-    // Wait
     dl_handle.join().ok();
     sender_handle.join().ok();
 
