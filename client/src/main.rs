@@ -16,7 +16,7 @@ const TS_PACKET_SIZE: usize = 188;
 // ----------------------------------------------------------------
 #[derive(Debug)]
 struct DownloadedSegment {
-    id:   usize,
+    id: usize,
     data: Vec<u8>,
 }
 
@@ -85,11 +85,11 @@ fn parse_pcr(ts_packet: &[u8]) -> Option<u64> {
 
     let p = &ts_packet[6..12];
     let pcr_base = ((p[0] as u64) << 25)
-                 | ((p[1] as u64) << 17)
-                 | ((p[2] as u64) << 9)
-                 | ((p[3] as u64) << 1)
-                 | ((p[4] as u64) >> 7);
-    let pcr_ext  = (((p[4] & 0x01) as u64) << 8) | (p[5] as u64);
+        | ((p[1] as u64) << 17)
+        | ((p[2] as u64) << 9)
+        | ((p[3] as u64) << 1)
+        | ((p[4] as u64) >> 7);
+    let pcr_ext = (((p[4] & 0x01) as u64) << 8) | (p[5] as u64);
 
     // treat 'pcr_base' as 90 kHz, plus the extension fraction:
     //
@@ -97,7 +97,7 @@ fn parse_pcr(ts_packet: &[u8]) -> Option<u64> {
     //
     // use an integer in "pcr_base*300 + pcr_ext"
     let total_90k = pcr_base * 300 + pcr_ext;
-    Some(total_90k) 
+    Some(total_90k)
 }
 
 // ----------------------------------------------------------------
@@ -119,8 +119,8 @@ fn send_segment_by_pcr(
                 if cur > prev {
                     let diff = cur - prev;
                     // Now we interpret 'diff' as a difference in "ticks".
-                    // If the TS is truly 90 kHz for base + extension => 27MHz, 
-                    let diff_secs = diff as f64 / 90_000.0;  
+                    // If the TS is truly 90 kHz for base + extension => 27MHz,
+                    let diff_secs = diff as f64 / 90_000.0;
                     if diff_secs > 0.0 && diff_secs < 10.0 {
                         // eprintln!("sleeping for {:.6}", diff_secs); // Debug
                         sleep(Duration::from_secs_f64(diff_secs));
@@ -257,10 +257,7 @@ fn downloader_thread(
 // ----------------------------------------------------------------
 // 6) The sender thread
 // ----------------------------------------------------------------
-fn sender_thread(
-    udp_addr: String,
-    rx: Receiver<DownloadedSegment>,
-) -> JoinHandle<()> {
+fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandle<()> {
     thread::spawn(move || {
         let sock = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
@@ -295,21 +292,21 @@ fn main() -> Result<()> {
                 .short('u')
                 .long("m3u8-url")
                 .action(ArgAction::Set)
-                .required(true)
+                .required(true),
         )
         .arg(
             Arg::new("udp_output")
                 .short('o')
                 .long("udp-output")
                 .action(ArgAction::Set)
-                .required(true)
+                .required(true),
         )
         .arg(
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
                 .action(ArgAction::Set)
-                .default_value("500")
+                .default_value("500"),
         )
         .arg(
             Arg::new("history_size")
