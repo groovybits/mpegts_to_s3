@@ -87,11 +87,32 @@ fn main() -> Result<()> {
                 .default_value("2000")
                 .help("Number of unique segments to remember to avoid re-downloading (default: 2000)."),
         )
+        .arg(
+            Arg::new("interval")
+                .long("interval")
+                .short('i')
+                .action(ArgAction::Set)
+                .default_value("1")
+                .help("Interval in seconds to check for new segments (default: 1)."),
+        )
+        .arg(
+            Arg::new("muxrate")
+                .long("muxrate")
+                .short('r')
+                .action(ArgAction::Set)
+                .default_value("15M")
+                .help("Muxrate for FFmpeg output (default: 15M)."),
+        )
         .get_matches();
 
     // Get arguments as Strings:
     let m3u8_url = matches.get_one::<String>("m3u8_url").unwrap();
     let udp_output = matches.get_one::<String>("udp_output").unwrap();
+    let interval = matches
+        .get_one::<String>("interval")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap_or(1);
     let history_capacity = matches
         .get_one::<String>("history_size")
         .unwrap()
@@ -119,19 +140,23 @@ fn main() -> Result<()> {
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("info")
-        // -re can be used to throttle output in real-time:
-        .arg("-re")
         // We'll feed an MPEG-TS stream from stdin:
         .arg("-f")
         .arg("mpegts")
         .arg("-i")
         .arg("pipe:0")
+        // -re can be used to throttle output in real-time:
+        .arg("-re")
+        .arg("-muxrate")
+        .arg(matches.get_one::<String>("muxrate").unwrap())
         // Copy codecs (no transcoding):
         .arg("-c")
         .arg("copy")
         // Output MPEG-TS over UDP:
         .arg("-f")
         .arg("mpegts")
+        .arg("-fflags")
+        .arg("+genpts")
         .arg(udp_output)
         .stdin(Stdio::piped())
         .spawn()?;
@@ -222,13 +247,13 @@ fn main() -> Result<()> {
         }
 
         // ------------------------------------------------------------
-        // 4e) Sleep before refetching the playlist (adjust interval as needed)
+        // 4e) Sleep before refetching the playlist N seconds
         // ------------------------------------------------------------
-        sleep(Duration::from_secs(5));
+        sleep(Duration::from_secs(interval));
     }
 
     // ----------------------------------------------------------------
-    // 5) Gracefully terminate FFmpeg (optional)
+    // 5) Gracefully terminate FFmpeg
     // ----------------------------------------------------------------
     match ffmpeg_child.kill() {
         Ok(_) => println!("Stopped FFmpeg."),
