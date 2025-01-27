@@ -2,7 +2,7 @@
 name = "hls-to-udp"
 version = "1.0.0"
 edition = "2021"
-description = "Fetch HLS segments, feed them to FFmpeg, and output MPEG-TS over UDP."
+description = "Fetch HLS segments and output as MPEG-TS over UDP rate controled for playback smoothness."
 keywords = ["mpegts", "s3"]
 categories = ["command-line-utilities"]
 readme = "README.md"
