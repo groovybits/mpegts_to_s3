@@ -8,7 +8,7 @@ license-file = "LICENSE"
 homepage = "https://github.com/groovybits/mpegts_to_s3"
 repository = "https://github.com/groovybits/mpegts_to_s3"
 authors = ["groovybits"]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 
 [dependencies]
