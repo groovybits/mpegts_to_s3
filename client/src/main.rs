@@ -15,7 +15,7 @@ const TS_PACKET_SIZE: usize = 188;
 /// Holds the full segment data plus a "segment ID" for debugging
 #[derive(Debug)]
 struct DownloadedSegment {
-    id:   usize,
+    id: usize,
     data: Vec<u8>,
 }
 
@@ -52,7 +52,8 @@ impl SegmentHistory {
 
 /// Convert HLS relative path to absolute URL
 fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
-    base.join(seg_path).map_err(|e| anyhow!("Failed URL join: {}", e))
+    base.join(seg_path)
+        .map_err(|e| anyhow!("Failed URL join: {}", e))
 }
 
 /// Minimal parse of PCR from a 188-byte TS packet's adaptation field, if present.
@@ -248,10 +249,7 @@ fn downloader_thread(
 }
 
 /// Thread that reads from the channel, and sends each segment's TS packets by PCR over UDP.
-fn sender_thread(
-    udp_addr: String,
-    rx: Receiver<DownloadedSegment>,
-) -> JoinHandle<()> {
+fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandle<()> {
     thread::spawn(move || {
         // Make a UDP socket
         let sock = match UdpSocket::bind("0.0.0.0:0") {
