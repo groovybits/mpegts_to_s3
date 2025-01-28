@@ -11,6 +11,11 @@ homepage = "https://github.com/groovybits/mpegts_to_s3/hls-to-udp"
 repository = "https://github.com/groovybits/mpegts_to_s3/hls-to-udp"
 authors = ["groovybits"]
 
+# Build release optimized with debug info
+[profile.release]
+opt-level = 3
+debug = true
+
 [dependencies]
 anyhow = "1"
 clap = "4"
