@@ -12,7 +12,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 while [ : ]; do
-    /app/hls-to-udp \
+    hls-to-udp \
         -u ${HLS_INPUT_URL} \
         -o ${UDP_OUTPUT_IP}:${UDP_OUTPUT_PORT} \
             $@

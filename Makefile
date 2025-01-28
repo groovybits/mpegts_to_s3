@@ -6,7 +6,7 @@ JOBS := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 all: ffmpeg libltntstools build
 
 install:
-	mkdir -p bin && cp -f target/release/mpegts_to_s3 hls-to-udp/target/release/hls-to-udp bin/
+	mkdir -p bin && cp -f target/release/udp-to-hls hls-to-udp/target/release/hls-to-udp bin/
 
 setup:
 	sh scripts/setup_system.sh

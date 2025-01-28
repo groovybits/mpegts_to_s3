@@ -1,17 +1,16 @@
-# MPEG-TS UDP to S3/MinIO HLS VOD and UDP Re-cast
+# UDP MpegTS to HLS VOD for UDP MpegTS Re-Stream
 
-This Rust application enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application. See the hls to udp relay for a way to replay the content [hls-to-udp](hls-to-udp/README.md).
+UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application. See the hls to udp relay for a way to replay the content [hls-to-udp](hls-to-udp/README.md).
 
 ```mermaid
 graph LR
     A["UDP<br/>Multicast<br/>Stream"] -->|"Captured via libpcap"| B["Capture<br/>Module"]
     B -->|"MPEG-TS"| C["Segmentation<br/>Process"]
-    C -->|"FFmpeg Next"| D["HLS Segments<br/>and Playlist"]
-    C -->|"Manual"| D
-    D -->|"Watch"| E["S3/MinIO<br/>Upload"]
+    C -->|"Segment"| D["HLS Segments<br/>and Playlist"]
+    D -->|"Upload"| E["S3/MinIO<br/>Upload"]
     E -->|"URLs"| F["HLS<br/>Playlist"]
-    F -->|"HTTP"| G["HTTP<br/>Download"]
-    G -->|"HLS"| H["MpegTS UDP<br/>Multicast<br/>Stream"]
+    F -->|"HTTP HLS Server"| G["HTTP<br/>Download"]
+    G -->|"MpegTS UDP"| H["MpegTS UDP<br/>Multicast<br/>Stream"]
     H ~~~ Z1[" "]
     Z1 ~~~ Z2[" "]
 
@@ -56,7 +55,7 @@ cargo build --release
 #### 1. Start MinIO Server
 ```bash
 # Start the MinIO server (uses ./data/ for storage)
-scripts/minio_server.py &
+TARGET_SERVER=192.168.1.1 scripts/minio_server.py &
 ```
 
 #### 2. Serve HLS Playlist
@@ -72,12 +71,11 @@ mkdir hls && cd hls
 ```bash
 # Capture multicast stream from udp://224.0.0.200:10001 on interface eth0
 # Segments can be saved to ./ts/ directory with 2-second duration and uploaded to S3/MinIO
-SEGMENT_DURATION_SECONDS=10 \
-../target/release/mpegts_to_s3 \
+SEGMENT_DURATION_SECONDS=2 \
+../target/release/udp-to-hls \
     -n eth0 \         # Network interface for packet capture
     -i 224.0.0.200 \  # Multicast IP to filter
     -p 10001 \         # UDP port to filter
-    --manual_segment \ # Use manual segmentation instead of FFmpeg
     -o ts \           # Output directory for .ts segments
     --diskless_mode   # Diskless mode avoids writing .ts segments to disk
 ```
@@ -96,7 +94,7 @@ SEGMENT_DURATION_SECONDS=10 \
      ```
   2. Setup an SSH tunnel for the HTTP server:
      ```bash
-     scripts/minio_admin.sh
+     scripts/minio_tunnel.sh
      ```
   3. Play back the hourly playlist:
      ```bash
@@ -129,7 +127,7 @@ SEGMENT_DURATION_SECONDS=10 \
 ## Usage
 
 ```bash
-mpegts_to_s3 [OPTIONS]
+udp-to-hls [OPTIONS]
 ```
 ### Options:
 - **General Settings:**
@@ -144,7 +142,6 @@ mpegts_to_s3 [OPTIONS]
 - **HLS Output:**
   - `-o`, `--output_dir`: Local directory for HLS output (default: `ts`)
   - `--remove_local`: Remove local `.ts` and `.m3u8` files after upload
-  - `--manual_segment`: Use manual segmentation instead of FFmpeg
   - `--hls_keep_segments`: Number of segments to keep in the `.m3u8` index (0 = unlimited, default: `10`)
   - `--diskless_mode`: Diskless mode avoids writing `.ts` segments to disk (default: `false`) requires --manual_segment arg.
 
