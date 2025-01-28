@@ -2,7 +2,7 @@
 FROM rust:1.84 as builder
 
 WORKDIR /app
-COPY src src
+COPY src/main.rs src/main.rs
 COPY Cargo.toml Cargo.toml
 
 # Install build-time dependencies for pcap & ffmpeg
