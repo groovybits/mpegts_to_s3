@@ -4,11 +4,10 @@
 - NONE
 
 ### NON-CRITICAL BUGS
-- [ ] Better estimation of the duration of the video in the non-FFmpeg segmentation.
+- NONE
 
 ### FEATURES
-- [ ] Add encoding to FFmpeg Next Muxing
-- [ ] Improve duration derivation in non-FFmpeg segmentation
+- [ ] Improve duration derivation in segmentation
 - [ ] Add policy support with more details to S3 signing
 - [ ] Discontinuity flagging in HLS Manifest
 - [ ] Add testing and documentation
