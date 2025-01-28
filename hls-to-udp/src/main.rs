@@ -146,7 +146,7 @@ fn send_segment(
                     if cur > prev {
                         let diff = cur - prev;
                         let diff_secs = diff as f64 / 90_000.0;
-                        if diff_secs > 0.0 && diff_secs < 10.0 {
+                        if diff_secs > 0.0 && diff_secs < 2.0 {
                             sleep(Duration::from_secs_f64(diff_secs));
                         }
                     }
@@ -198,7 +198,7 @@ fn send_segment(
         let interval = packet_size_bits / current_bitrate;
         let mut offset = 0;
 
-        while offset < segment_data.len() {
+        while (offset +TS_PACKET_SIZE ) < segment_data.len() {
             let send_start = Instant::now();
             let packet = &segment_data[offset..offset + TS_PACKET_SIZE];
 
@@ -403,7 +403,7 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("100")
+                .default_value("30")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -421,7 +421,7 @@ fn main() -> Result<()> {
         .get_one::<String>("poll_ms")
         .unwrap()
         .parse::<u64>()
-        .unwrap_or(500);
+        .unwrap_or(30);
     let hist_cap = matches
         .get_one::<String>("history_size")
         .unwrap()
