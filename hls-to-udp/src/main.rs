@@ -198,7 +198,7 @@ fn send_segment(
         let interval = packet_size_bits / current_bitrate;
         let mut offset = 0;
 
-        while (offset +TS_PACKET_SIZE ) < segment_data.len() {
+        while (offset + TS_PACKET_SIZE ) <= segment_data.len() {
             let send_start = Instant::now();
             let packet = &segment_data[offset..offset + TS_PACKET_SIZE];
 
