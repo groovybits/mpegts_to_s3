@@ -1,4 +1,4 @@
-# MPEG-TS UDP Multicast to HLS VOD for UDP Re-cast from S3/MinIO Storage
+# MPEG-TS UDP to S3/MinIO HLS VOD and UDP Re-cast
 
 This Rust application enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application. See the hls to udp relay for a way to replay the content [hls-to-udp](hls-to-udp/README.md).
 
