@@ -1149,7 +1149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_secs()
         .init();
-    debug!("Logging initialized. Starting main()...");
+    log::info!("MpegTStoS3: Logging initialized. Starting main()...");
 
     let matches = ClapCommand::new("mpegts_to_s3")
         .version(get_version())

@@ -41,7 +41,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        ENABLE_DEBUG: "true"
+        ENABLE_DEBUG: "false"
     container_name: "mpegts_to_s3"
     env_file:
       - "config.env"
@@ -64,7 +64,7 @@ services:
       context: .
       dockerfile: Dockerfile.rebroadcast
       args:
-        ENABLE_DEBUG: "true"
+        ENABLE_DEBUG: "false"
     container_name: "hls_to_udp"
     env_file:
       - "config.env"

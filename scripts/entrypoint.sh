@@ -1,6 +1,7 @@
 #!/bin/sh
 
 export RUST_BACKTRACE=1
+export RUST_LOG=info
 
 cleanup() {
     echo "Caught signal, cleaning up..."

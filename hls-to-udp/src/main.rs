@@ -9,6 +9,8 @@ use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant};
 use url::Url;
 
+use env_logger;
+
 const TS_PACKET_SIZE: usize = 188;
 const MAX_UDP_BITRATE: f64 = 30_000_000.0; // 30 Mbps max
 const UDP_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -382,6 +384,11 @@ fn get_version() -> &'static str {
 }
 
 fn main() -> Result<()> {
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp_secs()
+        .init();
+    log::info!("HLStoUDP: Logging initialized. Starting main()...");
     let matches = ClapCommand::new("hls-udp-streamer")
         .version(get_version())
         .about("HLS to UDP streamer with PCR/duration-based timing")
