@@ -1,4 +1,4 @@
-# Rust HLS to MpegTS UDP Client
+# HLS VOD to MPEG-TS UDP Multicast Stream
 
 This Rust-based client reads from an HLS M3U8 playlist and rebroadcasts it as MPEG-TS over UDP.
 It is based off the HLS produced by https://github.com/groovybits/mpegts_to_s3.git and is intended to be used as a relay for replaying that content.

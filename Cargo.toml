@@ -1,8 +1,8 @@
 [package]
 name = "mpegts_to_s3"
-version = "0.1.6"
-description = "MPEG-TS to S3"
-keywords = ["mpegts", "s3"]
+version = "0.9.0"
+description = "MPEG-TS UDP PCAP Capture to S3/MinIO HLS VOD for MPEG-TS UDP Rebroadcast"
+keywords = ["mpegts", "s3", "hls", "udp"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 license-file = "LICENSE"
