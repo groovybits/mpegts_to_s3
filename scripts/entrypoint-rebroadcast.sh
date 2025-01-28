@@ -1,6 +1,19 @@
 #!/bin/sh
 
-/app/hls-to-udp \
-    -u ${HLS_INPUT_URL} \
-    -o ${UDP_OUTPUT_IP}:${UDP_OUTPUT_PORT} \
-         $@
+export RUST_BACKTRACE=1
+
+cleanup() {
+    echo "Caught signal, cleaning up..."
+    kilall hls-to-udp
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+while [ : ]; do
+    /app/hls-to-udp \
+        -u ${HLS_INPUT_URL} \
+        -o ${UDP_OUTPUT_IP}:${UDP_OUTPUT_PORT} \
+            $@
+    sleep 1
+done

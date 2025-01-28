@@ -1,6 +1,8 @@
 # --- Stage 1: Build the Rust application ---
 FROM rust:1.84 as builder
 
+ARG DEBUG
+
 WORKDIR /app
 COPY src/main.rs src/main.rs
 COPY Cargo.toml Cargo.toml
@@ -13,7 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libswresample-dev libswscale-dev \
     libavdevice-dev libclang-dev
 
-RUN cargo build --release
+RUN if [ "$DEBUG" = "true" ]; then \
+        cargo build && \
+            mkdir -p target/release && \
+            cp -f target/debug/mpegts_to_s3 target/release/; \
+    else \
+        cargo build --release; \
+    fi
 
 # --- Stage 2: Final runtime container ---
 FROM debian:stable-slim

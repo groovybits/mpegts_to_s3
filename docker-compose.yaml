@@ -41,6 +41,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: "mpegts_to_s3"
+    args:
+      DEBUG: "true"
     env_file:
       - "config.env"
     # Mount local 'hls' directory as the working directory
@@ -62,6 +64,8 @@ services:
       context: .
       dockerfile: Dockerfile.rebroadcast
     container_name: "hls_to_udp"
+    args:
+      DEBUG: "true"
     env_file:
       - "config.env"
     depends_on:
