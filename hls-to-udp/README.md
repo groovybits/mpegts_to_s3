@@ -2,7 +2,7 @@
 
 This Rust-based client reads from an HLS M3U8 playlist and rebroadcasts it as MPEG-TS over UDP. It is designed to handle the HLS produced by https://github.com/groovybits/mpegts_to_s3.git and is intended to be used as a relay for replaying that content.
 
-Currently it is recommended to smooth the output with the LTN TS Tools Bitrate Smoother [https://github.com/groovybits/ltntstools/blob/master/src/bitrate_smoother.c](https://github.com/groovybits/ltntstools/blob/master/src/bitrate_smoother.c). See the build project for that here [https://github.com/LTNGlobal-opensource/ltntstools-build-environment](https://github.com/LTNGlobal-opensource/ltntstools-build-environment).
+Currently it is recommended to smooth the output with the LTN TS Tools Bitrate Smoother [https://github.com/LTNGlobal-opensource/ltntstools/blob/master/src/bitrate_smoother.c](https://github.com/LTNGlobal-opensource/ltntstools/blob/master/src/bitrate_smoother.c). See the build project for that here [https://github.com/LTNGlobal-opensource/ltntstools-build-environment](https://github.com/LTNGlobal-opensource/ltntstools-build-environment).
 
 ## Features
 
