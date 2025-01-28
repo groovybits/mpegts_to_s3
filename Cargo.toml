@@ -1,6 +1,6 @@
 [package]
 name = "mpegts_to_s3"
-version = "0.1.5"
+version = "0.1.6"
 description = "MPEG-TS to S3"
 keywords = ["mpegts", "s3"]
 categories = ["command-line-utilities"]
