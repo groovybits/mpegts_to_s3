@@ -165,8 +165,8 @@ fn send_segment(
             }
         }
     } else if segment_duration > 0.0 && num_packets > 0 {
-        let calculated_duration = segment_duration
-            .max((segment_data.len() as f64 * 8.0) / current_bitrate);
+        let calculated_duration =
+            segment_duration.max((segment_data.len() as f64 * 8.0) / current_bitrate);
 
         let time_per_packet = calculated_duration / num_packets as f64;
         let start_time = Instant::now();
@@ -174,7 +174,7 @@ fn send_segment(
 
         for i in 0..num_packets {
             let target_time = start_time + Duration::from_secs_f64(i as f64 * time_per_packet);
-            
+
             let packet = &segment_data[offset..offset + TS_PACKET_SIZE];
             loop {
                 match sock.send(packet) {
@@ -185,9 +185,9 @@ fn send_segment(
                     Err(e) => return Err(e.into()),
                 }
             }
-            
+
             offset += TS_PACKET_SIZE;
-            
+
             let now = Instant::now();
             if let Some(remaining) = target_time.checked_duration_since(now) {
                 sleep(remaining);
@@ -197,11 +197,11 @@ fn send_segment(
         let packet_size_bits = (TS_PACKET_SIZE * 8) as f64;
         let interval = packet_size_bits / current_bitrate;
         let mut offset = 0;
-        
+
         while offset < segment_data.len() {
             let send_start = Instant::now();
             let packet = &segment_data[offset..offset + TS_PACKET_SIZE];
-            
+
             loop {
                 match sock.send(packet) {
                     Ok(_) => break,
@@ -211,9 +211,9 @@ fn send_segment(
                     Err(e) => return Err(e.into()),
                 }
             }
-            
+
             offset += TS_PACKET_SIZE;
-            
+
             let elapsed = send_start.elapsed();
             let target_duration = Duration::from_secs_f64(interval);
             if let Some(remaining) = target_duration.checked_sub(elapsed) {
@@ -361,7 +361,7 @@ fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandl
         while let Ok(seg) = rx.recv() {
             println!("Sender processing segment #{}", seg.id);
             bitrate_estimator.update(seg.data.len(), seg.duration);
-            
+
             if let Err(e) = send_segment(
                 &sock,
                 &seg.data,
