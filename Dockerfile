@@ -1,7 +1,8 @@
 # --- Stage 1: Build the Rust application ---
 FROM rust:1.84 as builder
 
-ARG DEBUG
+ARG ENABLE_DEBUG
+ENV ENABLE_DEBUG=${ENABLE_DEBUG:-false}
 
 WORKDIR /app
 COPY src/main.rs src/main.rs
@@ -15,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libswresample-dev libswscale-dev \
     libavdevice-dev libclang-dev
 
-RUN if [ "$DEBUG" = "true" ]; then \
+RUN if [ "${ENABLE_DEBUG}" = "true" ]; then \
         cargo build && \
             mkdir -p target/release && \
             cp -f target/debug/mpegts_to_s3 target/release/; \
