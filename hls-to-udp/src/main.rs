@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 const TS_PACKET_SIZE: usize = 188;
-const MAX_UDP_BITRATE: f64 = 10_000_000.0; // 10 Mbps max
+const MAX_UDP_BITRATE: f64 = 30_000_000.0; // 30 Mbps max
 const UDP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
@@ -377,9 +377,13 @@ fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandl
     })
 }
 
+fn get_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 fn main() -> Result<()> {
     let matches = ClapCommand::new("hls-udp-streamer")
-        .version("1.0")
+        .version(get_version())
         .about("HLS to UDP streamer with PCR/duration-based timing")
         .arg(
             Arg::new("m3u8_url")
@@ -399,7 +403,7 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("500")
+                .default_value("100")
                 .action(ArgAction::Set),
         )
         .arg(
