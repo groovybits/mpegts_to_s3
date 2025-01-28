@@ -1,4 +1,4 @@
-# Rust-Based Multicast MPEG-TS UDP Stream PCAP Capture for S3/MinIO HLS Hourly Archiving and Playback
+# Rust-Based Multicast MPEG-TS UDP Stream PCAP Capture for S3/MinIO HLS Hourly Archiving and Playback to MPeg-TS UDP Multicast Stream
 
 This Rust application enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application.
 
@@ -6,12 +6,13 @@ This Rust application enables capturing of MPEG-TS UDP multicast streams, segmen
 graph LR
     A["UDP<br/>Multicast<br/>Stream"] -->|"Captured via libpcap"| B["Capture<br/>Module"]
     B -->|"MPEG-TS"| C["Segmentation<br/>Process"]
-    C -->|"FFmpeg"| D["HLS Segments<br/>and Playlist"]
+    C -->|"FFmpeg Next"| D["HLS Segments<br/>and Playlist"]
     C -->|"Manual"| D
     D -->|"Watch"| E["S3/MinIO<br/>Upload"]
-    E -->|"URLs"| F["HLS<br/>Playback"]
-    E -->|"Log"| G["URL<br/>Logs"]
-    G ~~~ Z1[" "]
+    E -->|"URLs"| F["HLS<br/>Playlist"]
+    F -->|"HTTP"| G["HTTP<br/>Download"]
+    G -->|"HLS"| H["MpegTS UDP<br/>Multicast<br/>Stream"]
+    H ~~~ Z1[" "]
     Z1 ~~~ Z2[" "]
 
     style A fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
@@ -21,6 +22,7 @@ graph LR
     style E fill:#ff99cc,stroke:#cc0066,stroke-width:2px,color:#660033,font-weight:bold
     style F fill:#e6b3e6,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
     style G fill:#b3b3e6,stroke:#000066,stroke-width:2px,color:#000033,font-weight:bold
+    style H fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
     style Z1 fill:none,stroke:none,color:transparent
     style Z2 fill:none,stroke:none,color:transparent
 ```

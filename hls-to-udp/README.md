@@ -15,12 +15,21 @@ It is based off the HLS produced by https://github.com/groovybits/mpegts_to_s3.g
 
 ## Installation
 
-2. Build the project:
+1. Build the project:
     ```sh
     cargo build --release
     ```
 
-## Usage
+## Container Deployment
+
+1. Build the container image:
+    ```sh
+    # The Dockerfile.rebroadcast and docker-compose.yaml are in the mpegts_to_s3 directory ../ below this one
+    cd ../
+    podman-compose up --build
+    ```
+
+## Usage outside of a container
 
 1. Run the client with the M3U8 URL and UDP address:
     ```sh

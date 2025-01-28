@@ -43,7 +43,6 @@ services:
     container_name: "mpegts_to_s3"
     env_file:
       - "config.env"
-
     # Mount local 'hls' directory as the working directory
     # where mpegts_to_s3 will write its files.
     volumes:
@@ -51,5 +50,22 @@ services:
 
     depends_on:
       - s3minio
+    restart: unless-stopped
+
+  ######################################
+  # Rust-Based HLS to UDP Service
+  ######################################
+  hls_to_udp:
+    network_mode: "host"
+    hostname: "hls-to-udp"
+    build:
+      context: .
+      dockerfile: Dockerfile.rebroadcast
+    container_name: "hls_to_udp"
+    env_file:
+      - "config.env"
+    depends_on:
+      - s3minio
+      - mpegts_to_s3
     restart: unless-stopped
 
