@@ -39,7 +39,7 @@ services:
     hostname: "mpegts-to-s3"
     build:
       context: .
-      dockerfile: Dockerfile.capture
+      dockerfile: Dockerfile
       args:
         ENABLE_DEBUG: "false"
     container_name: "mpegts_to_s3"
@@ -49,10 +49,10 @@ services:
     # where mpegts_to_s3 will write its files.
     volumes:
       - "./hls:/app/hls"
-
     depends_on:
       - s3minio
     restart: unless-stopped
+    entrypoint: ["/app/entrypoint_capture.sh"]
 
   ######################################
   # Rust-Based HLS to UDP Service
@@ -62,7 +62,7 @@ services:
     hostname: "hls-to-udp"
     build:
       context: .
-      dockerfile: Dockerfile.replay
+      dockerfile: Dockerfile
       args:
         ENABLE_DEBUG: "false"
     container_name: "hls_to_udp"
@@ -72,4 +72,16 @@ services:
       - s3minio
       - mpegts_to_s3
     restart: unless-stopped
+    entrypoint: ["/app/entrypoint_replay.sh"]
 
+  ######################################
+  # HLS M3U8 Playlist Service
+  ######################################
+  hls-server:
+    image: nginx:alpine
+    container_name: hls-server
+    ports:
+      - "3001:80" # Map port 3001 on the host to port 80 in the container
+    volumes:
+      - ./hls:/usr/share/nginx/html:ro # Serve HLS files from the local "hls" folder
+    restart: unless-stopped

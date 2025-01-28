@@ -32,7 +32,7 @@ RUN mkdir -p /app/hls
 
 WORKDIR /app/hls
 COPY --from=builder /app/target/release/mpegts_to_s3 /app/mpegts_to_s3
-COPY scripts/entrypoint.sh /app/entrypoint.sh
+COPY scripts/entrypoint_capture.sh /app/entrypoint.sh
 
 RUN /app/mpegts_to_s3 --version
 

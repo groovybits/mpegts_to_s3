@@ -26,7 +26,7 @@ RUN apt-get update && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /app/target/release/hls-to-udp /app/hls-to-udp
-COPY scripts/entrypoint-rebroadcast.sh /app/entrypoint.sh
+COPY scripts/entrypoint_replay.sh /app/entrypoint.sh
 
 RUN /app/hls-to-udp --version
 
