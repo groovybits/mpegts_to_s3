@@ -410,14 +410,14 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("30")
+                .default_value("500")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("history_size")
                 .short('s')
                 .long("history-size")
-                .default_value("2000")
+                .default_value("100")
                 .action(ArgAction::Set),
         )
         .get_matches();
@@ -428,12 +428,12 @@ fn main() -> Result<()> {
         .get_one::<String>("poll_ms")
         .unwrap()
         .parse::<u64>()
-        .unwrap_or(30);
+        .unwrap_or(500);
     let hist_cap = matches
         .get_one::<String>("history_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(2000);
+        .unwrap_or(100);
 
     println!("Starting streamer:");
     println!("  M3U8 URL: {}", m3u8_url);
