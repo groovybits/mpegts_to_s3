@@ -1,0 +1,7 @@
+[submodule "src/include/libltntstools"]
+	path = src/include/libltntstools
+	url = https://github.com/groovybits/libltntstools.git
+[submodule "src/include/FFmpeg"]
+	path = src/include/FFmpeg
+	url = https://github.com/groovybits/FFmpeg.git
+
