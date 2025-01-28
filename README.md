@@ -159,6 +159,9 @@ mpegts_to_s3 [OPTIONS]
   - `PCAP_PACKET_HEADER_SIZE`: Size of mpegts packet ip/eth header (default: `42`)
   - `PACAP_BUFFER_SIZE`: Size of the pcap buffer (default: `4194304`)
   - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `true`)
+  - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:3001/index.m3u8`)
+  - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
+  - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
 
 ---
 
