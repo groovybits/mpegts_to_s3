@@ -1,7 +1,7 @@
 [package]
 name = "mpegts_to_s3"
-version = "0.9.0"
-description = "MPEG-TS UDP PCAP Capture to S3/MinIO HLS VOD for MPEG-TS UDP Rebroadcast"
+version = "0.9.1"
+description = "MPEG-TS UDP Multicast to HLS VOD for UDP Re-cast from S3/MinIO Storage"
 keywords = ["mpegts", "s3", "hls", "udp"]
 categories = ["command-line-utilities"]
 readme = "README.md"

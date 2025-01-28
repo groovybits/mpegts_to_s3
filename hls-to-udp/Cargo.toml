@@ -1,8 +1,8 @@
 [package]
 name = "hls-to-udp"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
-description = "Fetch HLS segments and output as MPEG-TS over UDP."
+description = "HLS VOD to MPEG-TS UDP Re-cast."
 keywords = ["mpegts", "s3", "hls", "udp"]
 categories = ["command-line-utilities"]
 readme = "README.md"

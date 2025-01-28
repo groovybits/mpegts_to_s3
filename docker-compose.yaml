@@ -39,7 +39,7 @@ services:
     hostname: "mpegts-to-s3"
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.capture
       args:
         ENABLE_DEBUG: "false"
     container_name: "mpegts_to_s3"
@@ -62,7 +62,7 @@ services:
     hostname: "hls-to-udp"
     build:
       context: .
-      dockerfile: Dockerfile.rebroadcast
+      dockerfile: Dockerfile.replay
       args:
         ENABLE_DEBUG: "false"
     container_name: "hls_to_udp"
