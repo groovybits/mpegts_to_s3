@@ -148,7 +148,7 @@ udp-to-hls [OPTIONS]
   - `--diskless_mode`: Diskless mode avoids writing `.ts` segments to disk (default: `false`) requires --manual_segment arg.
 
 ### Environment Variables:
-  - `SEGMENT_DURATION_SECONDS`: Duration of each segment in seconds (default: `2`)
+  - `SEGMENT_DURATION_MS`: Duration of each segment in milliseconds (default: `1000`), (less than 1 second may not work well)
   - `FILE_MAX_AGE_SECONDS`: Maximum age of files in seconds to upload (default: `30`)
   - `URL_SIGNING_SECONDS`: Duration of signed URLs in seconds (default: `31104004`)
   - `MINIO_ROOT_USER`: S3 username / access key ID (default: `minioadmin`)
