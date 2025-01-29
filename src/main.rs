@@ -973,12 +973,6 @@ impl Drop for ManualSegmenter {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .format_timestamp_secs()
-        .init();
-    log::info!("MpegTStoS3: Logging initialized. Starting main()...");
-
     let matches = ClapCommand::new("mpegts_to_s3")
         .version(get_version())
         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
@@ -1069,6 +1063,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .help("Number of diskless segments to keep in memory ring buffer.")
                 .default_value("1"),
         )
+        .arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .default_value("0"),
+        )
         .get_matches();
 
     debug!("Command-line arguments parsed: {:?}", matches);
@@ -1084,6 +1084,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let remove_local = matches.get_flag("remove_local");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
     let diskless_mode = matches.get_flag("diskless_mode");
+    let verbose = matches.get_one::<String>("verbose").unwrap().parse().unwrap_or(0);
+    if verbose > 0 {
+        let log_level = match verbose {
+            1 => log::LevelFilter::Info,
+            2 => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        };
+        env_logger::Builder::new()
+            .filter_level(log_level)
+            .format_timestamp_secs()
+            .init();
+    } else {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Info)
+            .format_timestamp_secs()
+            .init();
+    }
+    log::info!("MpegTStoS3: Logging initialized. Starting main()...");
 
     let hls_keep_segments: usize = matches
         .get_one::<String>("hls_keep_segments")

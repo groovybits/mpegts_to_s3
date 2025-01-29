@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
+use env_logger;
+use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
@@ -9,12 +11,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, sleep, JoinHandle};
 use std::time::Duration;
 use url::Url;
-//use libltntstools_sys::*;
-use libltntstools::PcrSmoother;
 
-use env_logger;
-
-const UDP_RETRY_DELAY: Duration = Duration::from_millis(10);
+const UDP_RETRY_DELAY: Duration = Duration::from_millis(3);
 
 #[derive(Debug)]
 struct DownloadedSegment {
@@ -55,10 +53,10 @@ impl SegmentHistory {
 
 fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
     base.join(seg_path)
-        .map_err(|e| anyhow!("Failed URL join: {}", e))
+        .map_err(|e| anyhow!("ResolveSegmentUrl: Failed URL join: {}", e))
 }
 
-fn downloader_thread(
+fn receiver_thread(
     m3u8_url: String,
     poll_interval_ms: u64,
     hist_capacity: usize,
@@ -69,7 +67,7 @@ fn downloader_thread(
         let base_url = match Url::parse(&m3u8_url) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("Invalid M3U8 URL: {}", e);
+                eprintln!("ReceiverThread: Invalid M3U8 URL: {}", e);
                 return;
             }
         };
@@ -80,21 +78,21 @@ fn downloader_thread(
             let playlist_text = match client.get(&m3u8_url).send() {
                 Ok(r) => {
                     if !r.status().is_success() {
-                        eprintln!("M3U8 fetch HTTP error: {}", r.status());
+                        eprintln!("ReceiverThread: 3U8 fetch HTTP error: {}", r.status());
                         thread::sleep(Duration::from_millis(500));
                         continue;
                     }
                     match r.text() {
                         Ok(txt) => txt,
                         Err(e) => {
-                            eprintln!("M3U8 read error: {}", e);
+                            eprintln!("ReceiverThread: M3U8 read error: {}", e);
                             thread::sleep(Duration::from_millis(500));
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("M3U8 request error: {}", e);
+                    eprintln!("ReceiverThread: M3U8 request error: {}", e);
                     thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -104,12 +102,12 @@ fn downloader_thread(
             let media_pl = match parsed {
                 Ok(Playlist::MediaPlaylist(mp)) => mp,
                 Ok(_) => {
-                    eprintln!("Got Master/unknown playlist...");
+                    eprintln!("ReceiverThread: Got Master/unknown playlist...");
                     thread::sleep(Duration::from_millis(poll_interval_ms));
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("Parse error: {:?}, ignoring...", e);
+                    eprintln!("ReceiverThread: Parse error: {:?}, ignoring...", e);
                     thread::sleep(Duration::from_millis(poll_interval_ms));
                     continue;
                 }
@@ -125,28 +123,31 @@ fn downloader_thread(
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
                     Err(e) => {
-                        eprintln!("Bad segment URL: {}", e);
+                        eprintln!("ReceiverThread: Bad segment URL: {}", e);
                         continue;
                     }
                 };
-                println!("Downloading segment {} => {}", next_seg_id, seg_url);
+                println!(
+                    "ReceiverThread: Downloading segment {} => {}",
+                    next_seg_id, seg_url
+                );
 
                 let seg_bytes = match client.get(seg_url).send() {
                     Ok(resp) => {
                         if !resp.status().is_success() {
-                            eprintln!("Segment fetch error: {}", resp.status());
+                            eprintln!("ReceiverThread: Segment fetch error: {}", resp.status());
                             continue;
                         }
                         match resp.bytes() {
                             Ok(b) => b.to_vec(),
                             Err(e) => {
-                                eprintln!("Segment read err: {}", e);
+                                eprintln!("ReceiverThread: Segment read err: {}", e);
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Segment request error: {}", e);
+                        eprintln!("ReceiverThread: Segment request error: {}", e);
                         continue;
                     }
                 };
@@ -157,14 +158,14 @@ fn downloader_thread(
                     duration: seg.duration.into(),
                 };
                 if tx.send(seg_struct).is_err() {
-                    eprintln!("Receiver dropped, downloader exiting.");
+                    eprintln!("ReceiverThread: Receiver dropped, downloader exiting.");
                     return;
                 }
                 next_seg_id += 1;
             }
 
             if media_pl.end_list {
-                println!("ENDLIST found => done downloading.");
+                println!("ReceiverThread: ENDLIST found => done downloading.");
                 break;
             }
 
@@ -173,24 +174,29 @@ fn downloader_thread(
     })
 }
 
-fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandle<()> {
+fn sender_thread(
+    udp_addr: String,
+    latency: i32,
+    pcr_pid_arg: u16,
+    rx: Receiver<DownloadedSegment>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let sock = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("UDP bind error: {}", e);
+                eprintln!("SenderThread: UDP bind error: {}", e);
                 return;
             }
         };
 
         if let Err(e) = sock.connect(&udp_addr) {
-            eprintln!("Failed to connect UDP socket: {}", e);
+            eprintln!("SenderThread: Failed to connect UDP socket: {}", e);
             return;
         }
 
-        let callback = |v: Vec<u8>| {
+        let smoother_callback = |v: Vec<u8>| {
             log::debug!(
-                "Callback received buffer with {} bytes, sending to UDP.",
+                "SmootherCallback: received buffer with {} bytes, sending to UDP.",
                 v.len()
             );
             loop {
@@ -200,28 +206,110 @@ fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandl
                         sleep(UDP_RETRY_DELAY);
                     }
                     Err(e) => {
-                        eprintln!("UDP send error: {}", e);
+                        eprintln!("SmootherCallback: UDP send error: {}", e);
                         break;
                     }
                 }
             }
         };
-        let pcr_pid = 0x31;
-        let bitrate = 20000;
+        // setup channels to communicate pcr pid and bitrate to the smoother in the rx.recv() loop for setup
+        let (pcr_tx, pcr_rx) = mpsc::channel();
+        let sm_callback = move |v: Vec<u8>| {
+            // Ensure we have enough bytes for the pat_s struct
+            if v.len() < std::mem::size_of::<libltntstools_sys::pat_s>() {
+                log::error!("StreamModelCallback: not enough data for pat_s.");
+                return;
+            }
+
+            // Interpret bytes as a pat_s
+            let pat: libltntstools_sys::pat_s =
+                unsafe { std::ptr::read_unaligned(v.as_ptr() as *const libltntstools_sys::pat_s) };
+
+            log::info!(
+                "StreamModelCallback: received PAT with length {} bytes.",
+                v.len()
+            );
+
+            if pat.program_count > 0 {
+                log::info!(
+                    "StreamModelCallback: PAT has {} programs.",
+                    pat.program_count
+                );
+                for i in 0..pat.program_count {
+                    let p = &pat.programs[i as usize];
+                    log::info!(
+                        "StreamModelCallback: Program #{}: PID: 0x{:x}",
+                        i,
+                        p.program_number
+                    );
+                    if p.pmt.PCR_PID > 0 {
+                        log::info!(
+                            "StreamModelCallback: Program #{}: PCR PID: 0x{:x}",
+                            i,
+                            p.pmt.PCR_PID
+                        );
+                        if let Err(e) = pcr_tx.send(p.pmt.PCR_PID) {
+                            log::error!(
+                                "StreamModelCallback: Failed to send PCR to smoother: {}",
+                                e
+                            );
+                        }
+                        break; // Only one program handled for now
+                    }
+                }
+            } else {
+                log::error!("StreamModelCallback: PAT has no programs.");
+                return;
+            }
+        };
+
+        let mut model = StreamModel::new(sm_callback);
+
+        let mut pcr_pid = pcr_pid_arg; // FIXME: hardcoded for now, need to autodetect, streammodel doesn't do the callback????
+        let rate = 5000;
         let pkt_size = 1316;
-        let latency_ms = 50;
-        let mut smoother = PcrSmoother::new(pcr_pid, bitrate, pkt_size, latency_ms, callback);
+        let latency_ms = latency;
+        let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
         while let Ok(seg) = rx.recv() {
             log::debug!(
-                "Sender processing segment #{} of {}bytes and {}s duration",
+                "SenderThread: processing segment #{} of {}bytes and {}s duration",
                 seg.id,
                 seg.data.len(),
                 seg.duration
             );
-            let _ = smoother.write(&seg.data);
+
+            // write the segment to the model for the pcr pid detection if not given
+            if pcr_pid_arg <= 0 {
+                let _ = model.write(&seg.data);
+                if let Ok(pcr_pid_detected) = pcr_rx.try_recv() {
+                    if pcr_pid != pcr_pid_detected as u16 {
+                        log::info!("SenderThread: received new PCR PID: {}", pcr_pid_detected);
+                        pcr_pid = pcr_pid_detected as u16;
+                    }
+                }
+            }
+
+            // Send to the smoother if we have a pcr pid
+            if pcr_pid > 0 {
+                // setup smoother if not already setup
+                if smoother.is_none() {
+                    smoother = Some(PcrSmoother::new(
+                        pcr_pid,
+                        rate,
+                        pkt_size,
+                        latency_ms,
+                        Box::new(smoother_callback),
+                    ));
+                }
+                if let Some(ref mut s) = smoother {
+                    let _ = s.write(&seg.data);
+                }
+            }
         }
-        println!("Sender thread exiting.");
+        drop(smoother);
+        drop(model);
+        println!("SenderThread: exiting.");
     })
 }
 
@@ -230,11 +318,6 @@ fn get_version() -> &'static str {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .format_timestamp_secs()
-        .init();
-    log::info!("HLStoUDP: Logging initialized. Starting main()...");
     let matches = ClapCommand::new("hls-udp-streamer")
         .version(get_version())
         .about("HLS to UDP streamer with PCR/duration-based timing")
@@ -266,8 +349,40 @@ fn main() -> Result<()> {
                 .default_value("32")
                 .action(ArgAction::Set),
         )
+        .arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .default_value("0")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("latency")
+                .short('l')
+                .long("latency")
+                .default_value("100")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("pcr_pid")
+                .short('c')
+                .long("pcr-pid")
+                .default_value("0x00")
+                .action(ArgAction::Set),
+        )
         .get_matches();
 
+    let latency = matches
+        .get_one::<String>("latency")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(100);
+    let pcr_pid_str = matches.get_one::<String>("pcr_pid").unwrap();
+    let pcr_pid = if pcr_pid_str.starts_with("0x") {
+        u16::from_str_radix(&pcr_pid_str[2..], 16).unwrap_or(0x00)
+    } else {
+        pcr_pid_str.parse::<u16>().unwrap_or(0x00)
+    };
     let m3u8_url = matches.get_one::<String>("m3u8_url").unwrap().clone();
     let udp_out = matches.get_one::<String>("udp_output").unwrap().clone();
     let poll_ms = matches
@@ -280,16 +395,40 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<usize>()
         .unwrap_or(32);
+    let verbose = matches
+        .get_one::<String>("verbose")
+        .unwrap()
+        .parse::<u8>()
+        .unwrap_or(0);
+    if verbose > 0 {
+        let log_level = match verbose {
+            1 => log::LevelFilter::Info,
+            2 => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        };
+        env_logger::Builder::new()
+            .filter_level(log_level)
+            .format_timestamp_secs()
+            .init();
+    } else {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Info)
+            .format_timestamp_secs()
+            .init();
+    }
+    log::info!("HLStoUDP: Logging initialized. Starting main()...");
 
     println!("Starting streamer:");
     println!("  M3U8 URL: {}", m3u8_url);
     println!("  UDP Target: {}", udp_out);
     println!("  Poll Interval: {} ms", poll_ms);
     println!("  History Size: {}", hist_cap);
+    println!("  Latency: {} ms", latency);
+    println!("  PCR PID: 0x{:x}", pcr_pid);
 
     let (tx, rx) = mpsc::channel();
-    let dl_handle = downloader_thread(m3u8_url, poll_ms, hist_cap, tx);
-    let sender_handle = sender_thread(udp_out, rx);
+    let dl_handle = receiver_thread(m3u8_url, poll_ms, hist_cap, tx);
+    let sender_handle = sender_thread(udp_out, latency, pcr_pid, rx);
 
     dl_handle.join().ok();
     sender_handle.join().ok();
