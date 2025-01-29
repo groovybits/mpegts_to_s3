@@ -8,6 +8,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant};
 use url::Url;
+use libltntstools_sys::*;
+use libltntstools::PcrSmoother;
 
 use env_logger;
 
