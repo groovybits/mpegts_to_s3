@@ -24,5 +24,5 @@ log = "0.4.25"
 m3u8-rs = "6"
 reqwest = { version = "0.11", features = ["blocking"] }
 url = "2.2"
-ibltntstools-sys = { git = "https://github.com/LTNGlobal-opensource/libltntstools" }
+libltntstools-sys = { git = "https://github.com/LTNGlobal-opensource/libltntstools" }
 libltntstools = { git = "https://github.com/LTNGlobal-opensource/libltntstools" }
