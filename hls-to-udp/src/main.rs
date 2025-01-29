@@ -267,7 +267,7 @@ fn sender_thread(
             );
 
             // write the segment to the model for the pcr pid detection if not given
-            if pcr_pid_arg <= 0 {
+            if pcr_pid <= 0 {
                 let _ = model.write(&seg.data);
                 if let Ok(pcr_pid_detected) = pcr_rx.try_recv() {
                     if pcr_pid != pcr_pid_detected as u16 {
