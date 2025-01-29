@@ -214,21 +214,8 @@ fn sender_thread(
         };
         // setup channels to communicate pcr pid and bitrate to the smoother in the rx.recv() loop for setup
         let (pcr_tx, pcr_rx) = mpsc::channel();
-        let sm_callback = move |v: Vec<u8>| {
-            // Ensure we have enough bytes for the pat_s struct
-            if v.len() < std::mem::size_of::<libltntstools_sys::pat_s>() {
-                log::error!("StreamModelCallback: not enough data for pat_s.");
-                return;
-            }
-
-            // Interpret bytes as a pat_s
-            let pat: libltntstools_sys::pat_s =
-                unsafe { std::ptr::read_unaligned(v.as_ptr() as *const libltntstools_sys::pat_s) };
-
-            log::info!(
-                "StreamModelCallback: received PAT with length {} bytes.",
-                v.len()
-            );
+        let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
+            log::info!("StreamModelCallback: received PAT.");
 
             if pat.program_count > 0 {
                 log::info!(
