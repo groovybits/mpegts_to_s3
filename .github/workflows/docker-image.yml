@@ -17,12 +17,12 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: recursive
-    - name: Build the Docker image
-      run: |
-        IMAGE_TAG=$(date +%s)
-        docker build . --file Dockerfile --tag groovybits/mpegts_to_s3:$IMAGE_TAG
-    - name: Push the Docker image to Docker Hub
-      run: |
-        IMAGE_TAG=$(date +%s)
-        docker push groovybits/mpegts_to_s3:$IMAGE_TAG
 
+    - name: Set up environment variables
+      run: echo "IMAGE_TAG=$(date +%s)" >> $GITHUB_ENV
+
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag groovybits/mpegts_to_s3:${{ env.IMAGE_TAG }}
+
+    - name: Push the Docker image to Docker Hub
+      run: docker push groovybits/mpegts_to_s3:${{ env.IMAGE_TAG }}
