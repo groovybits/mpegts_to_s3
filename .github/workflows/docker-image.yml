@@ -24,5 +24,8 @@ jobs:
     - name: Build the Docker image
       run: docker build . --file Dockerfile --tag groovybits/mpegts_to_s3:${{ env.IMAGE_TAG }}
 
+    - name: Log in to Docker Hub
+      run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
     - name: Push the Docker image to Docker Hub
       run: docker push groovybits/mpegts_to_s3:${{ env.IMAGE_TAG }}
