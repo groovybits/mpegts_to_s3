@@ -79,21 +79,21 @@ fn receiver_thread(
                 Ok(r) => {
                     if !r.status().is_success() {
                         eprintln!("ReceiverThread: 3U8 fetch HTTP error: {}", r.status());
-                        thread::sleep(Duration::from_millis(500));
+                        thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     match r.text() {
                         Ok(txt) => txt,
                         Err(e) => {
                             eprintln!("ReceiverThread: M3U8 read error: {}", e);
-                            thread::sleep(Duration::from_millis(500));
+                            thread::sleep(Duration::from_millis(100));
                             continue;
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("ReceiverThread: M3U8 request error: {}", e);
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(Duration::from_millis(100));
                     continue;
                 }
             };
@@ -326,7 +326,7 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("500")
+                .default_value("100")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -376,7 +376,7 @@ fn main() -> Result<()> {
         .get_one::<String>("poll_ms")
         .unwrap()
         .parse::<u64>()
-        .unwrap_or(500);
+        .unwrap_or(100);
     let hist_cap = matches
         .get_one::<String>("history_size")
         .unwrap()
