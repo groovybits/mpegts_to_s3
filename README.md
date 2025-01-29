@@ -40,7 +40,7 @@ vim config.env
 podman-compose up --build
 ```
 
-There is a container at `docker.io/groovybits/mpeg_to_s3:latest` which can be used.
+There is a container at `docker.io/groovybits/mpegts_to_s3:latest` which can be used.
 
 ## Quick Start Guide (Local Build)
 
