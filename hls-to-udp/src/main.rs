@@ -6,13 +6,12 @@ use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::net::UdpSocket;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, sleep, JoinHandle};
 use std::time::Duration;
 use url::Url;
 
-const UDP_RETRY_DELAY: Duration = Duration::from_millis(3);
+const UDP_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
 struct DownloadedSegment {
@@ -60,7 +59,7 @@ fn receiver_thread(
     m3u8_url: String,
     poll_interval_ms: u64,
     hist_capacity: usize,
-    tx: Sender<DownloadedSegment>,
+    tx: SyncSender<DownloadedSegment>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let client = Client::new();
@@ -180,41 +179,102 @@ fn sender_thread(
     pcr_pid_arg: u16,
     pkt_size: i32,
     rate: i32,
+    udp_queue_size: usize,
     rx: Receiver<DownloadedSegment>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut pcr_pid = pcr_pid_arg;
-        let sock = match UdpSocket::bind("0.0.0.0:0") {
+        // Create raw socket with socket2
+        let socket = match socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("SenderThread: UDP bind error: {}", e);
+                eprintln!("SenderThread: Socket creation error: {}", e);
                 return;
             }
         };
+
+        // Configure socket before converting to std::net::UdpSocket
+        let desired_send_buffer = 2 * 1024 * 1024; // 2MB
+        if let Err(e) = socket.set_send_buffer_size(desired_send_buffer) {
+            eprintln!("SenderThread: Failed to set send buffer: {}", e);
+        }
+
+        // Get actual buffer size
+        match socket.send_buffer_size() {
+            Ok(actual) => {
+                if actual < desired_send_buffer {
+                    log::warn!(
+                        "OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.",
+                        actual / 1024,
+                        desired_send_buffer / 1024
+                    );
+                }
+            }
+            Err(e) => eprintln!("SenderThread: Couldn't get buffer size: {}", e),
+        }
+
+        // Convert to stdlib socket
+        let sock: std::net::UdpSocket = socket.into();
+
+        // Set non-blocking mode to prevent send from blocking
+        if let Err(e) = sock.set_nonblocking(false) {
+            eprintln!("SenderThread: Failed to set non-blocking socket: {}", e);
+            return;
+        }
 
         if let Err(e) = sock.connect(&udp_addr) {
             eprintln!("SenderThread: Failed to connect UDP socket: {}", e);
             return;
         }
 
+        // setup channels for smoother callback to use to send data to a udp sending thread
+        let (smother_tx, smother_rx) = mpsc::sync_channel(udp_queue_size);
         let smoother_callback = |v: Vec<u8>| {
             log::debug!(
                 "SmootherCallback: received buffer with {} bytes, sending to UDP.",
                 v.len()
             );
-            loop {
-                match sock.send(v.as_slice()) {
-                    Ok(_) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Err(e) = smother_tx.send(v) {
+                log::error!(
+                    "SmootherCallback: Failed to send buffer to UDP thread: {}",
+                    e
+                );
+            }
+        };
+
+        // smoother thread to send data to UDP from the packets sent from the smoother callback smoother_tx
+        thread::spawn(move || {
+            while let Ok(data) = smother_rx.recv() {
+                log::debug!(
+                    "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
+                    data.len()
+                );
+                let mut retries = 0;
+                let max_retries = 3;
+                loop {
+                    if let Err(e) = sock.send(&data) {
+                        log::error!("SmootherThread: UDP send error: {}", e);
+                        if retries >= max_retries {
+                            log::error!(
+                                "SmootherThread: UDP send failed after {} retries, dropping packet.",
+                                max_retries
+                            );
+                            break;
+                        }
+                        retries += 1;
                         sleep(UDP_RETRY_DELAY);
-                    }
-                    Err(e) => {
-                        eprintln!("SmootherCallback: UDP send error: {}", e);
+                    } else {
                         break;
                     }
                 }
             }
-        };
+            log::info!("SmootherThread: exiting.");
+        });
+
         // setup channels to communicate pcr pid and bitrate to the smoother in the rx.recv() loop for setup
         let (pcr_tx, pcr_rx) = mpsc::channel();
 
@@ -348,7 +408,7 @@ fn main() -> Result<()> {
             Arg::new("latency")
                 .short('l')
                 .long("latency")
-                .default_value("100")
+                .default_value("1000")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -372,8 +432,44 @@ fn main() -> Result<()> {
                 .default_value("1316")
                 .action(ArgAction::Set),
         )
+        .arg(
+            Arg::new("segment_queue_size")
+                .short('q')
+                .long("segment-queue-size")
+                .default_value("32")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("udp_queue_size")
+                .short('z')
+                .long("udp-queue-size")
+                .default_value("1024")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("max_bitrate")
+                .long("max-bitrate")
+                .help("Maximum output bitrate in kbps")
+                .default_value("5000"),
+        )
+        .arg(
+            Arg::new("max_burst")
+                .long("max-burst")
+                .help("Maximum burst size in kilobytes")
+                .default_value("1000"),
+        )
         .get_matches();
 
+    let udp_queue_size = matches
+        .get_one::<String>("udp_queue_size")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(1024);
+    let segment_queue_size = matches
+        .get_one::<String>("segment_queue_size")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(32);
     let pkt_size = matches
         .get_one::<String>("packet_size")
         .unwrap()
@@ -388,7 +484,7 @@ fn main() -> Result<()> {
         .get_one::<String>("latency")
         .unwrap()
         .parse::<i32>()
-        .unwrap_or(100);
+        .unwrap_or(1000);
     let pcr_pid_str = matches.get_one::<String>("pcr_pid").unwrap();
     let pcr_pid = if pcr_pid_str.starts_with("0x") {
         u16::from_str_radix(&pcr_pid_str[2..], 16).unwrap_or(0x00)
@@ -431,6 +527,7 @@ fn main() -> Result<()> {
     log::info!("HLStoUDP: Logging initialized. Starting main()...");
 
     println!("Starting streamer:");
+    println!("  Version: {}", get_version());
     println!("  M3U8 URL: {}", m3u8_url);
     println!("  UDP Target: {}", udp_out);
     println!("  Poll Interval: {} ms", poll_ms);
@@ -439,10 +536,21 @@ fn main() -> Result<()> {
     println!("  PCR PID: 0x{:x}", pcr_pid);
     println!("  Rate: {}", rate);
     println!("  Packet Size: {} bytes", pkt_size);
+    println!("  Verbose: {}", verbose);
+    println!("  Segment Queue Size: {}", segment_queue_size);
+    println!("  UDP Queue Size: {}", udp_queue_size);
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let dl_handle = receiver_thread(m3u8_url, poll_ms, hist_cap, tx);
-    let sender_handle = sender_thread(udp_out, latency, pcr_pid, pkt_size, rate, rx);
+    let sender_handle = sender_thread(
+        udp_out,
+        latency,
+        pcr_pid,
+        pkt_size,
+        rate,
+        udp_queue_size,
+        rx,
+    );
 
     dl_handle.join().ok();
     sender_handle.join().ok();
