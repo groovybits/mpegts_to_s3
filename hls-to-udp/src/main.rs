@@ -307,7 +307,7 @@ fn get_version() -> &'static str {
 fn main() -> Result<()> {
     let matches = ClapCommand::new("hls-udp-streamer")
         .version(get_version())
-        .about("HLS to UDP streamer with PCR/duration-based timing")
+        .about("HLS to UDP relay using LibLTNTSTools StreamModel and Smoother")
         .arg(
             Arg::new("m3u8_url")
                 .short('u')

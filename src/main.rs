@@ -35,11 +35,11 @@ use env_logger;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
-fn get_segment_duration_ms() -> u64 {
+fn get_segment_duration_ms() -> f64 {
     std::env::var("SEGMENT_DURATION_MS")
-        .unwrap_or_else(|_| "500".to_string())
+        .unwrap_or_else(|_| "2000.0".to_string())
         .parse()
-        .unwrap_or(500)
+        .unwrap_or(2000.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
@@ -121,12 +121,12 @@ fn get_version() -> &'static str {
 
 /// Utility: Attempt to get the actual duration from file creation/modification times.
 /// Fallback to environment-based default if we can't measure it.
-fn get_actual_file_duration(path: &Path) -> u64 {
+fn get_actual_file_duration(path: &Path) -> f64 {
     if let Ok(metadata) = path.metadata() {
         if let Ok(created_time) = metadata.created() {
             if let Ok(modified_time) = metadata.modified() {
                 if let Ok(elapsed) = modified_time.duration_since(created_time) {
-                    return elapsed.as_millis() as u64;
+                    return elapsed.as_millis() as f64;
                 }
             }
         }
@@ -222,12 +222,12 @@ impl HourlyIndexCreator {
                     .iter()
                     .map(|e| e.duration.ceil() as u64)
                     .max()
-                    .unwrap_or(get_segment_duration_ms());
+                    .unwrap_or(get_segment_duration_ms() as u64);
                 max_seg
             } else {
-                get_segment_duration_ms()
+                get_segment_duration_ms() as u64
             };
-            let target_duration_secs = target_duration_ms as f64 / 1000.0 + 1.0;
+            let target_duration_secs = target_duration_ms / 1000;
             writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration_secs)?;
 
             let media_seq = if let Some(vec) = entries {
@@ -898,7 +898,7 @@ impl ManualSegmenter {
             .write(true)
             .truncate(true)
             .open(&self.playlist_path)?;
-        let duration_secs = get_segment_duration_ms() as f64 / 1000.0 + 1.0;
+        let duration_secs = get_segment_duration_ms() / 1000.0 + 1.0;
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
@@ -926,8 +926,8 @@ impl ManualSegmenter {
             .iter()
             .map(|e| e.duration.ceil() as u64)
             .max()
-            .unwrap_or_else(|| get_segment_duration_ms());
-        let max_seg_secs = max_seg_ms as f64 / 1000.0 + 1.0;
+            .unwrap_or_else(|| get_segment_duration_ms() as u64);
+        let max_seg_secs = max_seg_ms / 1000;
         writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg_secs)?;
 
         let seq_start = self
@@ -1436,7 +1436,7 @@ async fn handle_file_events(
 
                             // Compute the segment duration
                             let pcr_dur_path = path.with_extension("dur");
-                            let actual_segment_duration = if pcr_dur_path.exists() {
+                            let actual_segment_duration_ms = if pcr_dur_path.exists() {
                                 if let Ok(dur_str) = fs::read_to_string(&pcr_dur_path) {
                                     dur_str
                                         .parse()
@@ -1457,7 +1457,7 @@ async fn handle_file_events(
                                     .record_segment(
                                         &hour_dir,
                                         &key_str,
-                                        actual_segment_duration as f64 / 1000.0,
+                                        actual_segment_duration_ms / 1000.0,
                                         custom_lines,
                                         &output_dir,
                                     )

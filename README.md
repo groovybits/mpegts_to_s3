@@ -172,6 +172,7 @@ udp-to-hls [OPTIONS]
    - **Manually segments** streams by directly processing MPEG-TS packets
 3. **Upload:** A directory watcher uploads new `.ts` segments and playlists to S3 or MinIO.
 4. **Playback:** The uploaded segments are accessible via signed or unsigned URLs, enabling HLS playback.
+5. **Relay:** The hls-to-udp relay can be used to replay the content back as a multicast stream later or in real-time.
 
 ---
 
