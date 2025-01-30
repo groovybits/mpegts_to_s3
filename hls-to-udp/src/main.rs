@@ -7,7 +7,7 @@ use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::net::UdpSocket;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, sleep, JoinHandle};
 use std::time::Duration;
 use url::Url;
@@ -60,7 +60,7 @@ fn receiver_thread(
     m3u8_url: String,
     poll_interval_ms: u64,
     hist_capacity: usize,
-    tx: Sender<DownloadedSegment>,
+    tx: SyncSender<DownloadedSegment>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let client = Client::new();
@@ -180,6 +180,7 @@ fn sender_thread(
     pcr_pid_arg: u16,
     pkt_size: i32,
     rate: i32,
+    udp_queue_size: usize,
     rx: Receiver<DownloadedSegment>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -193,7 +194,7 @@ fn sender_thread(
         };
 
         // Set non-blocking mode to prevent send from blocking
-        if let Err(e) = sock.set_nonblocking(true) {
+        if let Err(e) = sock.set_nonblocking(false) {
             eprintln!("SenderThread: Failed to set non-blocking socket: {}", e);
             return;
         }
@@ -204,7 +205,7 @@ fn sender_thread(
         }
 
         // setup channels for smoother callback to use to send data to a udp sending thread
-        let (smother_tx, smother_rx) = mpsc::channel();
+        let (smother_tx, smother_rx) = mpsc::sync_channel(udp_queue_size);
         let smoother_callback = |v: Vec<u8>| {
             log::debug!(
                 "SmootherCallback: received buffer with {} bytes, sending to UDP.",
@@ -226,28 +227,21 @@ fn sender_thread(
                     data.len()
                 );
                 let mut retries = 0;
-                let max_retries = 10;
+                let max_retries = 3;
                 loop {
-                    match sock.send(data.as_slice()) {
-                        Ok(_) => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            retries += 1;
-                            if retries >= max_retries {
-                                log::error!(
-                                    "SmootherThread: Max retries reached, dropping packet."
-                                );
-                                break;
-                            }
-                            log::warn!(
-                                "SmootherThread: UDP send would block, retrying in {}ms...",
-                                UDP_RETRY_DELAY.as_millis()
+                    if let Err(e) = sock.send(&data) {
+                        log::error!("SmootherThread: UDP send error: {}", e);
+                        if retries >= max_retries {
+                            log::error!(
+                                "SmootherThread: UDP send failed after {} retries, dropping packet.",
+                                max_retries
                             );
-                            sleep(UDP_RETRY_DELAY);
-                        }
-                        Err(e) => {
-                            log::error!("SmootherThread: UDP send error: {}", e);
                             break;
                         }
+                        retries += 1;
+                        sleep(UDP_RETRY_DELAY);
+                    } else {
+                        break;
                     }
                 }
             }
@@ -411,8 +405,32 @@ fn main() -> Result<()> {
                 .default_value("1316")
                 .action(ArgAction::Set),
         )
+        .arg(
+            Arg::new("segment_queue_size")
+                .short('q')
+                .long("segment-queue-size")
+                .default_value("32")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("udp_queue_size")
+                .short('z')
+                .long("udp-queue-size")
+                .default_value("1024")
+                .action(ArgAction::Set),
+        )
         .get_matches();
 
+    let udp_queue_size = matches
+        .get_one::<String>("udp_queue_size")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(1024);
+    let segment_queue_size = matches
+        .get_one::<String>("segment_queue_size")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(32);
     let pkt_size = matches
         .get_one::<String>("packet_size")
         .unwrap()
@@ -478,10 +496,13 @@ fn main() -> Result<()> {
     println!("  PCR PID: 0x{:x}", pcr_pid);
     println!("  Rate: {}", rate);
     println!("  Packet Size: {} bytes", pkt_size);
+    println!("  Verbose: {}", verbose);
+    println!("  Segment Queue Size: {}", segment_queue_size);
+    println!("  UDP Queue Size: {}", udp_queue_size);
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let dl_handle = receiver_thread(m3u8_url, poll_ms, hist_cap, tx);
-    let sender_handle = sender_thread(udp_out, latency, pcr_pid, pkt_size, rate, rx);
+    let sender_handle = sender_thread(udp_out, latency, pcr_pid, pkt_size, rate, udp_queue_size, rx);
 
     dl_handle.join().ok();
     sender_handle.join().ok();
