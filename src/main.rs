@@ -44,16 +44,16 @@ fn get_segment_duration_ms() -> f64 {
 
 fn get_max_segment_size_bytes() -> usize {
     std::env::var("MAX_SEGMENT_SIZE_BYTES")
-        .unwrap_or_else(|_| "100000000".to_string())
+        .unwrap_or_else(|_| "25000000".to_string())
         .parse()
-        .unwrap_or(50_000_000)
+        .unwrap_or(25_000_000)
 }
 
 fn get_file_max_age_seconds() -> u64 {
     std::env::var("FILE_MAX_AGE_SECONDS")
-        .unwrap_or_else(|_| "30".to_string())
+        .unwrap_or_else(|_| "5".to_string())
         .parse()
-        .unwrap_or(300)
+        .unwrap_or(5)
 }
 
 fn get_url_signing_seconds() -> u64 {
@@ -217,7 +217,7 @@ impl HourlyIndexCreator {
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
 
-            let target_duration_ms = if let Some(vec) = entries {
+            let target_duration_secs = if let Some(vec) = entries {
                 let max_seg = vec
                     .iter()
                     .map(|e| e.duration.ceil() as u64)
@@ -225,9 +225,8 @@ impl HourlyIndexCreator {
                     .unwrap_or(get_segment_duration_ms() as u64);
                 max_seg
             } else {
-                get_segment_duration_ms() as u64
+                get_segment_duration_ms() as u64 / 1000
             };
-            let target_duration_secs = target_duration_ms / 1000;
             writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration_secs)?;
 
             let media_seq = if let Some(vec) = entries {
@@ -898,7 +897,7 @@ impl ManualSegmenter {
             .write(true)
             .truncate(true)
             .open(&self.playlist_path)?;
-        let duration_secs = get_segment_duration_ms() / 1000.0 + 1.0;
+        let duration_secs = get_segment_duration_ms() as u64 / 1000;
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
@@ -921,13 +920,12 @@ impl ManualSegmenter {
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
 
-        let max_seg_ms = self
+        let max_seg_secs = self
             .playlist_entries
             .iter()
             .map(|e| e.duration.ceil() as u64)
             .max()
-            .unwrap_or_else(|| get_segment_duration_ms() as u64);
-        let max_seg_secs = max_seg_ms / 1000;
+            .unwrap_or_else(|| get_segment_duration_ms() as u64 / 1000);
         writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg_secs)?;
 
         let seq_start = self
@@ -1042,7 +1040,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("hls_keep_segments")
                 .long("hls_keep_segments")
                 .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
-                .default_value("10"),
+                .default_value("3"),
         )
         .arg(
             Arg::new("unsigned_urls")
@@ -1111,7 +1109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .get_one::<String>("hls_keep_segments")
         .unwrap()
         .parse()
-        .unwrap_or(10);
+        .unwrap_or(3);
 
     let diskless_ring_size: usize = matches
         .get_one::<String>("diskless_ring_size")
@@ -1378,7 +1376,7 @@ async fn handle_file_events(
 
                             // Wait for the file to stabilize
                             if !full_path_str.starts_with("mem://") {
-                                let mut retries = 30;
+                                let mut retries = 90;
                                 let mut stable_count = 0;
                                 let mut last_size = 0;
 
@@ -1394,7 +1392,7 @@ async fn handle_file_events(
                                             }
                                         }
                                     }
-                                    sleep(Duration::from_millis(300)).await;
+                                    sleep(Duration::from_millis(100)).await;
                                     retries -= 1;
                                 }
 

@@ -333,7 +333,7 @@ fn main() -> Result<()> {
             Arg::new("history_size")
                 .short('s')
                 .long("history-size")
-                .default_value("32")
+                .default_value("1800")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -381,7 +381,7 @@ fn main() -> Result<()> {
         .get_one::<String>("history_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(32);
+        .unwrap_or(1800);
     let verbose = matches
         .get_one::<String>("verbose")
         .unwrap()
