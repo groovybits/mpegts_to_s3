@@ -6,7 +6,7 @@ ENV ENABLE_DEBUG=${ENABLE_DEBUG:-false}
 
 # avoid resource issues
 ARG JOBS
-ENV JOBS=${JOBS:-$(nproc)}
+ENV JOBS=${JOBS:-32}
 ENV CARGO_BUILD_JOBS=${JOBS}
 
 ## Base probe app in /app directory
