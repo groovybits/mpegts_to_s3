@@ -531,7 +531,8 @@ struct ManualSegmenter {
 
 impl ManualSegmenter {
     fn new(output_dir: &str) -> Self {
-        let playlist_path = Path::new("").join("index.m3u8");
+        let playlist_file = format!("{}.m3u8", output_dir);
+        let playlist_path = Path::new("").join(&playlist_file);
         Self {
             output_dir: output_dir.to_string(),
             current_ts_file: None,
@@ -736,7 +737,7 @@ impl ManualSegmenter {
             let mut final_path = format!("mem://segment_{}", self.segment_index + 1);
             if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
                 let segment_path = self.current_segment_path(self.segment_index + 1);
-                let object_key = format!("{}", segment_path.to_string_lossy());
+                let object_key = format!("{}/{}", self.output_dir, segment_path.to_string_lossy());
                 info!(
                     "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
                     object_key,
@@ -1027,7 +1028,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("output_dir")
                 .short('o')
                 .long("output_dir")
-                .default_value("ts")
+                .default_value("channel01")
                 .help("Local dir for HLS output"),
         )
         .arg(

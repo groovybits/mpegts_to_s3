@@ -23,23 +23,27 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother [https://github.co
 
 ## Usage
 
-1. Help output:
-    ```sh
-    HLS to UDP relay using LibLTNTSTools StreamModel and Smoother
+    | hls-to-udp [OPTIONS] --m3u8-url <m3u8_url> --udp-output <udp_output_port:udp_output_ip>
+    |
+    | Option                               | Description                                 | Default  |
+    |--------------------------------------|---------------------------------------------|----------|
+    | **-u, --m3u8-url <m3u8_url>**        | The URL of the M3U8 playlist                | (none)   |
+    | **-o, --udp-output <udp_output>**    | The destination UDP address                 | (none)   |
+    | **-p, --poll-ms <poll_ms>**          | The poll interval in milliseconds           | 100      |
+    | **-s, --history-size <history_size>**| The number of segments to retain            | 1800     |
+    | **-v, --verbose <verbose>**          | Verbose mode                                | 0        |
+    | **-l, --latency <latency>**          | Additional latency in milliseconds          | 100      |
+    | **-c, --pcr-pid <pcr_pid>**          | PID to use for PCR timestamps               | 0x00     |
+    | **-r, --rate <rate>**                | Bitrate in kbps                             | 5000     |
+    | **-k, --packet-size <packet_size>**  | TS packet size in bytes                     | 1316     |
+    | **-h, --help**                       | Print help                                  | -        |
+    | **-V, --version**                    | Print version                               | -        |
 
-    Usage: hls-to-udp [OPTIONS] --m3u8-url <m3u8_url> --udp-output <udp_output>
+## Environment Variables
 
-    Options:
-    -u, --m3u8-url <m3u8_url>
-    -o, --udp-output <udp_output>
-    -p, --poll-ms <poll_ms>            [default: 100]
-    -s, --history-size <history_size>  [default: 32]
-    -v, --verbose <verbose>            [default: 0]
-    -l, --latency <latency>            [default: 100]
-    -c, --pcr-pid <pcr_pid>            [default: 0x00]
-    -h, --help                         Print help
-    -V, --version                      Print version
-    ```
+    - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:3001/channel01.m3u8`)
+    - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
+    - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
 
 ## Example
 

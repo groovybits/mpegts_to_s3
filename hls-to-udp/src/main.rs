@@ -178,9 +178,12 @@ fn sender_thread(
     udp_addr: String,
     latency: i32,
     pcr_pid_arg: u16,
+    pkt_size: i32,
+    rate: i32,
     rx: Receiver<DownloadedSegment>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let mut pcr_pid = pcr_pid_arg;
         let sock = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
             Err(e) => {
@@ -214,6 +217,8 @@ fn sender_thread(
         };
         // setup channels to communicate pcr pid and bitrate to the smoother in the rx.recv() loop for setup
         let (pcr_tx, pcr_rx) = mpsc::channel();
+
+        // setup callback for stream model to detect pcr pid
         let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
             log::info!("StreamModelCallback: received PAT.");
 
@@ -252,10 +257,6 @@ fn sender_thread(
 
         let mut model = StreamModel::new(sm_callback);
 
-        let mut pcr_pid = pcr_pid_arg; // FIXME: hardcoded for now, need to autodetect, streammodel doesn't do the callback????
-        let rate = 5000;
-        let pkt_size = 1316;
-        let latency_ms = latency;
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
         while let Ok(seg) = rx.recv() {
@@ -285,7 +286,7 @@ fn sender_thread(
                         pcr_pid,
                         rate,
                         pkt_size,
-                        latency_ms,
+                        latency,
                         Box::new(smoother_callback),
                     ));
                 }
@@ -357,8 +358,32 @@ fn main() -> Result<()> {
                 .default_value("0x00")
                 .action(ArgAction::Set),
         )
+        .arg(
+            Arg::new("rate")
+                .short('r')
+                .long("rate")
+                .default_value("5000")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("packet_size")
+                .short('k')
+                .long("packet-size")
+                .default_value("1316")
+                .action(ArgAction::Set),
+        )
         .get_matches();
 
+    let pkt_size = matches
+        .get_one::<String>("packet_size")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(1316);
+    let rate = matches
+        .get_one::<String>("rate")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(5000);
     let latency = matches
         .get_one::<String>("latency")
         .unwrap()
@@ -412,10 +437,12 @@ fn main() -> Result<()> {
     println!("  History Size: {}", hist_cap);
     println!("  Latency: {} ms", latency);
     println!("  PCR PID: 0x{:x}", pcr_pid);
+    println!("  Rate: {}", rate);
+    println!("  Packet Size: {} bytes", pkt_size);
 
     let (tx, rx) = mpsc::channel();
     let dl_handle = receiver_thread(m3u8_url, poll_ms, hist_cap, tx);
-    let sender_handle = sender_thread(udp_out, latency, pcr_pid, rx);
+    let sender_handle = sender_thread(udp_out, latency, pcr_pid, pkt_size, rate, rx);
 
     dl_handle.join().ok();
     sender_handle.join().ok();

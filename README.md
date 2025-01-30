@@ -128,26 +128,27 @@ SEGMENT_DURATION_SECONDS=2 \
 
 ## Usage
 
-```bash
-udp-to-hls [OPTIONS]
-```
-### Options:
-- **General Settings:**
-  - `-e`, `--endpoint`: S3-compatible endpoint (default: `http://127.0.0.1:9000`)
-  - `-r`, `--region`: S3 region (default: `us-east-1`)
-  - `-b`, `--bucket`: S3 bucket name (default: `ltnhls`)
-- **UDP Stream Capture:**
-  - `-i`, `--udp_ip`: Multicast IP to filter (default: `227.1.1.102`)
-  - `-p`, `--udp_port`: UDP port to filter (default: `4102`)
-  - `-n`, `--interface`: Network interface for packet capture (default: `net1`)
-  - `-t`, `--timeout`: Packet capture timeout in milliseconds (default: `1000`)
-- **HLS Output:**
-  - `-o`, `--output_dir`: Local directory for HLS output (default: `ts`)
-  - `--remove_local`: Remove local `.ts` and `.m3u8` files after upload
-  - `--hls_keep_segments`: Number of segments to keep in the `.m3u8` index (0 = unlimited, default: `10`)
-  - `--diskless_mode`: Diskless mode avoids writing `.ts` segments to disk (default: `false`) requires --manual_segment arg.
+   | Option                                 | Description                                                  | Default                  |
+   |----------------------------------------|--------------------------------------------------------------|--------------------------|
+   | -e, --endpoint <endpoint>              | S3-compatible endpoint                                       | http://127.0.0.1:9000    |
+   | -r, --region <region>                  | S3 region                                                    | us-east-1                |
+   | -b, --bucket <bucket>                  | S3 bucket name                                               | hls                      |
+   | -i, --udp_ip <udp_ip>                  | UDP multicast IP to filter                                   | 227.1.1.102              |
+   | -p, --udp_port <udp_port>              | UDP port to filter                                           | 4102                     |
+   | -n, --interface <interface>            | Network interface for pcap                                   | net1                     |
+   | -t, --timeout <timeout>                | Capture timeout in milliseconds                              | 1000                     |
+   | -o, --output_dir <output_dir>          | Local dir for HLS output and Channel Name/Key                | channel01                |
+   | --remove_local                         | Remove local .ts/.m3u8 after uploading?                      |                          |
+   | --hls_keep_segments <hls_keep_segments>| Max segments kept in ${output_Dir}.m3u8                      | 3                        |
+   | --unsigned_urls                        | Generate unsigned S3 URLs instead of presigned URLs          |                          |
+   | --diskless_mode                        | Keep TS segments in memory only                              |                          |
+   | --diskless_ring_size <diskless_rs>     | Number of segments in memory buffer                          | 1                        |
+   | -v, --verbose <verbose>                | Verbose level                                                | 0                        |
+   | -h, --help                             | Print help                                                   |                          |
+   | -V, --version                          | Print version                                                |                          |
 
 ### Environment Variables:
+  - `CHANNEL_NAME`: Name of the channel (default: `channel01`) used as the subdirectory for HLS ts segments
   - `SEGMENT_DURATION_MS`: Duration of each segment in milliseconds (default: `1000`), (less than 1 second may not work well)
   - `FILE_MAX_AGE_SECONDS`: Maximum age of files in seconds to upload (default: `30`)
   - `URL_SIGNING_SECONDS`: Duration of signed URLs in seconds (default: `31104004`)
@@ -158,7 +159,7 @@ udp-to-hls [OPTIONS]
   - `PCAP_PACKET_HEADER_SIZE`: Size of mpegts packet ip/eth header (default: `42`)
   - `PACAP_BUFFER_SIZE`: Size of the pcap buffer (default: `4194304`)
   - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `true`)
-  - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:3001/index.m3u8`)
+  - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:3001/channel01.m3u8`)
   - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
   - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
 
