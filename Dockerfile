@@ -28,16 +28,15 @@ RUN dnf install -yq almalinux-release-synergy
 RUN dnf groupinstall -yq "Development Tools"
 RUN dnf install -yq gcc-toolset-13 scl-utils
 
-RUN dnf install -yq zlib-devel openssl-devel clang clang-devel \
-    libpcap-devel nasm \
+RUN dnf install -yq zlib-devel openssl-devel clang clang-devel libpcap-devel nasm \
     libzen-devel librdkafka-devel ncurses-devel libdvbpsi-devel bzip2-devel libcurl-devel;
 
 ## Copy files needed for builds
 COPY Makefile .
 COPY Cargo.toml .
 COPY src/main.rs src/main.rs
-COPY src/include/FFmpeg src/include/FFmpeg
-COPY src/include/libltntstools src/include/libltntstools
+#COPY src/include/FFmpeg src/include/FFmpeg
+#COPY src/include/libltntstools src/include/libltntstools
 COPY hls-to-udp/src/main.rs hls-to-udp/src/main.rs
 COPY hls-to-udp/Cargo.toml hls-to-udp/Cargo.toml
 
@@ -46,11 +45,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 ## Build FFmpeg for libltntstools
-RUN scl enable gcc-toolset-13 -- make -j $JOBS ffmpeg
+#RUN scl enable gcc-toolset-13 -- make -j $JOBS ffmpeg
 
 ## Build LibLTNtsTools and copy libs to /usr/lib
-RUN scl enable gcc-toolset-13 -- make -j $JOBS libltntstools && \
-    cp -R src/include/libltntstools/target-root/ /usr/
+#RUN scl enable gcc-toolset-13 -- make -j $JOBS libltntstools && \
+#    cp -R src/include/libltntstools/target-root/ /usr/
 
 ## Build programs
 RUN scl enable gcc-toolset-13 -- make build -j $JOBS && \
@@ -72,8 +71,8 @@ ENV PATH="/app/bin:${PATH}"
 ## Alma Release Synergy GRPC and Protobuf
 RUN microdnf update -y > /dev/null
 RUN microdnf install -y almalinux-release-synergy > /dev/null
-RUN microdnf install -y libpcap \
-        libzen librdkafka ncurses libdvbpsi bzip2 > /dev/null
+RUN microdnf install -y libpcap  > /dev/null
+# libzen librdkafka ncurses libdvbpsi bzip2 > /dev/null
 
 WORKDIR /app/hls
 

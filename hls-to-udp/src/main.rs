@@ -203,31 +203,57 @@ fn sender_thread(
             return;
         }
 
+        // setup channels for smoother callback to use to send data to a udp sending thread
+        let (smother_tx, smother_rx) = mpsc::channel();
         let smoother_callback = |v: Vec<u8>| {
             log::debug!(
                 "SmootherCallback: received buffer with {} bytes, sending to UDP.",
                 v.len()
             );
-            let mut retries = 0;
-            let max_retries = 5;
-            loop {
-                match sock.send(v.as_slice()) {
-                    Ok(_) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        retries += 1;
-                        if retries >= max_retries {
-                            log::error!("SmootherCallback: Max retries reached, dropping packet.");
+            if let Err(e) = smother_tx.send(v) {
+                log::error!(
+                    "SmootherCallback: Failed to send buffer to UDP thread: {}",
+                    e
+                );
+            }
+        };
+
+        // smoother thread to send data to UDP from the packets sent from the smoother callback smoother_tx
+        thread::spawn(move || {
+            while let Ok(data) = smother_rx.recv() {
+                log::debug!(
+                    "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
+                    data.len()
+                );
+                let mut retries = 0;
+                let max_retries = 10;
+                loop {
+                    match sock.send(data.as_slice()) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            retries += 1;
+                            if retries >= max_retries {
+                                log::error!(
+                                    "SmootherThread: Max retries reached, dropping packet."
+                                );
+                                break;
+                            }
+                            log::warn!(
+                                "SmootherThread: UDP send would block, retrying in {}ms...",
+                                UDP_RETRY_DELAY.as_millis()
+                            );
+                            sleep(UDP_RETRY_DELAY);
+                        }
+                        Err(e) => {
+                            log::error!("SmootherThread: UDP send error: {}", e);
                             break;
                         }
-                        sleep(UDP_RETRY_DELAY);
-                    }
-                    Err(e) => {
-                        eprintln!("SmootherCallback: UDP send error: {}", e);
-                        break;
                     }
                 }
             }
-        };
+            log::info!("SmootherThread: exiting.");
+        });
+
         // setup channels to communicate pcr pid and bitrate to the smoother in the rx.recv() loop for setup
         let (pcr_tx, pcr_rx) = mpsc::channel();
 
@@ -361,7 +387,7 @@ fn main() -> Result<()> {
             Arg::new("latency")
                 .short('l')
                 .long("latency")
-                .default_value("100")
+                .default_value("1000")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -401,7 +427,7 @@ fn main() -> Result<()> {
         .get_one::<String>("latency")
         .unwrap()
         .parse::<i32>()
-        .unwrap_or(100);
+        .unwrap_or(1000);
     let pcr_pid_str = matches.get_one::<String>("pcr_pid").unwrap();
     let pcr_pid = if pcr_pid_str.starts_with("0x") {
         u16::from_str_radix(&pcr_pid_str[2..], 16).unwrap_or(0x00)
