@@ -12,7 +12,7 @@ use std::thread::{self, sleep, JoinHandle};
 use std::time::Duration;
 use url::Url;
 
-const UDP_RETRY_DELAY: Duration = Duration::from_millis(3);
+const UDP_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
 struct DownloadedSegment {
@@ -192,6 +192,12 @@ fn sender_thread(
             }
         };
 
+        // Set non-blocking mode to prevent send from blocking
+        if let Err(e) = sock.set_nonblocking(true) {
+            eprintln!("SenderThread: Failed to set non-blocking socket: {}", e);
+            return;
+        }
+
         if let Err(e) = sock.connect(&udp_addr) {
             eprintln!("SenderThread: Failed to connect UDP socket: {}", e);
             return;
@@ -202,10 +208,17 @@ fn sender_thread(
                 "SmootherCallback: received buffer with {} bytes, sending to UDP.",
                 v.len()
             );
+            let mut retries = 0;
+            let max_retries = 5;
             loop {
                 match sock.send(v.as_slice()) {
                     Ok(_) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        retries += 1;
+                        if retries >= max_retries {
+                            log::error!("SmootherCallback: Max retries reached, dropping packet.");
+                            break;
+                        }
                         sleep(UDP_RETRY_DELAY);
                     }
                     Err(e) => {
