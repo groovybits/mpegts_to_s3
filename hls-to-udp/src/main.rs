@@ -6,7 +6,6 @@ use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::net::UdpSocket;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, sleep, JoinHandle};
 use std::time::Duration;
@@ -185,13 +184,41 @@ fn sender_thread(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut pcr_pid = pcr_pid_arg;
-        let sock = match UdpSocket::bind("0.0.0.0:0") {
+        // Create raw socket with socket2
+        let socket = match socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("SenderThread: UDP bind error: {}", e);
+                eprintln!("SenderThread: Socket creation error: {}", e);
                 return;
             }
         };
+
+        // Configure socket before converting to std::net::UdpSocket
+        let desired_send_buffer = 2 * 1024 * 1024; // 2MB
+        if let Err(e) = socket.set_send_buffer_size(desired_send_buffer) {
+            eprintln!("SenderThread: Failed to set send buffer: {}", e);
+        }
+
+        // Get actual buffer size
+        match socket.send_buffer_size() {
+            Ok(actual) => {
+                if actual < desired_send_buffer {
+                    log::warn!(
+                        "OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.",
+                        actual / 1024,
+                        desired_send_buffer / 1024
+                    );
+                }
+            }
+            Err(e) => eprintln!("SenderThread: Couldn't get buffer size: {}", e),
+        }
+
+        // Convert to stdlib socket
+        let sock: std::net::UdpSocket = socket.into();
 
         // Set non-blocking mode to prevent send from blocking
         if let Err(e) = sock.set_nonblocking(false) {
@@ -419,6 +446,18 @@ fn main() -> Result<()> {
                 .default_value("1024")
                 .action(ArgAction::Set),
         )
+        .arg(
+            Arg::new("max_bitrate")
+                .long("max-bitrate")
+                .help("Maximum output bitrate in kbps")
+                .default_value("5000"),
+        )
+        .arg(
+            Arg::new("max_burst")
+                .long("max-burst")
+                .help("Maximum burst size in kilobytes")
+                .default_value("1000"),
+        )
         .get_matches();
 
     let udp_queue_size = matches
@@ -488,6 +527,7 @@ fn main() -> Result<()> {
     log::info!("HLStoUDP: Logging initialized. Starting main()...");
 
     println!("Starting streamer:");
+    println!("  Version: {}", get_version());
     println!("  M3U8 URL: {}", m3u8_url);
     println!("  UDP Target: {}", udp_out);
     println!("  Poll Interval: {} ms", poll_ms);
@@ -502,7 +542,15 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let dl_handle = receiver_thread(m3u8_url, poll_ms, hist_cap, tx);
-    let sender_handle = sender_thread(udp_out, latency, pcr_pid, pkt_size, rate, udp_queue_size, rx);
+    let sender_handle = sender_thread(
+        udp_out,
+        latency,
+        pcr_pid,
+        pkt_size,
+        rate,
+        udp_queue_size,
+        rx,
+    );
 
     dl_handle.join().ok();
     sender_handle.join().ok();

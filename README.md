@@ -148,6 +148,9 @@ SEGMENT_DURATION_SECONDS=2 \
    | -V, --version                          | Print version                                                |                          |
 
 ### Environment Variables:
+
+#### mpegts-to-s3 Environment Variables:
+
   - `CHANNEL_NAME`: Name of the channel (default: `channel01`) used as the subdirectory for HLS ts segments
   - `SEGMENT_DURATION_MS`: Duration of each segment in milliseconds (default: `1000`), (less than 1 second may not work well)
   - `FILE_MAX_AGE_SECONDS`: Maximum age of files in seconds to upload (default: `30`)
@@ -159,9 +162,13 @@ SEGMENT_DURATION_SECONDS=2 \
   - `PCAP_PACKET_HEADER_SIZE`: Size of mpegts packet ip/eth header (default: `42`)
   - `PACAP_BUFFER_SIZE`: Size of the pcap buffer (default: `4194304`)
   - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `true`)
+
+#### hls-to-udp Environment Variables:
+
   - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:3001/channel01.m3u8`)
   - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
   - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
+  - `SMOOTHER_LATENCY`: Bitrate Smoother latency in milliseconds (default: `1000`)
 
 ---
 
