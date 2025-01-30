@@ -1,19 +1,18 @@
 use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
+use env_logger;
+use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
+use std::io::Write;
 use std::net::UdpSocket;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, sleep, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use url::Url;
 
-use env_logger;
-
-const TS_PACKET_SIZE: usize = 188;
-const MAX_UDP_BITRATE: f64 = 30_000_000.0; // 30 Mbps max
-const UDP_RETRY_DELAY: Duration = Duration::from_millis(10);
+const UDP_RETRY_DELAY: Duration = Duration::from_millis(3);
 
 #[derive(Debug)]
 struct DownloadedSegment {
@@ -54,180 +53,10 @@ impl SegmentHistory {
 
 fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
     base.join(seg_path)
-        .map_err(|e| anyhow!("Failed URL join: {}", e))
+        .map_err(|e| anyhow!("ResolveSegmentUrl: Failed URL join: {}", e))
 }
 
-fn parse_pcr(ts_packet: &[u8]) -> Option<u64> {
-    if ts_packet.len() != TS_PACKET_SIZE || ts_packet[0] != 0x47 {
-        return None;
-    }
-    let afc = (ts_packet[3] >> 4) & 0b11;
-    if afc == 0b00 || afc == 0b01 {
-        return None;
-    }
-    let adapt_len = ts_packet[4] as usize;
-    if adapt_len == 0 || (adapt_len + 5) > ts_packet.len() {
-        return None;
-    }
-    let flags = ts_packet[5];
-    if (flags & 0x10) == 0 {
-        return None;
-    }
-    if adapt_len < 7 {
-        return None;
-    }
-    if 6 + 6 > ts_packet.len() {
-        return None;
-    }
-
-    let p = &ts_packet[6..12];
-    let pcr_base = ((p[0] as u64) << 25)
-        | ((p[1] as u64) << 17)
-        | ((p[2] as u64) << 9)
-        | ((p[3] as u64) << 1)
-        | ((p[4] as u64) >> 7);
-    let pcr_ext = (((p[4] & 0x01) as u64) << 8) | (p[5] as u64);
-
-    let total_90k = pcr_base * 300 + pcr_ext;
-    Some(total_90k)
-}
-
-struct BitrateEstimator {
-    average_bitrate: f64,
-    alpha: f64,
-}
-
-impl BitrateEstimator {
-    fn new() -> Self {
-        Self {
-            average_bitrate: 4_000_000.0,
-            alpha: 0.2,
-        }
-    }
-
-    fn update(&mut self, bytes: usize, duration: f64) {
-        if duration > 0.0 {
-            let bitrate = (bytes as f64 * 8.0) / duration;
-            self.average_bitrate = self.alpha * bitrate + (1.0 - self.alpha) * self.average_bitrate;
-        }
-    }
-
-    fn current_bitrate(&self) -> f64 {
-        self.average_bitrate.min(MAX_UDP_BITRATE)
-    }
-}
-
-fn send_segment(
-    sock: &UdpSocket,
-    segment_data: &[u8],
-    last_pcr: &mut Option<u64>,
-    segment_duration: f64,
-    current_bitrate: f64,
-) -> Result<()> {
-    let num_packets = segment_data.len() / TS_PACKET_SIZE;
-    let mut any_pcr = false;
-
-    let mut offset_check = 0;
-    while offset_check + TS_PACKET_SIZE <= segment_data.len() {
-        let packet = &segment_data[offset_check..offset_check + TS_PACKET_SIZE];
-        if parse_pcr(packet).is_some() {
-            any_pcr = true;
-            break;
-        }
-        offset_check += TS_PACKET_SIZE;
-    }
-
-    if any_pcr {
-        let mut offset = 0;
-        while offset + TS_PACKET_SIZE <= segment_data.len() {
-            let packet = &segment_data[offset..offset + TS_PACKET_SIZE];
-            offset += TS_PACKET_SIZE;
-
-            if let Some(cur) = parse_pcr(packet) {
-                if let Some(prev) = *last_pcr {
-                    if cur > prev {
-                        let diff = cur - prev;
-                        let diff_secs = diff as f64 / 90_000.0;
-                        if diff_secs > 0.0 && diff_secs < 2.0 {
-                            sleep(Duration::from_secs_f64(diff_secs));
-                        }
-                    }
-                }
-                *last_pcr = Some(cur);
-            }
-
-            loop {
-                match sock.send(packet) {
-                    Ok(_) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        sleep(UDP_RETRY_DELAY);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-    } else if segment_duration > 0.0 && num_packets > 0 {
-        let calculated_duration =
-            segment_duration.max((segment_data.len() as f64 * 8.0) / current_bitrate);
-
-        let time_per_packet = calculated_duration / num_packets as f64;
-        let start_time = Instant::now();
-        let mut offset = 0;
-
-        for i in 0..num_packets {
-            let target_time = start_time + Duration::from_secs_f64(i as f64 * time_per_packet);
-
-            let packet = &segment_data[offset..offset + TS_PACKET_SIZE];
-            loop {
-                match sock.send(packet) {
-                    Ok(_) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        sleep(UDP_RETRY_DELAY);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            offset += TS_PACKET_SIZE;
-
-            let now = Instant::now();
-            if let Some(remaining) = target_time.checked_duration_since(now) {
-                sleep(remaining);
-            }
-        }
-    } else {
-        let packet_size_bits = (TS_PACKET_SIZE * 8) as f64;
-        let interval = packet_size_bits / current_bitrate;
-        let mut offset = 0;
-
-        while (offset + TS_PACKET_SIZE ) <= segment_data.len() {
-            let send_start = Instant::now();
-            let packet = &segment_data[offset..offset + TS_PACKET_SIZE];
-
-            loop {
-                match sock.send(packet) {
-                    Ok(_) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        sleep(UDP_RETRY_DELAY);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            offset += TS_PACKET_SIZE;
-
-            let elapsed = send_start.elapsed();
-            let target_duration = Duration::from_secs_f64(interval);
-            if let Some(remaining) = target_duration.checked_sub(elapsed) {
-                sleep(remaining);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn downloader_thread(
+fn receiver_thread(
     m3u8_url: String,
     poll_interval_ms: u64,
     hist_capacity: usize,
@@ -238,7 +67,7 @@ fn downloader_thread(
         let base_url = match Url::parse(&m3u8_url) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("Invalid M3U8 URL: {}", e);
+                eprintln!("ReceiverThread: Invalid M3U8 URL: {}", e);
                 return;
             }
         };
@@ -249,22 +78,22 @@ fn downloader_thread(
             let playlist_text = match client.get(&m3u8_url).send() {
                 Ok(r) => {
                     if !r.status().is_success() {
-                        eprintln!("M3U8 fetch HTTP error: {}", r.status());
-                        thread::sleep(Duration::from_millis(500));
+                        eprintln!("ReceiverThread: 3U8 fetch HTTP error: {}", r.status());
+                        thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     match r.text() {
                         Ok(txt) => txt,
                         Err(e) => {
-                            eprintln!("M3U8 read error: {}", e);
-                            thread::sleep(Duration::from_millis(500));
+                            eprintln!("ReceiverThread: M3U8 read error: {}", e);
+                            thread::sleep(Duration::from_millis(100));
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("M3U8 request error: {}", e);
-                    thread::sleep(Duration::from_millis(500));
+                    eprintln!("ReceiverThread: M3U8 request error: {}", e);
+                    thread::sleep(Duration::from_millis(100));
                     continue;
                 }
             };
@@ -273,12 +102,12 @@ fn downloader_thread(
             let media_pl = match parsed {
                 Ok(Playlist::MediaPlaylist(mp)) => mp,
                 Ok(_) => {
-                    eprintln!("Got Master/unknown playlist...");
+                    eprintln!("ReceiverThread: Got Master/unknown playlist...");
                     thread::sleep(Duration::from_millis(poll_interval_ms));
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("Parse error: {:?}, ignoring...", e);
+                    eprintln!("ReceiverThread: Parse error: {:?}, ignoring...", e);
                     thread::sleep(Duration::from_millis(poll_interval_ms));
                     continue;
                 }
@@ -294,28 +123,31 @@ fn downloader_thread(
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
                     Err(e) => {
-                        eprintln!("Bad segment URL: {}", e);
+                        eprintln!("ReceiverThread: Bad segment URL: {}", e);
                         continue;
                     }
                 };
-                println!("Downloading segment {} => {}", next_seg_id, seg_url);
+                println!(
+                    "ReceiverThread: Downloading segment {} => {}",
+                    next_seg_id, seg_url
+                );
 
                 let seg_bytes = match client.get(seg_url).send() {
                     Ok(resp) => {
                         if !resp.status().is_success() {
-                            eprintln!("Segment fetch error: {}", resp.status());
+                            eprintln!("ReceiverThread: Segment fetch error: {}", resp.status());
                             continue;
                         }
                         match resp.bytes() {
                             Ok(b) => b.to_vec(),
                             Err(e) => {
-                                eprintln!("Segment read err: {}", e);
+                                eprintln!("ReceiverThread: Segment read err: {}", e);
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Segment request error: {}", e);
+                        eprintln!("ReceiverThread: Segment request error: {}", e);
                         continue;
                     }
                 };
@@ -326,14 +158,14 @@ fn downloader_thread(
                     duration: seg.duration.into(),
                 };
                 if tx.send(seg_struct).is_err() {
-                    eprintln!("Receiver dropped, downloader exiting.");
+                    eprintln!("ReceiverThread: Receiver dropped, downloader exiting.");
                     return;
                 }
                 next_seg_id += 1;
             }
 
             if media_pl.end_list {
-                println!("ENDLIST found => done downloading.");
+                println!("ReceiverThread: ENDLIST found => done downloading.");
                 break;
             }
 
@@ -342,40 +174,130 @@ fn downloader_thread(
     })
 }
 
-fn sender_thread(udp_addr: String, rx: Receiver<DownloadedSegment>) -> JoinHandle<()> {
+fn sender_thread(
+    udp_addr: String,
+    latency: i32,
+    pcr_pid_arg: u16,
+    pkt_size: i32,
+    rate: i32,
+    rx: Receiver<DownloadedSegment>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
+        let mut pcr_pid = pcr_pid_arg;
         let sock = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("UDP bind error: {}", e);
+                eprintln!("SenderThread: UDP bind error: {}", e);
                 return;
             }
         };
 
         if let Err(e) = sock.connect(&udp_addr) {
-            eprintln!("Failed to connect UDP socket: {}", e);
+            eprintln!("SenderThread: Failed to connect UDP socket: {}", e);
             return;
         }
 
-        let mut last_pcr: Option<u64> = None;
-        let mut bitrate_estimator = BitrateEstimator::new();
+        let smoother_callback = |v: Vec<u8>| {
+            log::debug!(
+                "SmootherCallback: received buffer with {} bytes, sending to UDP.",
+                v.len()
+            );
+            loop {
+                match sock.send(v.as_slice()) {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(UDP_RETRY_DELAY);
+                    }
+                    Err(e) => {
+                        eprintln!("SmootherCallback: UDP send error: {}", e);
+                        break;
+                    }
+                }
+            }
+        };
+        // setup channels to communicate pcr pid and bitrate to the smoother in the rx.recv() loop for setup
+        let (pcr_tx, pcr_rx) = mpsc::channel();
+
+        // setup callback for stream model to detect pcr pid
+        let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
+            log::info!("StreamModelCallback: received PAT.");
+
+            if pat.program_count > 0 {
+                log::info!(
+                    "StreamModelCallback: PAT has {} programs.",
+                    pat.program_count
+                );
+                for i in 0..pat.program_count {
+                    let p = &pat.programs[i as usize];
+                    log::info!(
+                        "StreamModelCallback: Program #{}: PID: 0x{:x}",
+                        i,
+                        p.program_number
+                    );
+                    if p.pmt.PCR_PID > 0 {
+                        log::info!(
+                            "StreamModelCallback: Program #{}: PCR PID: 0x{:x}",
+                            i,
+                            p.pmt.PCR_PID
+                        );
+                        if let Err(e) = pcr_tx.send(p.pmt.PCR_PID) {
+                            log::error!(
+                                "StreamModelCallback: Failed to send PCR to smoother: {}",
+                                e
+                            );
+                        }
+                        break; // Only one program handled for now
+                    }
+                }
+            } else {
+                log::error!("StreamModelCallback: PAT has no programs.");
+                return;
+            }
+        };
+
+        let mut model = StreamModel::new(sm_callback);
+
+        let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
         while let Ok(seg) = rx.recv() {
-            println!("Sender processing segment #{}", seg.id);
-            bitrate_estimator.update(seg.data.len(), seg.duration);
+            log::debug!(
+                "SenderThread: processing segment #{} of {}bytes and {}s duration",
+                seg.id,
+                seg.data.len(),
+                seg.duration
+            );
 
-            if let Err(e) = send_segment(
-                &sock,
-                &seg.data,
-                &mut last_pcr,
-                seg.duration,
-                bitrate_estimator.current_bitrate(),
-            ) {
-                eprintln!("Critical send error: {}", e);
-                break;
+            // write the segment to the model for the pcr pid detection if not given
+            if pcr_pid <= 0 {
+                let _ = model.write(&seg.data);
+                if let Ok(pcr_pid_detected) = pcr_rx.try_recv() {
+                    if pcr_pid != pcr_pid_detected as u16 {
+                        log::info!("SenderThread: received new PCR PID: {}", pcr_pid_detected);
+                        pcr_pid = pcr_pid_detected as u16;
+                    }
+                }
+            }
+
+            // Send to the smoother if we have a pcr pid
+            if pcr_pid > 0 {
+                // setup smoother if not already setup
+                if smoother.is_none() {
+                    smoother = Some(PcrSmoother::new(
+                        pcr_pid,
+                        rate,
+                        pkt_size,
+                        latency,
+                        Box::new(smoother_callback),
+                    ));
+                }
+                if let Some(ref mut s) = smoother {
+                    let _ = s.write(&seg.data);
+                }
             }
         }
-        println!("Sender thread exiting.");
+        drop(smoother);
+        drop(model);
+        println!("SenderThread: exiting.");
     })
 }
 
@@ -384,14 +306,9 @@ fn get_version() -> &'static str {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .format_timestamp_secs()
-        .init();
-    log::info!("HLStoUDP: Logging initialized. Starting main()...");
     let matches = ClapCommand::new("hls-udp-streamer")
         .version(get_version())
-        .about("HLS to UDP streamer with PCR/duration-based timing")
+        .about("HLS to UDP relay using LibLTNTSTools StreamModel and Smoother")
         .arg(
             Arg::new("m3u8_url")
                 .short('u')
@@ -410,40 +327,122 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("500")
+                .default_value("100")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("history_size")
                 .short('s')
                 .long("history-size")
+                .default_value("1800")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .default_value("0")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("latency")
+                .short('l')
+                .long("latency")
                 .default_value("100")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("pcr_pid")
+                .short('c')
+                .long("pcr-pid")
+                .default_value("0x00")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("rate")
+                .short('r')
+                .long("rate")
+                .default_value("5000")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("packet_size")
+                .short('k')
+                .long("packet-size")
+                .default_value("1316")
                 .action(ArgAction::Set),
         )
         .get_matches();
 
+    let pkt_size = matches
+        .get_one::<String>("packet_size")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(1316);
+    let rate = matches
+        .get_one::<String>("rate")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(5000);
+    let latency = matches
+        .get_one::<String>("latency")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(100);
+    let pcr_pid_str = matches.get_one::<String>("pcr_pid").unwrap();
+    let pcr_pid = if pcr_pid_str.starts_with("0x") {
+        u16::from_str_radix(&pcr_pid_str[2..], 16).unwrap_or(0x00)
+    } else {
+        pcr_pid_str.parse::<u16>().unwrap_or(0x00)
+    };
     let m3u8_url = matches.get_one::<String>("m3u8_url").unwrap().clone();
     let udp_out = matches.get_one::<String>("udp_output").unwrap().clone();
     let poll_ms = matches
         .get_one::<String>("poll_ms")
         .unwrap()
         .parse::<u64>()
-        .unwrap_or(500);
+        .unwrap_or(100);
     let hist_cap = matches
         .get_one::<String>("history_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(100);
+        .unwrap_or(1800);
+    let verbose = matches
+        .get_one::<String>("verbose")
+        .unwrap()
+        .parse::<u8>()
+        .unwrap_or(0);
+    if verbose > 0 {
+        let log_level = match verbose {
+            1 => log::LevelFilter::Info,
+            2 => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        };
+        env_logger::Builder::new()
+            .filter_level(log_level)
+            .format_timestamp_secs()
+            .init();
+    } else {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Info)
+            .format_timestamp_secs()
+            .init();
+    }
+    log::info!("HLStoUDP: Logging initialized. Starting main()...");
 
     println!("Starting streamer:");
     println!("  M3U8 URL: {}", m3u8_url);
     println!("  UDP Target: {}", udp_out);
     println!("  Poll Interval: {} ms", poll_ms);
     println!("  History Size: {}", hist_cap);
+    println!("  Latency: {} ms", latency);
+    println!("  PCR PID: 0x{:x}", pcr_pid);
+    println!("  Rate: {}", rate);
+    println!("  Packet Size: {} bytes", pkt_size);
 
     let (tx, rx) = mpsc::channel();
-    let dl_handle = downloader_thread(m3u8_url, poll_ms, hist_cap, tx);
-    let sender_handle = sender_thread(udp_out, rx);
+    let dl_handle = receiver_thread(m3u8_url, poll_ms, hist_cap, tx);
+    let sender_handle = sender_thread(udp_out, latency, pcr_pid, pkt_size, rate, rx);
 
     dl_handle.join().ok();
     sender_handle.join().ok();

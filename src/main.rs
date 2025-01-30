@@ -35,25 +35,25 @@ use env_logger;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
-fn get_segment_duration_seconds() -> u64 {
-    std::env::var("SEGMENT_DURATION_SECONDS")
-        .unwrap_or_else(|_| "2".to_string())
+fn get_segment_duration_ms() -> f64 {
+    std::env::var("SEGMENT_DURATION_MS")
+        .unwrap_or_else(|_| "2000.0".to_string())
         .parse()
-        .unwrap_or(2)
+        .unwrap_or(2000.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
     std::env::var("MAX_SEGMENT_SIZE_BYTES")
-        .unwrap_or_else(|_| "100000000".to_string())
+        .unwrap_or_else(|_| "25000000".to_string())
         .parse()
-        .unwrap_or(50_000_000)
+        .unwrap_or(25_000_000)
 }
 
 fn get_file_max_age_seconds() -> u64 {
     std::env::var("FILE_MAX_AGE_SECONDS")
-        .unwrap_or_else(|_| "30".to_string())
+        .unwrap_or_else(|_| "5".to_string())
         .parse()
-        .unwrap_or(300)
+        .unwrap_or(5)
 }
 
 fn get_url_signing_seconds() -> u64 {
@@ -126,12 +126,12 @@ fn get_actual_file_duration(path: &Path) -> f64 {
         if let Ok(created_time) = metadata.created() {
             if let Ok(modified_time) = metadata.modified() {
                 if let Ok(elapsed) = modified_time.duration_since(created_time) {
-                    return elapsed.as_secs_f64();
+                    return elapsed.as_millis() as f64;
                 }
             }
         }
     }
-    get_segment_duration_seconds() as f64
+    get_segment_duration_ms()
 }
 
 // ------------- HOURLY INDEX CREATOR -------------
@@ -217,17 +217,17 @@ impl HourlyIndexCreator {
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
 
-            let target_duration = if let Some(vec) = entries {
+            let target_duration_secs = if let Some(vec) = entries {
                 let max_seg = vec
                     .iter()
                     .map(|e| e.duration.ceil() as u64)
                     .max()
-                    .unwrap_or(get_segment_duration_seconds());
+                    .unwrap_or(get_segment_duration_ms() as u64);
                 max_seg
             } else {
-                get_segment_duration_seconds()
+                get_segment_duration_ms() as u64 / 1000
             };
-            writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration)?;
+            writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration_secs)?;
 
             let media_seq = if let Some(vec) = entries {
                 vec.iter().map(|e| e.sequence_id).min().unwrap_or(0)
@@ -531,7 +531,8 @@ struct ManualSegmenter {
 
 impl ManualSegmenter {
     fn new(output_dir: &str) -> Self {
-        let playlist_path = Path::new("").join("index.m3u8");
+        let playlist_file = format!("{}.m3u8", output_dir);
+        let playlist_path = Path::new("").join(&playlist_file);
         Self {
             output_dir: output_dir.to_string(),
             current_ts_file: None,
@@ -628,7 +629,8 @@ impl ManualSegmenter {
         self.bytes_this_segment += data.len() as u64;
 
         // Do a simple "close if wall clock or byte-based logic says so"
-        let desired_secs = get_segment_duration_seconds() as f64;
+        let desired_ms = get_segment_duration_ms() as f64;
+        let desired_secs = desired_ms / 1000.0;
         let now = Instant::now();
         let elapsed_wall = self
             .segment_open_time
@@ -669,8 +671,8 @@ impl ManualSegmenter {
                 .map(|st| Instant::now().duration_since(st).as_secs_f64())
                 .unwrap_or(0.0)
         } else {
-            let d = get_segment_duration_seconds() as f64;
-            d + 1.0
+            let d = get_segment_duration_ms() as f64;
+            d / 1000.0
         };
 
         // round up real_elapsed to nearest second
@@ -735,7 +737,7 @@ impl ManualSegmenter {
             let mut final_path = format!("mem://segment_{}", self.segment_index + 1);
             if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
                 let segment_path = self.current_segment_path(self.segment_index + 1);
-                let object_key = format!("{}", segment_path.to_string_lossy());
+                let object_key = format!("{}/{}", self.output_dir, segment_path.to_string_lossy());
                 info!(
                     "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
                     object_key,
@@ -896,14 +898,11 @@ impl ManualSegmenter {
             .write(true)
             .truncate(true)
             .open(&self.playlist_path)?;
+        let duration_secs = get_segment_duration_ms() as u64 / 1000;
 
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
-        writeln!(
-            f,
-            "#EXT-X-TARGETDURATION:{}",
-            get_segment_duration_seconds() + 1
-        )?;
+        writeln!(f, "#EXT-X-TARGETDURATION:{}", duration_secs)?;
         writeln!(f, "#EXT-X-MEDIA-SEQUENCE:0")?;
         Ok(())
     }
@@ -922,13 +921,13 @@ impl ManualSegmenter {
         writeln!(f, "#EXTM3U")?;
         writeln!(f, "#EXT-X-VERSION:3")?;
 
-        let max_seg = self
+        let max_seg_secs = self
             .playlist_entries
             .iter()
             .map(|e| e.duration.ceil() as u64)
             .max()
-            .unwrap_or_else(|| get_segment_duration_seconds());
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg)?;
+            .unwrap_or_else(|| get_segment_duration_ms() as u64 / 1000);
+        writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg_secs)?;
 
         let seq_start = self
             .segment_index
@@ -973,12 +972,6 @@ impl Drop for ManualSegmenter {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .format_timestamp_secs()
-        .init();
-    log::info!("MpegTStoS3: Logging initialized. Starting main()...");
-
     let matches = ClapCommand::new("mpegts_to_s3")
         .version(get_version())
         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
@@ -1035,7 +1028,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("output_dir")
                 .short('o')
                 .long("output_dir")
-                .default_value("ts")
+                .default_value("channel01")
                 .help("Local dir for HLS output"),
         )
         .arg(
@@ -1048,7 +1041,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("hls_keep_segments")
                 .long("hls_keep_segments")
                 .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
-                .default_value("10"),
+                .default_value("3"),
         )
         .arg(
             Arg::new("unsigned_urls")
@@ -1069,6 +1062,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .help("Number of diskless segments to keep in memory ring buffer.")
                 .default_value("1"),
         )
+        .arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .default_value("0"),
+        )
         .get_matches();
 
     debug!("Command-line arguments parsed: {:?}", matches);
@@ -1084,12 +1083,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let remove_local = matches.get_flag("remove_local");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
     let diskless_mode = matches.get_flag("diskless_mode");
+    let verbose = matches
+        .get_one::<String>("verbose")
+        .unwrap()
+        .parse()
+        .unwrap_or(0);
+    if verbose > 0 {
+        let log_level = match verbose {
+            1 => log::LevelFilter::Info,
+            2 => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        };
+        env_logger::Builder::new()
+            .filter_level(log_level)
+            .format_timestamp_secs()
+            .init();
+    } else {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Info)
+            .format_timestamp_secs()
+            .init();
+    }
+    log::info!("MpegTStoS3: Logging initialized. Starting main()...");
 
     let hls_keep_segments: usize = matches
         .get_one::<String>("hls_keep_segments")
         .unwrap()
         .parse()
-        .unwrap_or(10);
+        .unwrap_or(3);
 
     let diskless_ring_size: usize = matches
         .get_one::<String>("diskless_ring_size")
@@ -1356,7 +1377,7 @@ async fn handle_file_events(
 
                             // Wait for the file to stabilize
                             if !full_path_str.starts_with("mem://") {
-                                let mut retries = 30;
+                                let mut retries = 90;
                                 let mut stable_count = 0;
                                 let mut last_size = 0;
 
@@ -1372,7 +1393,7 @@ async fn handle_file_events(
                                             }
                                         }
                                     }
-                                    sleep(Duration::from_millis(300)).await;
+                                    sleep(Duration::from_millis(100)).await;
                                     retries -= 1;
                                 }
 
@@ -1414,7 +1435,7 @@ async fn handle_file_events(
 
                             // Compute the segment duration
                             let pcr_dur_path = path.with_extension("dur");
-                            let actual_segment_duration = if pcr_dur_path.exists() {
+                            let actual_segment_duration_ms = if pcr_dur_path.exists() {
                                 if let Ok(dur_str) = fs::read_to_string(&pcr_dur_path) {
                                     dur_str
                                         .parse()
@@ -1435,7 +1456,7 @@ async fn handle_file_events(
                                     .record_segment(
                                         &hour_dir,
                                         &key_str,
-                                        actual_segment_duration,
+                                        actual_segment_duration_ms / 1000.0,
                                         custom_lines,
                                         &output_dir,
                                     )
