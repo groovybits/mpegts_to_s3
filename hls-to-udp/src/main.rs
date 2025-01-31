@@ -192,6 +192,7 @@ fn sender_thread(
     pkt_size: i32,
     rate: i32,
     udp_queue_size: usize,
+    retries: usize,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -269,7 +270,6 @@ fn sender_thread(
         let sock_clone = Arc::clone(&sock);
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
         let smoother_thread = thread::spawn(move || {
-            let retries = 0;
             let mut retry_count = 0;
             while let Ok(data) = smoother_rx.recv() {
                 log::debug!(
@@ -575,8 +575,19 @@ fn main() -> Result<()> {
                 .help("Maximum burst size in kilobytes")
                 .default_value("1000"),
         )
+        .arg(
+            Arg::new("send_retries")
+                .long("send_retries")
+                .help("Number of retries before dropping packet")
+                .default_value("0"),
+        )
         .get_matches();
 
+    let send_retries = matches
+        .get_one::<String>("send_retries")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(0);
     let udp_queue_size = matches
         .get_one::<String>("udp_queue_size")
         .unwrap()
@@ -656,6 +667,7 @@ fn main() -> Result<()> {
     println!("  Verbose: {}", verbose);
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
+    println!("  Send Retries: {}", send_retries);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(3);
@@ -674,6 +686,7 @@ fn main() -> Result<()> {
         pkt_size,
         rate,
         udp_queue_size,
+        send_retries,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
