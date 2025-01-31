@@ -269,7 +269,7 @@ fn sender_thread(
         let sock_clone = Arc::clone(&sock);
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
         let smoother_thread = thread::spawn(move || {
-            let retries = 100;
+            let retries = 0;
             let mut retry_count = 0;
             while let Ok(data) = smoother_rx.recv() {
                 log::debug!(
@@ -330,6 +330,8 @@ fn sender_thread(
                         thread::sleep(Duration::from_millis(1));
                     }
                 }
+                // free data buffer
+                drop(data);
                 if shutdown_flag_clone.load(Ordering::SeqCst) {
                     log::info!("SmootherThread: Shutdown flag set, exiting.");
                     break;
