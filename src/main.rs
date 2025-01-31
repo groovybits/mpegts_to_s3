@@ -1091,6 +1091,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     debug!("Command-line arguments parsed: {:?}", matches);
 
+    // print version
+    println!("MpegTStoS3 version: {}", get_version());
+
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
     let region_name = matches.get_one::<String>("region").unwrap();
     let bucket = matches.get_one::<String>("bucket").unwrap();
@@ -1188,7 +1191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (watch_tx, watch_rx) = std_mpsc::channel();
     let watch_dir = output_dir.to_string();
     let shutdown_flag_wt_clone = Arc::clone(&shutdown_flag);
-    let watch_thread = thread::spawn(move || {
+    let _watch_thread = thread::spawn(move || {
         if let Err(e) = watch_directory(&watch_dir, watch_tx, shutdown_flag_wt_clone) {
             eprintln!("Directory watcher error: {:?}", e);
         }
@@ -1202,7 +1205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let hic_for_task = hourly_index_creator.clone();
     let shutdown_flag_ut_clone = Arc::clone(&shutdown_flag);
-    let upload_task = tokio::spawn(async move {
+    let _upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
             watch_rx,
             s3_client_clone,
