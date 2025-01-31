@@ -1358,7 +1358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }*/
     // force exit
     std::process::exit(0);
-    /* 
+    /*
     log::info!("Dropping manual segmenter...");
 
     drop(manual_segmenter);
@@ -1372,7 +1372,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 // ---------------- Directory Watcher ----------------
 
-fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>, shutdown_flag_ut_clone: Arc<AtomicBool>) -> notify::Result<()> {
+fn watch_directory(
+    dir_path: &str,
+    tx: std::sync::mpsc::Sender<Event>,
+    shutdown_flag_ut_clone: Arc<AtomicBool>,
+) -> notify::Result<()> {
     let (notify_tx, notify_rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(
         notify_tx,
