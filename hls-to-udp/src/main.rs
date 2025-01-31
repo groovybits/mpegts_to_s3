@@ -349,8 +349,7 @@ fn sender_thread(
             }
         };
 
-        let mut model = StreamModel::new(sm_callback);
-
+        let mut model: Option<StreamModel<_>> = Some(StreamModel::new(sm_callback));
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
         while let Ok(seg) = rx.recv() {
@@ -363,11 +362,15 @@ fn sender_thread(
 
             // write the segment to the model for the pcr pid detection if not given
             if pcr_pid <= 0 {
-                let _ = model.write(&seg.data);
-                if let Ok(pcr_pid_detected) = pcr_rx.try_recv() {
-                    if pcr_pid != pcr_pid_detected as u16 {
-                        log::info!("SenderThread: received new PCR PID: {}", pcr_pid_detected);
-                        pcr_pid = pcr_pid_detected as u16;
+                if let Some(ref mut m) = model {
+                    let _ = m.write(&seg.data);
+                    if let Ok(pcr_pid_detected) = pcr_rx.try_recv() {
+                        if pcr_pid != pcr_pid_detected as u16 {
+                            log::info!("SenderThread: received new PCR PID: {}", pcr_pid_detected);
+                            pcr_pid = pcr_pid_detected as u16;
+                            // free model
+                            model = None;
+                        }
                     }
                 }
             }
@@ -389,8 +392,11 @@ fn sender_thread(
                 }
             }
         }
+        if model.is_some() {
+            log::warn!("SenderThread: Model not freed, dropping.");
+            drop(model);
+        }
         drop(smoother);
-        drop(model);
         println!("SenderThread: exiting.");
     })
 }
