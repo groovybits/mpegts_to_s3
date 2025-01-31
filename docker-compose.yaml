@@ -13,7 +13,7 @@ services:
       - "config.env"
 
     volumes:
-      - "./data:/data"
+      - "./data:/data:rw"
 
     command: >
       server /data
@@ -48,7 +48,7 @@ services:
     # Mount local 'hls' directory as the working directory
     # where mpegts_to_s3 will write its files.
     volumes:
-      - "./hls:/app/hls"
+      - "./hls:/app/hls:rw"
     depends_on:
       - s3minio
     restart: unless-stopped
@@ -72,6 +72,7 @@ services:
     depends_on:
       - s3minio
       - udp-to-hls
+      - hls-http-server
     restart: unless-stopped
     entrypoint: ["/app/entrypoint_hls-to-udp.sh"]
 
