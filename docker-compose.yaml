@@ -43,6 +43,12 @@ services:
       args:
         ENABLE_DEBUG: "false"
     container_name: "udp-to-hls"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_ADMIN
+      - BPF
+    privileged: true # Required for eBPF and Pcap
     env_file:
       - "config.env"
     # Mount local 'hls' directory as the working directory

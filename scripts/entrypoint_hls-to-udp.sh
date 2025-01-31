@@ -20,7 +20,7 @@ while [ : ]; do
         -s ${HLS_HISTORY_SIZE} \
         -q ${SEGMENT_QUEUE_SIZE} \
         -z ${UDP_QUEUE_SIZE} \
-        --send-retries ${SEND_RETRIES} \
+        --send_retries ${SEND_RETRIES} \
             $@
     sleep 1
 done
