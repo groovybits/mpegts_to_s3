@@ -378,7 +378,11 @@ fn sender_thread(
             }
         };
 
-        let mut model: Option<StreamModel<_>> = Some(StreamModel::new(sm_callback));
+        let mut model: Option<StreamModel<_>> = if pcr_pid_arg == 0 {
+            Some(StreamModel::new(sm_callback))
+        } else {
+            None
+        };
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
         while let Ok(seg) = rx.recv() {
@@ -409,7 +413,9 @@ fn sender_thread(
             // drop the model if we have a pcr pid
             if pcr_pid > 0 && model.is_some() {
                 log::warn!("SenderThread: Dropping model after PCR PID detected.");
-                model = None;
+                if let Some(m) = model.take() {
+                    drop(m);
+                }
             }
 
             // Send to the smoother if we have a pcr pid
@@ -436,11 +442,18 @@ fn sender_thread(
         }
         if model.is_some() {
             log::warn!("SenderThread: Model not freed, dropping.");
-            drop(model);
+            if let Some(m) = model {
+                drop(m);
+            }
         }
-        drop(smoother);
+        if let Some(s) = smoother {
+            log::info!("SenderThread: Dropping smoother.");
+            drop(s);
+        }
+
         log::info!("SenderThread: sending shutdown signal to smoother.");
         tx_shutdown.send(()).ok();
+
         // wait for smoother thread to exit
         log::info!("SenderThread: waiting for smoother thread to exit.");
         smoother_thread.join().unwrap();
@@ -454,11 +467,17 @@ fn get_version() -> &'static str {
 
 fn main() -> Result<()> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let mut ctrl_counter = 0;
     ctrlc::set_handler({
         let shutdown_flag = Arc::clone(&shutdown_flag);
         move || {
             eprintln!("Got CTRL+C, shutting down gracefully...");
             shutdown_flag.store(true, Ordering::SeqCst);
+            ctrl_counter += 1;
+            if ctrl_counter >= 3 {
+                eprintln!("Got CTRL+C 3 times, forcing exit.");
+                std::process::exit(1);
+            }
         }
     })
     .expect("Error setting Ctrl-C handler");
@@ -637,7 +656,7 @@ fn main() -> Result<()> {
     println!("  UDP Queue Size: {}", udp_queue_size);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
-    let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1);
+    let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(3);
     let dl_handle = receiver_thread(
         m3u8_url,
         poll_ms,
@@ -672,6 +691,8 @@ fn main() -> Result<()> {
 
     log::info!("Main: Waiting for downloader thread to exit...");
     dl_handle.join().unwrap();
+
+    // FIXME: This is causing a deadlock, need to figure out why
     //log::info!("Main: Waiting for sender thread to exit...");
     //sender_handle.join().unwrap();
 
