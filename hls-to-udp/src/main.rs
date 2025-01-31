@@ -670,7 +670,7 @@ fn main() -> Result<()> {
     println!("  Send Retries: {}", send_retries);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
-    let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(3);
+    let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
     let dl_handle = receiver_thread(
         m3u8_url,
         poll_ms,
