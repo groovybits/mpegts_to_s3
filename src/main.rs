@@ -559,6 +559,10 @@ impl ManualSegmenter {
         }
     }
 
+    pub async fn finalize(&mut self) -> std::io::Result<()> {
+        self.close_current_segment_file().await
+    }
+
     fn with_s3(
         mut self,
         s3_client: Option<Client>,
@@ -962,16 +966,6 @@ impl ManualSegmenter {
     }
 }
 
-impl Drop for ManualSegmenter {
-    fn drop(&mut self) {
-        let _ = tokio::runtime::Handle::try_current().map(|handle| {
-            handle.block_on(async {
-                let _ = self.close_current_segment_file().await;
-            })
-        });
-    }
-}
-
 // ------------- MAIN -------------
 
 #[tokio::main]
@@ -1191,7 +1185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (watch_tx, watch_rx) = std_mpsc::channel();
     let watch_dir = output_dir.to_string();
     let shutdown_flag_wt_clone = Arc::clone(&shutdown_flag);
-    let _watch_thread = thread::spawn(move || {
+    let watch_thread = thread::spawn(move || {
         if let Err(e) = watch_directory(&watch_dir, watch_tx, shutdown_flag_wt_clone) {
             eprintln!("Directory watcher error: {:?}", e);
         }
@@ -1205,7 +1199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let hic_for_task = hourly_index_creator.clone();
     let shutdown_flag_ut_clone = Arc::clone(&shutdown_flag);
-    let _upload_task = tokio::spawn(async move {
+    let upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
             watch_rx,
             s3_client_clone,
@@ -1338,39 +1332,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
     }
-    // send shutdown signal to all threads
+    // ---------------------------------------------------
+    // GRACEFUL SHUTDOWN PHASE
+    // ---------------------------------------------------
+
+    // Ensure all loops see the shutdown flag:
     shutdown_flag.store(true, Ordering::SeqCst);
 
-    // If we had a diskless consumer thread, we can let it end
-    log::info!("Waiting for diskless consumer thread to exit...");
-    if let Some(handle) = diskless_consumer {
-        let _ = handle.thread().id();
-    }
-
-    //log::info!("Waiting for upload task to exit...");
-    //let _ = upload_task.await?;
-    //log::info!("Waiting for watch thread to exit...");
-    //let _ = watch_thread.join();
-
-    // If we have a manual segmenter, close it
-    /*if let Some(mut manual_segmenter) = manual_segmenter.take() {
+    if let Some(mut seg) = manual_segmenter.take() {
         log::info!("Closing final segment...");
-        if let Err(e) = manual_segmenter.close_current_segment_file().await {
+        if let Err(e) = seg.finalize().await {
             eprintln!("Error closing final segment: {:?}", e);
         }
-    }*/
-    // force exit
-    std::process::exit(0);
-    /*
-    log::info!("Dropping manual segmenter...");
+        drop(seg);
+    }
 
-    drop(manual_segmenter);
-    log::info!("All threads exited, cleaning up...");
-    drop(hourly_index_creator);
+    // Wait for the diskless consumer thread (if any):
+    if let Some(handle) = diskless_consumer {
+        log::info!("Waiting for diskless consumer thread to exit...");
+        if let Err(e) = handle.join() {
+            log::error!("Diskless consumer thread join error: {:?}", e);
+        }
+    }
 
-    println!("Exiting normally.");
+    // Await the upload task:
+    log::info!("Waiting for upload task to exit...");
+    match upload_task.await {
+        Ok(_) => log::info!("Upload task exited cleanly."),
+        Err(e) => log::error!("Upload task panicked: {:?}", e),
+    }
+
+    // Join the directory watch thread:
+    log::info!("Waiting for watch thread to exit...");
+    if let Err(e) = watch_thread.join() {
+        log::error!("Watch thread join error: {:?}", e);
+    }
+
+    log::info!("All threads/tasks exited. Shutting down.");
     Ok(())
-    */
 }
 
 // ---------------- Directory Watcher ----------------
