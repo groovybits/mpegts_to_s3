@@ -8,6 +8,7 @@ use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -271,70 +272,86 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
         let smoother_thread = thread::spawn(move || {
             let mut retry_count = 0;
-            while let Ok(data) = smoother_rx.recv() {
-                log::debug!(
-                    "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
-                    data.len()
-                );
-                if shutdown_flag_clone.load(Ordering::SeqCst) {
-                    log::info!("SmootherThread: Shutdown flag set, exiting.");
-                    break;
-                }
-                loop {
-                    if shutdown_flag_clone.load(Ordering::SeqCst) {
-                        log::info!("SmootherThread: Shutdown flag set, breaking loop.");
-                        break;
-                    }
-                    match sock_clone.send(&data) {
-                        Ok(_) => {
-                            stats_sent += 1;
-                            if retry_count > 0 {
-                                log::warn!(
-                                    "SmootherThread: Retried {} times, sent packet of sent={} dropped={}",
-                                    retry_count,
+            loop {
+                // Use recv_timeout to avoid indefinite blocking
+                match smoother_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(data) => {
+                        log::debug!(
+                            "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
+                            data.len()
+                        );
+                        if shutdown_flag_clone.load(Ordering::SeqCst) {
+                            log::info!("SmootherThread: Shutdown flag set, exiting.");
+                            break;
+                        }
+                        loop {
+                            if shutdown_flag_clone.load(Ordering::SeqCst) {
+                                log::info!("SmootherThread: Shutdown flag set, breaking loop.");
+                                break;
+                            }
+                            match sock_clone.send(&data) {
+                                Ok(_) => {
+                                    stats_sent += 1;
+                                    if retry_count > 0 {
+                                        log::warn!(
+                                            "SmootherThread: Retried {} times, sent packet of sent={} dropped={}",
+                                            retry_count,
+                                            stats_sent,
+                                            stats_dropped
+                                        );
+                                    }
+                                    retry_count = 0;
+                                    break;
+                                }
+                                Err(e) => {
+                                    // Handle WouldBlock specifically
+                                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                                        log::warn!(
+                                        "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
+                                        stats_sent, stats_dropped
+                                        );
+                                    } else {
+                                        log::error!("SmootherThread: Fatal UDP error: {}", e);
+                                        retry_count = 0;
+                                        stats_dropped += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            if retry_count >= retries {
+                                log::error!(
+                                    "SmootherThread: Retried {} times, dropping packet of sent={} dropped={}",
+                                    retries,
                                     stats_sent,
                                     stats_dropped
                                 );
+                                stats_dropped += 1;
+                                retry_count = 0;
+                                break;
+                            } else {
+                                retry_count += 1;
+                                // sleep 1ms before retrying
+                                thread::sleep(Duration::from_millis(1));
                             }
-                            retry_count = 0;
+                        }
+                        // free data buffer
+                        drop(data);
+                        if shutdown_flag_clone.load(Ordering::SeqCst) {
+                            log::info!("SmootherThread: Shutdown flag set, exiting.");
                             break;
                         }
-                        Err(e) => {
-                            // Handle WouldBlock specifically
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                log::warn!(
-                                "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
-                                stats_sent, stats_dropped
-                                );
-                            } else {
-                                log::error!("SmootherThread: Fatal UDP error: {}", e);
-                                retry_count = 0;
-                                stats_dropped += 1;
-                                break;
-                            }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if shutdown_flag_clone.load(Ordering::SeqCst) {
+                            log::info!("SmootherThread: Shutdown flag set, exiting.");
+                            break;
                         }
+                        continue;
                     }
-                    if retry_count >= retries {
-                        log::error!(
-                            "SmootherThread: Retried {} times, dropping packet of sent={} dropped={}",
-                            retries,
-                            stats_sent,
-                            stats_dropped
-                        );
-                        stats_dropped += 1;
-                        retry_count = 0;
+                    Err(RecvTimeoutError::Disconnected) => {
+                        log::info!("SmootherThread: channel disconnected, exiting.");
                         break;
-                    } else {
-                        retry_count += 1;
-                        // sleep 1ms before retrying
-                        thread::sleep(Duration::from_millis(1));
                     }
-                }
-                // free data buffer
-                drop(data);
-                if shutdown_flag_clone.load(Ordering::SeqCst) {
-                    log::info!("SmootherThread: Shutdown flag set, exiting.");
-                    break;
                 }
             }
             log::info!("SmootherThread: exiting.");
