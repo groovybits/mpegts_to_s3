@@ -837,6 +837,40 @@ impl ManualSegmenter {
             warn!("Error rewriting m3u8: {:?}", e);
         }
 
+        if let (Some(ref s3_client), Some(ref bucket_name)) = (&self.s3_client, &self.s3_bucket) {
+            let s3_key = format!("{}/index.m3u8", self.output_dir);
+            let local_m3u8 = std::path::Path::new("hls").join(format!("{}.m3u8", self.output_dir));
+
+            // Make sure the local file exists before uploading
+            if local_m3u8.exists() {
+                match s3_client
+                    .put_object()
+                    .bucket(bucket_name)
+                    .key(&s3_key)
+                    .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead) // public read
+                    .body(ByteStream::from_path(&local_m3u8).await?)
+                    .send()
+                    .await
+                {
+                    Ok(_) => {
+                        log::info!(
+                            "Successfully uploaded index M3U8 to {}/{}",
+                            bucket_name,
+                            s3_key
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to upload index M3U8 {}: {:?}", s3_key, e);
+                    }
+                }
+            } else {
+                debug!(
+                    "Not uploading index M3U8: local file does not exist at {:?}",
+                    local_m3u8
+                );
+            }
+        }
+
         // measure overall "bitrate"
         if let Some(st) = self.segment_open_time.take() {
             let real_elapsed = Instant::now().duration_since(st).as_secs_f64();
