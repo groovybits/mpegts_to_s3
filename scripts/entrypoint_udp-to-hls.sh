@@ -19,6 +19,7 @@ while [ : ]; do
         -e ${MINIO_SERVER_URL} \
         -b ${MINIO_BUCKET_NAME} \
         -o ${CHANNEL_NAME} \
+        --hls_keep_segments ${M3U8_LIVE_SEGMENT_COUNT} \
         --diskless_mode $@
 
     sleep 1

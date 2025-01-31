@@ -37,9 +37,9 @@ use env_logger;
 
 fn get_segment_duration_ms() -> f64 {
     std::env::var("SEGMENT_DURATION_MS")
-        .unwrap_or_else(|_| "2000.0".to_string())
+        .unwrap_or_else(|_| "1000.0".to_string())
         .parse()
-        .unwrap_or(2000.0)
+        .unwrap_or(1000.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
@@ -102,17 +102,17 @@ fn get_snaplen() -> i32 {
 }
 
 fn get_buffer_size() -> i32 {
-    std::env::var("BUFFER_SIZE")
-        .unwrap_or_else(|_| "4194304".to_string())
+    std::env::var("CAPTURE_BUFFER_SIZE")
+        .unwrap_or_else(|_| "1048476".to_string())
         .parse()
-        .unwrap_or(1024 * 1024 * 4)
+        .unwrap_or(1048476)
 }
 
 fn get_use_estimated_duration() -> bool {
     std::env::var("USE_ESTIMATED_DURATION")
-        .unwrap_or_else(|_| "true".to_string())
+        .unwrap_or_else(|_| "false".to_string())
         .parse()
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn get_version() -> &'static str {
@@ -251,23 +251,25 @@ impl HourlyIndexCreator {
 
         std::fs::rename(&temp_path, &index_path)?;
 
+        let s3_object_path = format!("{}/{}/index.m3u8", output_dir, hour_dir);
+
         self.upload_local_file_to_s3(
             &index_path,
-            &format!("{}/index.m3u8", hour_dir),
+            &format!("{}/index.m3u8", s3_object_path),
             "application/vnd.apple.mpegurl",
         )
         .await?;
 
         let final_index_url = self
-            .presign_get_url(&format!("{}/index.m3u8", hour_dir))
+            .presign_get_url(&format!("{}/index.m3u8", s3_object_path))
             .await?;
-        self.rewrite_urls_log(hour_dir, &final_index_url)?;
+        self.rewrite_urls_log(&s3_object_path, &final_index_url)?;
         Ok(())
     }
 
     fn rewrite_urls_log(&mut self, hour_dir: &str, final_url: &str) -> std::io::Result<()> {
-        let log_path = std::path::Path::new("").join("urls.log");
-        let temp_path = std::path::Path::new("").join("urls_temp.log");
+        let log_path = std::path::Path::new("").join("hourly_urls.log");
+        let temp_path = std::path::Path::new("").join("hourly_urls_temp.log");
 
         let mut lines = vec![];
         if log_path.exists() {
@@ -799,7 +801,8 @@ impl ManualSegmenter {
 
                 let hour_dir = format!("{}/{}/{}/{}", year, month, day, hour);
                 let object_key = format!(
-                    "{}",
+                    "{}/{}",
+                    self.output_dir,
                     self.current_segment_path(self.segment_index + 1)
                         .to_string_lossy()
                 );

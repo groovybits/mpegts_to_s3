@@ -50,10 +50,10 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [htt
     - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
     - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
     - `SMOOTHER_LATENCY`: Bitrate Smoother latency in milliseconds (default: `1000`)
-    - `M3U8_UPDATE_INTERVAL_MS`: M3U8 update interval in milliseconds (default: `1000`)
+    - `M3U8_UPDATE_INTERVAL_MS`: M3U8 update interval in milliseconds (default: `100`)
     - `HLS_HISTORY_SIZE`: HLS history size (default: `1800`)
     - `SEGMENT_QUEUE_SIZE`: Segment queue size (default: `32`)
-    - `UDP_QUEUE_SIZE`: UDP queue size (default: `32`)
+    - `UDP_QUEUE_SIZE`: UDP queue size (default: `1024`)
 
 ## Example
 

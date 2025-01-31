@@ -162,6 +162,10 @@ SEGMENT_DURATION_SECONDS=2 \
   - `PCAP_PACKET_HEADER_SIZE`: Size of mpegts packet ip/eth header (default: `42`)
   - `PACAP_BUFFER_SIZE`: Size of the pcap buffer (default: `4194304`)
   - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `true`)
+  - `CAPTURE_BUFFER_SIZE`: Size of the capture buffer (default: `4194304`)
+  - `PCAP_PACKET_COUNT`: Number of packets to capture at a time (default: `7`)
+  - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `false`)
+  - `M3U8_LIVE_SEGMENT_COUNT`: Number of segments to keep in the live m3u8 (default: `3`)
 
 #### hls-to-udp Environment Variables:
 
@@ -169,6 +173,10 @@ SEGMENT_DURATION_SECONDS=2 \
   - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
   - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
   - `SMOOTHER_LATENCY`: Bitrate Smoother latency in milliseconds (default: `1000`)
+  - `M3U8_UPDATE_INTERVAL_MS`: Interval to update the m3u8 file in milliseconds (default: `100`)
+  - `HLS_HISTORY_SIZE`: Number of segments to keep in the live m3u8 (default: `1800`)
+  - `SEGMENT_QUEUE_SIZE`: Size of the segment queue (default: `32`)
+  - `UDP_QUEUE_SIZE`: Size of the UDP queue (default: `1024`)
 
 ---
 
