@@ -7,11 +7,10 @@ use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::thread::{self, sleep, JoinHandle};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use url::Url;
-
-const UDP_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
 struct DownloadedSegment {
@@ -184,6 +183,9 @@ fn sender_thread(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut pcr_pid = pcr_pid_arg;
+        let mut stats_dropped = 0;
+        let mut stats_sent = 0;
+
         // Create raw socket with socket2
         let socket = match socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -221,7 +223,7 @@ fn sender_thread(
         let sock: std::net::UdpSocket = socket.into();
 
         // Set non-blocking mode to prevent send from blocking
-        if let Err(e) = sock.set_nonblocking(false) {
+        if let Err(e) = sock.set_nonblocking(true) {
             eprintln!("SenderThread: Failed to set non-blocking socket: {}", e);
             return;
         }
@@ -230,6 +232,7 @@ fn sender_thread(
             eprintln!("SenderThread: Failed to connect UDP socket: {}", e);
             return;
         }
+        let sock = Arc::new(sock); // Wrap in Arc for thread safety
 
         // setup channels for smoother callback to use to send data to a udp sending thread
         let (smother_tx, smother_rx) = mpsc::sync_channel(udp_queue_size);
@@ -247,28 +250,29 @@ fn sender_thread(
         };
 
         // smoother thread to send data to UDP from the packets sent from the smoother callback smoother_tx
+        let sock_clone = Arc::clone(&sock);
         thread::spawn(move || {
             while let Ok(data) = smother_rx.recv() {
                 log::debug!(
                     "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
                     data.len()
                 );
-                let mut retries = 0;
-                let max_retries = 3;
-                loop {
-                    if let Err(e) = sock.send(&data) {
-                        log::error!("SmootherThread: UDP send error: {}", e);
-                        if retries >= max_retries {
-                            log::error!(
-                                "SmootherThread: UDP send failed after {} retries, dropping packet.",
-                                max_retries
+                match sock_clone.send(&data) {
+                    Ok(_) => {
+                        stats_sent += 1;
+                    }
+                    Err(e) => {
+                        // Handle WouldBlock specifically
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            log::warn!(
+                                "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
+                                stats_sent, stats_dropped
                             );
+                            stats_dropped += 1;
+                        } else {
+                            log::error!("SmootherThread: Fatal UDP error: {}", e);
                             break;
                         }
-                        retries += 1;
-                        sleep(UDP_RETRY_DELAY);
-                    } else {
-                        break;
                     }
                 }
             }
