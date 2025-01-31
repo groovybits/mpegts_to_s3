@@ -252,27 +252,57 @@ fn sender_thread(
         // smoother thread to send data to UDP from the packets sent from the smoother callback smoother_tx
         let sock_clone = Arc::clone(&sock);
         thread::spawn(move || {
+            let retries = 100;
+            let mut retry_count = 0;
             while let Ok(data) = smother_rx.recv() {
                 log::debug!(
                     "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
                     data.len()
                 );
-                match sock_clone.send(&data) {
-                    Ok(_) => {
-                        stats_sent += 1;
-                    }
-                    Err(e) => {
-                        // Handle WouldBlock specifically
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            log::warn!(
-                                "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
-                                stats_sent, stats_dropped
-                            );
-                            stats_dropped += 1;
-                        } else {
-                            log::error!("SmootherThread: Fatal UDP error: {}", e);
+                loop {
+                    match sock_clone.send(&data) {
+                        Ok(_) => {
+                            stats_sent += 1;
+                            if retry_count > 0 {
+                                log::warn!(
+                                    "SmootherThread: Retried {} times, sent packet of sent={} dropped={}",
+                                    retry_count,
+                                    stats_sent,
+                                    stats_dropped
+                                );
+                            }
+                            retry_count = 0;
                             break;
                         }
+                        Err(e) => {
+                            // Handle WouldBlock specifically
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                log::warn!(
+                                "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
+                                stats_sent, stats_dropped
+                                );
+                            } else {
+                                log::error!("SmootherThread: Fatal UDP error: {}", e);
+                                retry_count = 0;
+                                stats_dropped += 1;
+                                break;
+                            }
+                        }
+                    }
+                    if retry_count >= retries {
+                        log::error!(
+                            "SmootherThread: Retried {} times, dropping packet of sent={} dropped={}",
+                            retries,
+                            stats_sent,
+                            stats_dropped
+                        );
+                        stats_dropped += 1;
+                        retry_count = 0;
+                        break;
+                    } else {
+                        retry_count += 1;
+                        // sleep 1ms before retrying
+                        thread::sleep(Duration::from_millis(1));
                     }
                 }
             }

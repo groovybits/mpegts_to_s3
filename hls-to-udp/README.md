@@ -24,21 +24,25 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [htt
 
 ## Usage
 
-    | hls-to-udp [OPTIONS] --m3u8-url <m3u8_url> --udp-output <udp_output_port:udp_output_ip>
-    |
-    | Option                               | Description                                 | Default  |
-    |--------------------------------------|---------------------------------------------|----------|
-    | **-u, --m3u8-url <m3u8_url>**        | The URL of the M3U8 playlist                | (none)   |
-    | **-o, --udp-output <udp_output>**    | The destination UDP address                 | (none)   |
-    | **-p, --poll-ms <poll_ms>**          | The poll interval in milliseconds           | 100      |
-    | **-s, --history-size <history_size>**| The number of segments to retain            | 1800     |
-    | **-v, --verbose <verbose>**          | Verbose mode                                | 0        |
-    | **-l, --latency <latency>**          | Additional latency in milliseconds          | 100      |
-    | **-c, --pcr-pid <pcr_pid>**          | PID to use for PCR timestamps               | 0x00     |
-    | **-r, --rate <rate>**                | Bitrate in kbps                             | 5000     |
-    | **-k, --packet-size <packet_size>**  | TS packet size in bytes                     | 1316     |
-    | **-h, --help**                       | Print help                                  | -        |
-    | **-V, --version**                    | Print version                               | -        |
+    **hls-to-udp [OPTIONS] --m3u8-url <m3u8_url> --udp-output <udp_output_port:udp_output_ip>**
+
+    | Option                                                 | Description                                       | Default |
+    |--------------------------------------------------------|---------------------------------------------------|---------|
+    | **-u, --m3u8-url <m3u8_url>**                          | The URL of the M3U8 playlist                      | (none)  |
+    | **-o, --udp-output <udp_output>**                      | The destination UDP address                       | (none)  |
+    | **-p, --poll-ms <poll_ms>**                            | The poll interval in milliseconds                 | 100     |
+    | **-s, --history-size <history_size>**                  | The number of segments to retain                  | 1800    |
+    | **-v, --verbose <verbose>**                            | Verbose mode                                      | 0       |
+    | **-l, --latency <latency>**                            | Additional latency in milliseconds                | 100     |
+    | **-c, --pcr-pid <pcr_pid>**                            | PID to use for PCR timestamps                     | 0x00    |
+    | **-r, --rate <rate>**                                  | Bitrate in kbps                                   | 5000    |
+    | **-k, --packet-size <packet_size>**                    | TS packet size in bytes                           | 1316    |
+    | **-q, --segment-queue-size <segment_queue_size>**      | The queue size for segments                       | 32      |
+    | **-z, --udp-queue-size <udp_queue_size>**              | The queue size for UDP packets                    | 1024    |
+    | **--max-bitrate <max_bitrate>**                        | Maximum output bitrate in kbps                    | 5000    |
+    | **--max-burst <max_burst>**                            | Maximum burst size in kilobytes                   | 1000    |
+    | **-h, --help**                                         | Print help                                        | -       |
+    | **-V, --version**                                      | Print version                                     | -       |
 
 ## Environment Variables
 
@@ -46,6 +50,10 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [htt
     - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
     - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
     - `SMOOTHER_LATENCY`: Bitrate Smoother latency in milliseconds (default: `1000`)
+    - `M3U8_UPDATE_INTERVAL_MS`: M3U8 update interval in milliseconds (default: `1000`)
+    - `HLS_HISTORY_SIZE`: HLS history size (default: `1800`)
+    - `SEGMENT_QUEUE_SIZE`: Segment queue size (default: `32`)
+    - `UDP_QUEUE_SIZE`: UDP queue size (default: `32`)
 
 ## Example
 

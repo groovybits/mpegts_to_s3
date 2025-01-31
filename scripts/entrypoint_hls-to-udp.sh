@@ -16,6 +16,10 @@ while [ : ]; do
         -u ${HLS_INPUT_URL} \
         -o ${UDP_OUTPUT_IP}:${UDP_OUTPUT_PORT} \
         -l ${SMOOTHER_LATENCY} \
+        -p ${M3U8_UPDATE_INTERVAL_MS} \
+        -s ${HLS_HISTORY_SIZE} \
+        -q ${SEGMENT_QUEUE_SIZE} \
+        -z ${UDP_QUEUE_SIZE} \
             $@
     sleep 1
 done
