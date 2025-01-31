@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
+use ctrlc;
 use env_logger;
 use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -59,6 +61,8 @@ fn receiver_thread(
     poll_interval_ms: u64,
     hist_capacity: usize,
     tx: SyncSender<DownloadedSegment>,
+    shutdown_flag: Arc<AtomicBool>,
+    tx_shutdown: SyncSender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let client = Client::new();
@@ -73,6 +77,10 @@ fn receiver_thread(
         let mut next_seg_id: usize = 1;
 
         loop {
+            if shutdown_flag.load(Ordering::SeqCst) {
+                log::info!("ReceiverThread: Shutdown flag set, exiting.");
+                break;
+            }
             let playlist_text = match client.get(&m3u8_url).send() {
                 Ok(r) => {
                     if !r.status().is_success() {
@@ -112,6 +120,10 @@ fn receiver_thread(
             };
 
             for seg in &media_pl.segments {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    log::info!("ReceiverThread: Shutdown flag set, breaking loop.");
+                    break;
+                }
                 let uri = &seg.uri;
                 if seg_history.contains(uri) {
                     continue;
@@ -157,6 +169,7 @@ fn receiver_thread(
                 };
                 if tx.send(seg_struct).is_err() {
                     eprintln!("ReceiverThread: Receiver dropped, downloader exiting.");
+                    tx_shutdown.send(()).ok();
                     return;
                 }
                 next_seg_id += 1;
@@ -180,6 +193,8 @@ fn sender_thread(
     rate: i32,
     udp_queue_size: usize,
     rx: Receiver<DownloadedSegment>,
+    shutdown_flag: Arc<AtomicBool>,
+    tx_shutdown: SyncSender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut pcr_pid = pcr_pid_arg;
@@ -235,31 +250,41 @@ fn sender_thread(
         let sock = Arc::new(sock); // Wrap in Arc for thread safety
 
         // setup channels for smoother callback to use to send data to a udp sending thread
-        let (smother_tx, smother_rx) = mpsc::sync_channel(udp_queue_size);
+        let (smoother_tx, smoother_rx) = mpsc::sync_channel(udp_queue_size);
         let smoother_callback = |v: Vec<u8>| {
             log::debug!(
                 "SmootherCallback: received buffer with {} bytes, sending to UDP.",
                 v.len()
             );
-            if let Err(e) = smother_tx.send(v) {
+            if let Err(e) = smoother_tx.send(v) {
                 log::error!(
                     "SmootherCallback: Failed to send buffer to UDP thread: {}",
                     e
                 );
+                tx_shutdown.send(()).ok();
             }
         };
 
         // smoother thread to send data to UDP from the packets sent from the smoother callback smoother_tx
         let sock_clone = Arc::clone(&sock);
-        thread::spawn(move || {
+        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+        let smoother_thread = thread::spawn(move || {
             let retries = 100;
             let mut retry_count = 0;
-            while let Ok(data) = smother_rx.recv() {
+            while let Ok(data) = smoother_rx.recv() {
                 log::debug!(
                     "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
                     data.len()
                 );
+                if shutdown_flag_clone.load(Ordering::SeqCst) {
+                    log::info!("SmootherThread: Shutdown flag set, exiting.");
+                    break;
+                }
                 loop {
+                    if shutdown_flag_clone.load(Ordering::SeqCst) {
+                        log::info!("SmootherThread: Shutdown flag set, breaking loop.");
+                        break;
+                    }
                     match sock_clone.send(&data) {
                         Ok(_) => {
                             stats_sent += 1;
@@ -304,6 +329,10 @@ fn sender_thread(
                         // sleep 1ms before retrying
                         thread::sleep(Duration::from_millis(1));
                     }
+                }
+                if shutdown_flag_clone.load(Ordering::SeqCst) {
+                    log::info!("SmootherThread: Shutdown flag set, exiting.");
+                    break;
                 }
             }
             log::info!("SmootherThread: exiting.");
@@ -359,20 +388,28 @@ fn sender_thread(
                 seg.data.len(),
                 seg.duration
             );
+            if shutdown_flag.load(Ordering::SeqCst) {
+                log::info!("SenderThread: Shutdown flag set, exiting.");
+                break;
+            }
 
             // write the segment to the model for the pcr pid detection if not given
-            if pcr_pid <= 0 {
+            if pcr_pid <= 0 && model.is_some() {
                 if let Some(ref mut m) = model {
                     let _ = m.write(&seg.data);
                     if let Ok(pcr_pid_detected) = pcr_rx.try_recv() {
                         if pcr_pid != pcr_pid_detected as u16 {
                             log::info!("SenderThread: received new PCR PID: {}", pcr_pid_detected);
                             pcr_pid = pcr_pid_detected as u16;
-                            // free model
-                            model = None;
                         }
                     }
                 }
+            }
+
+            // drop the model if we have a pcr pid
+            if pcr_pid > 0 && model.is_some() {
+                log::warn!("SenderThread: Dropping model after PCR PID detected.");
+                model = None;
             }
 
             // Send to the smoother if we have a pcr pid
@@ -391,12 +428,22 @@ fn sender_thread(
                     let _ = s.write(&seg.data);
                 }
             }
+
+            if shutdown_flag.load(Ordering::SeqCst) {
+                log::info!("SenderThread: Shutdown flag set, exiting.");
+                break;
+            }
         }
         if model.is_some() {
             log::warn!("SenderThread: Model not freed, dropping.");
             drop(model);
         }
         drop(smoother);
+        log::info!("SenderThread: sending shutdown signal to smoother.");
+        tx_shutdown.send(()).ok();
+        // wait for smoother thread to exit
+        log::info!("SenderThread: waiting for smoother thread to exit.");
+        smoother_thread.join().unwrap();
         println!("SenderThread: exiting.");
     })
 }
@@ -406,6 +453,15 @@ fn get_version() -> &'static str {
 }
 
 fn main() -> Result<()> {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let shutdown_flag = Arc::clone(&shutdown_flag);
+        move || {
+            eprintln!("Got CTRL+C, shutting down gracefully...");
+            shutdown_flag.store(true, Ordering::SeqCst);
+        }
+    })
+    .expect("Error setting Ctrl-C handler");
     let matches = ClapCommand::new("hls-udp-streamer")
         .version(get_version())
         .about("HLS to UDP relay using LibLTNTSTools StreamModel and Smoother")
@@ -581,8 +637,16 @@ fn main() -> Result<()> {
     println!("  UDP Queue Size: {}", udp_queue_size);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
-    let dl_handle = receiver_thread(m3u8_url, poll_ms, hist_cap, tx);
-    let sender_handle = sender_thread(
+    let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1);
+    let dl_handle = receiver_thread(
+        m3u8_url,
+        poll_ms,
+        hist_cap,
+        tx,
+        shutdown_flag.clone(),
+        tx_shutdown.clone(),
+    );
+    let _sender_handle = sender_thread(
         udp_out,
         latency,
         pcr_pid,
@@ -590,11 +654,27 @@ fn main() -> Result<()> {
         rate,
         udp_queue_size,
         rx,
+        shutdown_flag.clone(),
+        tx_shutdown.clone(),
     );
 
-    dl_handle.join().ok();
-    sender_handle.join().ok();
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Ok(_) = rx_shutdown.try_recv() {
+            log::info!("Main: Shutdown signal received, breaking loop.");
+            shutdown_flag.store(true, Ordering::SeqCst);
+            break;
+        }
+    }
 
-    println!("Main thread exiting.");
+    log::info!("Main: Waiting for downloader thread to exit...");
+    dl_handle.join().unwrap();
+    //log::info!("Main: Waiting for sender thread to exit...");
+    //sender_handle.join().unwrap();
+
+    println!("HLStoUDP: Main thread exiting.");
     Ok(())
 }
