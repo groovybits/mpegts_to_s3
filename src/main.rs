@@ -839,7 +839,7 @@ impl ManualSegmenter {
 
         if let (Some(ref s3_client), Some(ref bucket_name)) = (&self.s3_client, &self.s3_bucket) {
             let s3_key = format!("{}/index.m3u8", self.output_dir);
-            let local_m3u8 = std::path::Path::new("hls").join(format!("{}.m3u8", self.output_dir));
+            let local_m3u8 = std::path::Path::new("").join(format!("{}.m3u8", self.output_dir));
 
             // Make sure the local file exists before uploading
             if local_m3u8.exists() {
@@ -864,7 +864,7 @@ impl ManualSegmenter {
                     }
                 }
             } else {
-                debug!(
+                error!(
                     "Not uploading index M3U8: local file does not exist at {:?}",
                     local_m3u8
                 );
