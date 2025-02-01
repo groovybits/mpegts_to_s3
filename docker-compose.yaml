@@ -87,8 +87,6 @@ services:
   ######################################
   hls-http-server:
     image: docker.io/nginx:alpine
-    logging:
-      driver: none
     container_name: hls-http-server
     ports:
       - "3001:80" # Map port 3001 on the host to port 80 in the container
