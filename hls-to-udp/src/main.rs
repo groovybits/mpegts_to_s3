@@ -192,6 +192,7 @@ fn sender_thread(
     pcr_pid_arg: u16,
     pkt_size: i32,
     rate: i32,
+    smoother_max_bytes: usize,
     udp_queue_size: usize,
     retries: usize,
     rx: Receiver<DownloadedSegment>,
@@ -451,6 +452,17 @@ fn sender_thread(
                 }
                 if let Some(ref mut s) = smoother {
                     let _ = s.write(&seg.data);
+
+                    // Check size
+                    let current_size = s.get_size();
+                    if current_size > smoother_max_bytes.try_into().unwrap() {
+                        log::warn!(
+                            "Smoother backlog {} > threshold {}, forcing reset!",
+                            current_size,
+                            smoother_max_bytes
+                        );
+                        s.reset();
+                    }
                 }
             }
 
@@ -598,8 +610,19 @@ fn main() -> Result<()> {
                 .help("Number of retries before dropping packet")
                 .default_value("0"),
         )
+        .arg(
+            Arg::new("max_bytes_threshold")
+                .long("max-bytes-threshold")
+                .help("Maximum bytes in smoother queue before reset")
+                .default_value("120_000_000"),
+        )
         .get_matches();
 
+    let max_bytes_threshold = matches
+        .get_one::<String>("max_bytes_threshold")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(120_000_000);
     let send_retries = matches
         .get_one::<String>("send_retries")
         .unwrap()
@@ -702,6 +725,7 @@ fn main() -> Result<()> {
         pcr_pid,
         pkt_size,
         rate,
+        max_bytes_threshold,
         udp_queue_size,
         send_retries,
         rx,
