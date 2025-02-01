@@ -109,7 +109,7 @@ class HLSHandler(SimpleHTTPRequestHandler):
             self.send_header('Content-Length', str(file_size))
         self.end_headers()
 
-def run_server(port=3001):
+def run_server(port=80):
     server_address = ('', port)
     httpd = ThreadingHTTPServer(server_address, HLSHandler)
     print(f"Serving HLS content on port {port} (threaded)...")
@@ -121,4 +121,4 @@ def run_server(port=3001):
     print("Server stopped.")
 
 if __name__ == '__main__':
-    run_server(3001)
+    run_server(80)
