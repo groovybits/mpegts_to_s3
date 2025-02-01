@@ -7,15 +7,13 @@
  * Chris Kennedy 2025 Jan 15
  */
 
-use std::sync::mpsc::Receiver;
-use std::thread;
-
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
+use ctrlc;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -26,7 +24,10 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{mpsc as std_mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -558,6 +559,10 @@ impl ManualSegmenter {
         }
     }
 
+    pub async fn finalize(&mut self) -> std::io::Result<()> {
+        self.close_current_segment_file().await
+    }
+
     fn with_s3(
         mut self,
         s3_client: Option<Client>,
@@ -832,6 +837,40 @@ impl ManualSegmenter {
             warn!("Error rewriting m3u8: {:?}", e);
         }
 
+        if let (Some(ref s3_client), Some(ref bucket_name)) = (&self.s3_client, &self.s3_bucket) {
+            let s3_key = format!("{}/index.m3u8", self.output_dir);
+            let local_m3u8 = std::path::Path::new("").join(format!("{}.m3u8", self.output_dir));
+
+            // Make sure the local file exists before uploading
+            if local_m3u8.exists() {
+                match s3_client
+                    .put_object()
+                    .bucket(bucket_name)
+                    .key(&s3_key)
+                    .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead) // public read
+                    .body(ByteStream::from_path(&local_m3u8).await?)
+                    .send()
+                    .await
+                {
+                    Ok(_) => {
+                        log::info!(
+                            "Successfully uploaded index M3U8 to {}/{}",
+                            bucket_name,
+                            s3_key
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to upload index M3U8 {}: {:?}", s3_key, e);
+                    }
+                }
+            } else {
+                error!(
+                    "Not uploading index M3U8: local file does not exist at {:?}",
+                    local_m3u8
+                );
+            }
+        }
+
         // measure overall "bitrate"
         if let Some(st) = self.segment_open_time.take() {
             let real_elapsed = Instant::now().duration_since(st).as_secs_f64();
@@ -961,20 +1000,25 @@ impl ManualSegmenter {
     }
 }
 
-impl Drop for ManualSegmenter {
-    fn drop(&mut self) {
-        let _ = tokio::runtime::Handle::try_current().map(|handle| {
-            handle.block_on(async {
-                let _ = self.close_current_segment_file().await;
-            })
-        });
-    }
-}
-
 // ------------- MAIN -------------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let mut ctrl_counter = 0;
+    ctrlc::set_handler({
+        let shutdown_flag = Arc::clone(&shutdown_flag);
+        move || {
+            eprintln!("Got CTRL+C, shutting down gracefully...");
+            shutdown_flag.store(true, Ordering::SeqCst);
+            ctrl_counter += 1;
+            if ctrl_counter >= 3 {
+                eprintln!("Got CTRL+C 3 times, forcing exit.");
+                std::process::exit(1);
+            }
+        }
+    })
+    .expect("Error setting Ctrl-C handler");
     let matches = ClapCommand::new("mpegts_to_s3")
         .version(get_version())
         .about("PCAP capture -> HLS -> Directory Watch -> S3 Upload")
@@ -1075,6 +1119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     debug!("Command-line arguments parsed: {:?}", matches);
 
+    // print version
+    println!("MpegTStoS3 version: {}", get_version());
+
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
     let region_name = matches.get_one::<String>("region").unwrap();
     let bucket = matches.get_one::<String>("bucket").unwrap();
@@ -1171,8 +1218,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting directory watcher on: {}", output_dir);
     let (watch_tx, watch_rx) = std_mpsc::channel();
     let watch_dir = output_dir.to_string();
+    let shutdown_flag_wt_clone = Arc::clone(&shutdown_flag);
     let watch_thread = thread::spawn(move || {
-        if let Err(e) = watch_directory(&watch_dir, watch_tx) {
+        if let Err(e) = watch_directory(&watch_dir, watch_tx, shutdown_flag_wt_clone) {
             eprintln!("Directory watcher error: {:?}", e);
         }
     });
@@ -1184,6 +1232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir_for_task = output_dir.clone();
 
     let hic_for_task = hourly_index_creator.clone();
+    let shutdown_flag_ut_clone = Arc::clone(&shutdown_flag);
     let upload_task = tokio::spawn(async move {
         if let Err(e) = handle_file_events(
             watch_rx,
@@ -1193,6 +1242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             remove_local,
             hic_for_task,
             output_dir_for_task,
+            shutdown_flag_ut_clone,
         )
         .await
         {
@@ -1255,8 +1305,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let diskless_consumer = if diskless_mode {
         if let Some(_seg_ref) = &manual_segmenter {
             let buffer_ref = _seg_ref.diskless_buffer.clone();
+            let shutdown_flag_clone = Arc::clone(&shutdown_flag);
             let handle = thread::spawn(move || loop {
                 {
+                    if shutdown_flag_clone.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let mut buf = futures::executor::block_on(buffer_ref.lock());
                     if let Some(front) = buf.queue.pop_front() {
                         debug!(
@@ -1278,6 +1332,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     debug!("Starting main capture loop now...");
     loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            log::info!("Shutdown flag set, exiting main loop");
+            break;
+        }
         let packet = match cap.next_packet() {
             Ok(pkt) => pkt,
             Err(_) => {
@@ -1308,23 +1366,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
     }
+    // ---------------------------------------------------
+    // GRACEFUL SHUTDOWN PHASE
+    // ---------------------------------------------------
 
-    drop(manual_segmenter);
+    // Ensure all loops see the shutdown flag:
+    shutdown_flag.store(true, Ordering::SeqCst);
 
-    // If we had a diskless consumer thread, we can let it end
-    if let Some(handle) = diskless_consumer {
-        let _ = handle.thread().id();
+    if let Some(mut seg) = manual_segmenter.take() {
+        log::info!("Closing final segment...");
+        if let Err(e) = seg.finalize().await {
+            eprintln!("Error closing final segment: {:?}", e);
+        }
+        drop(seg);
     }
 
-    let _ = upload_task.await?;
-    let _ = watch_thread.join();
-    println!("Exiting normally.");
+    // Wait for the diskless consumer thread (if any):
+    if let Some(handle) = diskless_consumer {
+        log::info!("Waiting for diskless consumer thread to exit...");
+        if let Err(e) = handle.join() {
+            log::error!("Diskless consumer thread join error: {:?}", e);
+        }
+    }
+
+    // Await the upload task:
+    log::info!("Waiting for upload task to exit...");
+    match upload_task.await {
+        Ok(_) => log::info!("Upload task exited cleanly."),
+        Err(e) => log::error!("Upload task panicked: {:?}", e),
+    }
+
+    // Join the directory watch thread:
+    log::info!("Waiting for watch thread to exit...");
+    if let Err(e) = watch_thread.join() {
+        log::error!("Watch thread join error: {:?}", e);
+    }
+
+    log::info!("All threads/tasks exited. Shutting down.");
     Ok(())
 }
 
 // ---------------- Directory Watcher ----------------
 
-fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> notify::Result<()> {
+fn watch_directory(
+    dir_path: &str,
+    tx: std::sync::mpsc::Sender<Event>,
+    shutdown_flag_ut_clone: Arc<AtomicBool>,
+) -> notify::Result<()> {
     let (notify_tx, notify_rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(
         notify_tx,
@@ -1333,6 +1421,9 @@ fn watch_directory(dir_path: &str, tx: std::sync::mpsc::Sender<Event>) -> notify
     watcher.watch(Path::new(dir_path), RecursiveMode::Recursive)?;
 
     loop {
+        if shutdown_flag_ut_clone.load(Ordering::SeqCst) {
+            break;
+        }
         match notify_rx.recv() {
             Ok(Ok(event)) => {
                 if tx.send(event).is_err() {
@@ -1356,10 +1447,14 @@ async fn handle_file_events(
     remove_local: bool,
     hourly_index_creator: Arc<Mutex<HourlyIndexCreator>>,
     output_dir: String,
+    shutdown_flag_ut_clone: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds())));
 
     while let Ok(event) = rx.recv() {
+        if shutdown_flag_ut_clone.load(Ordering::SeqCst) {
+            break;
+        }
         match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => {
                 for path in event.paths {
@@ -1384,7 +1479,10 @@ async fn handle_file_events(
                                 let mut stable_count = 0;
                                 let mut last_size = 0;
 
-                                while retries > 0 && stable_count < 3 {
+                                while retries > 0
+                                    && stable_count < 3
+                                    && !shutdown_flag_ut_clone.load(Ordering::SeqCst)
+                                {
                                     if let Ok(metadata) = fs::metadata(&path) {
                                         let current_size = metadata.len();
                                         if current_size > 0 {
@@ -1401,7 +1499,7 @@ async fn handle_file_events(
                                 }
 
                                 if stable_count < 3 {
-                                    warn!("File {} did not stabilize, skipping", full_path_str);
+                                    error!("File {} did not stabilize, skipping", full_path_str);
                                     continue;
                                 }
                             }

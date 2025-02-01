@@ -8,6 +8,7 @@ use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -191,7 +192,9 @@ fn sender_thread(
     pcr_pid_arg: u16,
     pkt_size: i32,
     rate: i32,
+    smoother_max_bytes: usize,
     udp_queue_size: usize,
+    retries: usize,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -269,70 +272,87 @@ fn sender_thread(
         let sock_clone = Arc::clone(&sock);
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
         let smoother_thread = thread::spawn(move || {
-            let retries = 100;
             let mut retry_count = 0;
-            while let Ok(data) = smoother_rx.recv() {
-                log::debug!(
-                    "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
-                    data.len()
-                );
-                if shutdown_flag_clone.load(Ordering::SeqCst) {
-                    log::info!("SmootherThread: Shutdown flag set, exiting.");
-                    break;
-                }
-                loop {
-                    if shutdown_flag_clone.load(Ordering::SeqCst) {
-                        log::info!("SmootherThread: Shutdown flag set, breaking loop.");
-                        break;
-                    }
-                    match sock_clone.send(&data) {
-                        Ok(_) => {
-                            stats_sent += 1;
-                            if retry_count > 0 {
-                                log::warn!(
-                                    "SmootherThread: Retried {} times, sent packet of sent={} dropped={}",
-                                    retry_count,
+            loop {
+                // Use recv_timeout to avoid indefinite blocking
+                match smoother_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(data) => {
+                        log::debug!(
+                            "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
+                            data.len()
+                        );
+                        if shutdown_flag_clone.load(Ordering::SeqCst) {
+                            log::info!("SmootherThread: Shutdown flag set, exiting.");
+                            break;
+                        }
+                        loop {
+                            if shutdown_flag_clone.load(Ordering::SeqCst) {
+                                log::info!("SmootherThread: Shutdown flag set, breaking loop.");
+                                break;
+                            }
+                            match sock_clone.send(&data) {
+                                Ok(_) => {
+                                    stats_sent += 1;
+                                    if retry_count > 0 {
+                                        log::warn!(
+                                            "SmootherThread: Retried {} times, sent packet of sent={} dropped={}",
+                                            retry_count,
+                                            stats_sent,
+                                            stats_dropped
+                                        );
+                                    }
+                                    retry_count = 0;
+                                    break;
+                                }
+                                Err(e) => {
+                                    // Handle WouldBlock specifically
+                                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                                        log::warn!(
+                                        "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
+                                        stats_sent, stats_dropped
+                                        );
+                                    } else {
+                                        log::error!("SmootherThread: Fatal UDP error: {}", e);
+                                        retry_count = 0;
+                                        stats_dropped += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            if retry_count >= retries {
+                                log::error!(
+                                    "SmootherThread: Retried {} times, dropping packet of sent={} dropped={}",
+                                    retries,
                                     stats_sent,
                                     stats_dropped
                                 );
+                                stats_dropped += 1;
+                                retry_count = 0;
+                                break;
+                            } else {
+                                retry_count += 1;
+                                // sleep 1ms before retrying
+                                thread::sleep(Duration::from_millis(1));
                             }
-                            retry_count = 0;
+                        }
+                        // free data buffer
+                        drop(data);
+                        if shutdown_flag_clone.load(Ordering::SeqCst) {
+                            log::info!("SmootherThread: Shutdown flag set, exiting.");
                             break;
                         }
-                        Err(e) => {
-                            // Handle WouldBlock specifically
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                log::warn!(
-                                "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
-                                stats_sent, stats_dropped
-                                );
-                            } else {
-                                log::error!("SmootherThread: Fatal UDP error: {}", e);
-                                retry_count = 0;
-                                stats_dropped += 1;
-                                break;
-                            }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if shutdown_flag_clone.load(Ordering::SeqCst) {
+                            log::info!("SmootherThread: Shutdown flag set, exiting.");
+                            break;
                         }
+                        continue;
                     }
-                    if retry_count >= retries {
-                        log::error!(
-                            "SmootherThread: Retried {} times, dropping packet of sent={} dropped={}",
-                            retries,
-                            stats_sent,
-                            stats_dropped
-                        );
-                        stats_dropped += 1;
-                        retry_count = 0;
+                    Err(RecvTimeoutError::Disconnected) => {
+                        log::info!("SmootherThread: channel disconnected, exiting.");
                         break;
-                    } else {
-                        retry_count += 1;
-                        // sleep 1ms before retrying
-                        thread::sleep(Duration::from_millis(1));
                     }
-                }
-                if shutdown_flag_clone.load(Ordering::SeqCst) {
-                    log::info!("SmootherThread: Shutdown flag set, exiting.");
-                    break;
                 }
             }
             log::info!("SmootherThread: exiting.");
@@ -432,6 +452,17 @@ fn sender_thread(
                 }
                 if let Some(ref mut s) = smoother {
                     let _ = s.write(&seg.data);
+
+                    // Check size
+                    let current_size = s.get_size();
+                    if current_size > smoother_max_bytes.try_into().unwrap() {
+                        log::warn!(
+                            "Smoother backlog {} > threshold {}, forcing reset!",
+                            current_size,
+                            smoother_max_bytes
+                        );
+                        s.reset();
+                    }
                 }
             }
 
@@ -573,8 +604,30 @@ fn main() -> Result<()> {
                 .help("Maximum burst size in kilobytes")
                 .default_value("1000"),
         )
+        .arg(
+            Arg::new("send_retries")
+                .long("send_retries")
+                .help("Number of retries before dropping packet")
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("max_bytes_threshold")
+                .long("max-bytes-threshold")
+                .help("Maximum bytes in smoother queue before reset")
+                .default_value("120_000_000"),
+        )
         .get_matches();
 
+    let max_bytes_threshold = matches
+        .get_one::<String>("max_bytes_threshold")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(120_000_000);
+    let send_retries = matches
+        .get_one::<String>("send_retries")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(0);
     let udp_queue_size = matches
         .get_one::<String>("udp_queue_size")
         .unwrap()
@@ -654,9 +707,10 @@ fn main() -> Result<()> {
     println!("  Verbose: {}", verbose);
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
+    println!("  Send Retries: {}", send_retries);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
-    let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(3);
+    let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
     let dl_handle = receiver_thread(
         m3u8_url,
         poll_ms,
@@ -671,7 +725,9 @@ fn main() -> Result<()> {
         pcr_pid,
         pkt_size,
         rate,
+        max_bytes_threshold,
         udp_queue_size,
+        send_retries,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),

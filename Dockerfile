@@ -4,11 +4,6 @@ FROM almalinux:8.8 as builder
 ARG ENABLE_DEBUG
 ENV ENABLE_DEBUG=${ENABLE_DEBUG:-false}
 
-# avoid resource issues
-ARG JOBS
-ENV JOBS=${JOBS:-32}
-ENV CARGO_BUILD_JOBS=${JOBS}
-
 ## Base probe app in /app directory
 WORKDIR /app
 
@@ -43,9 +38,15 @@ COPY hls-to-udp/Cargo.toml hls-to-udp/Cargo.toml
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# avoid resource issues
+ARG JOBS
+ENV CPUS=4
+ENV JOBS=${JOBS:-${CPUS}}
+ENV CARGO_BUILD_JOBS=${JOBS}
+
 ## Build programs
-RUN scl enable gcc-toolset-13 -- make build -j $JOBS && \
-    scl enable gcc-toolset-13 -- make install -j $JOBS
+RUN scl enable gcc-toolset-13 -- make build -j $(nproc) && \
+    scl enable gcc-toolset-13 -- make install -j $(nproc) 
 
 ## Strip binaries in /app/bin/
 RUN strip /app/bin/*

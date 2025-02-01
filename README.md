@@ -86,13 +86,13 @@ SEGMENT_DURATION_SECONDS=2 \
 - **Direct Playback:**
   1. Use the index.m3u8 for playback of the current live stream:
      ```bash
-     mpv -i http://127.0.0.1:3001/index.m3u8
+     mpv -i http://127.0.0.1:80/index.m3u8
      ```
 
 - **MinIO Playback:**
   1. Retrieve the signed URL for the desired hour:
      ```bash
-     curl -s http://127.0.0.1:3001/ts/urls.log | tail -1
+     curl -s http://127.0.0.1:80/hourly_urls.log | tail -1
      ```
   2. Setup an SSH tunnel for the HTTP server:
      ```bash
@@ -108,7 +108,7 @@ SEGMENT_DURATION_SECONDS=2 \
      ```bash
      cd hls-to-udp
      cargo build --release
-     ./target/release/hls-to-udp -u http://127.0.0.1:3001/index.m3u8 -o 224.0.0.200:10001
+     ./target/release/hls-to-udp -u http://127.0.0.1:80/index.m3u8 -o 224.0.0.200:10001
      ```
   2. Play the relayed stream
      ```bash
@@ -169,7 +169,7 @@ SEGMENT_DURATION_SECONDS=2 \
 
 #### hls-to-udp Environment Variables:
 
-  - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:3001/channel01.m3u8`)
+  - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:80/channel01.m3u8`)
   - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
   - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
   - `SMOOTHER_LATENCY`: Bitrate Smoother latency in milliseconds (default: `1000`)
@@ -177,6 +177,7 @@ SEGMENT_DURATION_SECONDS=2 \
   - `HLS_HISTORY_SIZE`: Number of segments to keep in the live m3u8 (default: `1800`)
   - `SEGMENT_QUEUE_SIZE`: Size of the segment queue (default: `32`)
   - `UDP_QUEUE_SIZE`: Size of the UDP queue (default: `1024`)
+  - `SEND_RETRIES`: Number of retries to send UDP packets (default: `0`)
 
 ---
 
