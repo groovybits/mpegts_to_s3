@@ -31,6 +31,17 @@ services:
     restart: unless-stopped
 
   ######################################
+  # HLS M3U8 Playlist Service
+  ######################################
+  hls-http-server:
+    image: docker.io/nginx:alpine
+    container_name: hls-http-server
+    network_mode: "host"
+    volumes:
+      - ./hls:/usr/share/nginx/html:ro # Serve HLS files from the local "hls" folder
+    restart: unless-stopped
+  
+  ######################################
   # Rust-Based Capture & HLS Service
   ######################################
   udp-to-hls:
@@ -82,14 +93,3 @@ services:
     restart: unless-stopped
     entrypoint: ["/app/entrypoint_hls-to-udp.sh"]
 
-  ######################################
-  # HLS M3U8 Playlist Service
-  ######################################
-  hls-http-server:
-    image: docker.io/nginx:alpine
-    container_name: hls-http-server
-    ports:
-      - "3001:80" # Map port 3001 on the host to port 80 in the container
-    volumes:
-      - ./hls:/usr/share/nginx/html:ro # Serve HLS files from the local "hls" folder
-    restart: unless-stopped
