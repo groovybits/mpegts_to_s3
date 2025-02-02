@@ -194,7 +194,6 @@ fn sender_thread(
     rate: i32,
     smoother_max_bytes: usize,
     udp_queue_size: usize,
-    retries: usize,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -303,6 +302,7 @@ fn sender_thread(
                                     // If partial sends are possible on your platform, check `bytes_sent`.
                                     // Typically for UDP, it's all or nothing.
                                     stats_sent += 1;
+                                    log::debug!("SmootherThread: Packet of {} bytes sent of {} bytes data len.", bytes_sent, data.len());
                                     break; // Successfully sent
                                 }
                                 Err(e) => {
@@ -613,12 +613,6 @@ fn main() -> Result<()> {
                 .default_value("1000"),
         )
         .arg(
-            Arg::new("send_retries")
-                .long("send_retries")
-                .help("Number of retries before dropping packet")
-                .default_value("0"),
-        )
-        .arg(
             Arg::new("max_bytes_threshold")
                 .long("max-bytes-threshold")
                 .help("Maximum bytes in smoother queue before reset")
@@ -631,11 +625,6 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<usize>()
         .unwrap_or(120_000_000);
-    let send_retries = matches
-        .get_one::<String>("send_retries")
-        .unwrap()
-        .parse::<usize>()
-        .unwrap_or(0);
     let udp_queue_size = matches
         .get_one::<String>("udp_queue_size")
         .unwrap()
@@ -715,7 +704,6 @@ fn main() -> Result<()> {
     println!("  Verbose: {}", verbose);
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
-    println!("  Send Retries: {}", send_retries);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
@@ -735,7 +723,6 @@ fn main() -> Result<()> {
         rate,
         max_bytes_threshold,
         udp_queue_size,
-        send_retries,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
