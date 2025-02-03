@@ -287,7 +287,7 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 10; // ms total wait if OS buffer is full
+        let max_block_ms = 50; // ms total wait if OS buffer is full
 
         let smoother_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
@@ -626,7 +626,7 @@ fn main() -> Result<()> {
             Arg::new("max_bytes_threshold")
                 .long("max-bytes-threshold")
                 .help("Maximum bytes in smoother queue before reset")
-                .default_value("120_000_000"),
+                .default_value("200_000_000"),
         )
         .get_matches();
 
@@ -634,7 +634,7 @@ fn main() -> Result<()> {
         .get_one::<String>("max_bytes_threshold")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(120_000_000);
+        .unwrap_or(200_000_000);
     let udp_queue_size = matches
         .get_one::<String>("udp_queue_size")
         .unwrap()
