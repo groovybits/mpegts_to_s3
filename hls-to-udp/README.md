@@ -54,6 +54,7 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [htt
     - `HLS_HISTORY_SIZE`: HLS history size (default: `1800`)
     - `SEGMENT_QUEUE_SIZE`: Segment queue size (default: `32`)
     - `UDP_QUEUE_SIZE`: UDP queue size (default: `1024`)
+    - `UDP_SEND_BUFFER`: Size of the UDP Send buffer (default: `0` - OS default)
 
 ## Example
 

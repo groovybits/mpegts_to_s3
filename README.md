@@ -177,6 +177,7 @@ SEGMENT_DURATION_SECONDS=2 \
   - `HLS_HISTORY_SIZE`: Number of segments to keep in the live m3u8 (default: `1800`)
   - `SEGMENT_QUEUE_SIZE`: Size of the segment queue (default: `32`)
   - `UDP_QUEUE_SIZE`: Size of the UDP queue (default: `1024`)
+  - `UDP_SEND_BUFFER`: Size of the UDP Send buffer (default: `0` - OS default)
 
 ---
 

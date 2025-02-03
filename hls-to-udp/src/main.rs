@@ -204,6 +204,7 @@ fn sender_thread(
     rate: i32,
     smoother_max_bytes: usize,
     udp_queue_size: usize,
+    udp_send_buffer: usize,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -227,23 +228,30 @@ fn sender_thread(
         };
 
         // Configure socket before converting to std::net::UdpSocket
-        let desired_send_buffer = 2 * 1024 * 1024; // 2MB
-        if let Err(e) = socket.set_send_buffer_size(desired_send_buffer) {
-            eprintln!("SenderThread: Failed to set send buffer: {}", e);
-        }
+        if udp_send_buffer > 0 {
+            log::info!(
+                "SenderThread: Setting send buffer to {} bytes.",
+                udp_send_buffer
+            );
 
-        // Get actual buffer size
-        match socket.send_buffer_size() {
-            Ok(actual) => {
-                if actual < desired_send_buffer {
-                    log::warn!(
+            let desired_send_buffer = udp_send_buffer;
+            if let Err(e) = socket.set_send_buffer_size(desired_send_buffer) {
+                eprintln!("SenderThread: Failed to set send buffer: {}", e);
+            }
+
+            // Get actual buffer size
+            match socket.send_buffer_size() {
+                Ok(actual) => {
+                    if actual < desired_send_buffer {
+                        log::warn!(
                         "OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.",
                         actual / 1024,
                         desired_send_buffer / 1024
                     );
+                    }
                 }
+                Err(e) => eprintln!("SenderThread: Couldn't get buffer size: {}", e),
             }
-            Err(e) => eprintln!("SenderThread: Couldn't get buffer size: {}", e),
         }
 
         // Convert to stdlib socket
@@ -611,6 +619,13 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("udp_send_buffer")
+                .short('b')
+                .long("udp-send-buffer")
+                .default_value("0")
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("max_bitrate")
                 .long("max-bitrate")
                 .help("Maximum output bitrate in kbps")
@@ -640,6 +655,11 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<usize>()
         .unwrap_or(1024);
+    let udp_send_buffer = matches
+        .get_one::<String>("max_burst")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(0);
     let segment_queue_size = matches
         .get_one::<String>("segment_queue_size")
         .unwrap()
@@ -714,6 +734,7 @@ fn main() -> Result<()> {
     println!("  Verbose: {}", verbose);
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
+    println!("   UDP Send Buffer Size: {}", udp_send_buffer);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
@@ -733,6 +754,7 @@ fn main() -> Result<()> {
         rate,
         max_bytes_threshold,
         udp_queue_size,
+        udp_send_buffer,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),

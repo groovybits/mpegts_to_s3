@@ -20,6 +20,7 @@ while [ : ]; do
         -s ${HLS_HISTORY_SIZE} \
         -q ${SEGMENT_QUEUE_SIZE} \
         -z ${UDP_QUEUE_SIZE} \
+        -b ${UDP_SEND_BUFFER} \
             $@
     sleep 1
 done
