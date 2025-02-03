@@ -76,6 +76,7 @@ fn receiver_thread(
         };
         let mut seg_history = SegmentHistory::new(hist_capacity);
         let mut next_seg_id: usize = 1;
+        let mut first_poll = true;
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -119,6 +120,15 @@ fn receiver_thread(
                     continue;
                 }
             };
+
+            if first_poll {
+                for seg in &media_pl.segments {
+                    seg_history.insert(seg.uri.to_string());
+                }
+                first_poll = false;
+                thread::sleep(Duration::from_millis(poll_interval_ms));
+                continue;
+            }
 
             for seg in &media_pl.segments {
                 if shutdown_flag.load(Ordering::SeqCst) {
