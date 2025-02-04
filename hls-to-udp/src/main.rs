@@ -459,7 +459,7 @@ fn sender_thread(
                 }
             }
 
-            // If we have a PCR PID, drop the model now (no longer needed)
+            // If we have a PCR PID, drop the model
             if pcr_pid > 0 && model.is_some() {
                 log::info!("SenderThread: Dropping model after PCR PID detected.");
                 model.take(); // drop it
@@ -487,10 +487,18 @@ fn sender_thread(
                             current_size,
                             smoother_max_bytes
                         );
-                        //s.reset(); // FIXME: This seems overboard, just drop for now
+                        s.reset(); // FIXME: This seems overboard, just drop for now
                     } else {
-                        // Write TS data into the smoothing logic
-                        let _ = s.write(&seg.data);
+                        // split data into 7 * 188 byte packets
+                        /*let mut pos = 0;
+                        while pos < seg.data.len() {
+                            let end = std::cmp::min(pos + pkt_size as usize, seg.data.len());
+                            let _ = s.write(&seg.data[pos..end].to_vec());
+                            // sleep for a bit to simulate network delay
+                            //thread::sleep(Duration::from_millis(1));
+                            pos = end;
+                        }*/
+                        let _ = s.write(seg.data);
                     }
                     // drop data
                     drop(seg.data);
@@ -628,22 +636,10 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("max_bitrate")
-                .long("max-bitrate")
-                .help("Maximum output bitrate in kbps")
-                .default_value("5000"),
-        )
-        .arg(
-            Arg::new("max_burst")
-                .long("max-burst")
-                .help("Maximum burst size in kilobytes")
-                .default_value("1000"),
-        )
-        .arg(
             Arg::new("max_bytes_threshold")
                 .long("max-bytes-threshold")
                 .help("Maximum bytes in smoother queue before reset")
-                .default_value("200_000_000"),
+                .default_value("500_000_000"),
         )
         .get_matches();
 
@@ -651,14 +647,14 @@ fn main() -> Result<()> {
         .get_one::<String>("max_bytes_threshold")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(200_000_000);
+        .unwrap_or(500_000_000);
     let udp_queue_size = matches
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
         .unwrap_or(1024);
     let udp_send_buffer = matches
-        .get_one::<String>("max_burst")
+        .get_one::<String>("udp_send_buffer")
         .unwrap()
         .parse::<usize>()
         .unwrap_or(0);
