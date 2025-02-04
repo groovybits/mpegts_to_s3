@@ -76,6 +76,7 @@ fn receiver_thread(
         };
         let mut seg_history = SegmentHistory::new(hist_capacity);
         let mut next_seg_id: usize = 1;
+        let mut first_poll = true;
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -119,6 +120,15 @@ fn receiver_thread(
                     continue;
                 }
             };
+
+            if first_poll {
+                for seg in &media_pl.segments {
+                    seg_history.insert(seg.uri.to_string());
+                }
+                first_poll = false;
+                thread::sleep(Duration::from_millis(poll_interval_ms));
+                continue;
+            }
 
             for seg in &media_pl.segments {
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -194,15 +204,15 @@ fn sender_thread(
     rate: i32,
     smoother_max_bytes: usize,
     udp_queue_size: usize,
-    retries: usize,
+    udp_send_buffer: usize,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut pcr_pid = pcr_pid_arg;
-        let mut stats_dropped = 0;
-        let mut stats_sent = 0;
+        let mut stats_dropped = 0usize;
+        let mut stats_sent = 0usize;
 
         // Create raw socket with socket2
         let socket = match socket2::Socket::new(
@@ -218,45 +228,56 @@ fn sender_thread(
         };
 
         // Configure socket before converting to std::net::UdpSocket
-        let desired_send_buffer = 2 * 1024 * 1024; // 2MB
-        if let Err(e) = socket.set_send_buffer_size(desired_send_buffer) {
-            eprintln!("SenderThread: Failed to set send buffer: {}", e);
-        }
+        if udp_send_buffer > 0 {
+            log::info!(
+                "SenderThread: Setting send buffer to {} bytes.",
+                udp_send_buffer
+            );
 
-        // Get actual buffer size
-        match socket.send_buffer_size() {
-            Ok(actual) => {
-                if actual < desired_send_buffer {
-                    log::warn!(
+            let desired_send_buffer = udp_send_buffer;
+            if let Err(e) = socket.set_send_buffer_size(desired_send_buffer) {
+                eprintln!("SenderThread: Failed to set send buffer: {}", e);
+            }
+
+            // Get actual buffer size
+            match socket.send_buffer_size() {
+                Ok(actual) => {
+                    if actual < desired_send_buffer {
+                        log::warn!(
                         "OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.",
                         actual / 1024,
                         desired_send_buffer / 1024
                     );
+                    }
                 }
+                Err(e) => eprintln!("SenderThread: Couldn't get buffer size: {}", e),
             }
-            Err(e) => eprintln!("SenderThread: Couldn't get buffer size: {}", e),
         }
 
         // Convert to stdlib socket
         let sock: std::net::UdpSocket = socket.into();
 
-        // Set non-blocking mode to prevent send from blocking
+        // Keep socket in non-blocking mode (hybrid approach: we do small manual blocking when full)
         if let Err(e) = sock.set_nonblocking(true) {
             eprintln!("SenderThread: Failed to set non-blocking socket: {}", e);
             return;
         }
 
+        // Connect the UDP socket
         if let Err(e) = sock.connect(&udp_addr) {
             eprintln!("SenderThread: Failed to connect UDP socket: {}", e);
             return;
         }
+
         let sock = Arc::new(sock); // Wrap in Arc for thread safety
 
-        // setup channels for smoother callback to use to send data to a udp sending thread
+        // --- Channels for the Smoother callback => UDP send thread
         let (smoother_tx, smoother_rx) = mpsc::sync_channel(udp_queue_size);
+
+        // This callback is given to the Smoother to produce chunked TS data
         let smoother_callback = |v: Vec<u8>| {
             log::debug!(
-                "SmootherCallback: received buffer with {} bytes, sending to UDP.",
+                "SmootherCallback: received buffer with {} bytes for UDP.",
                 v.len()
             );
             if let Err(e) = smoother_tx.send(v) {
@@ -264,85 +285,93 @@ fn sender_thread(
                     "SmootherCallback: Failed to send buffer to UDP thread: {}",
                     e
                 );
+                // Attempt to shut down gracefully if the channel is disconnected
                 tx_shutdown.send(()).ok();
             }
         };
 
-        // smoother thread to send data to UDP from the packets sent from the smoother callback smoother_tx
+        // --- UDP-sending thread, reading from smoother_rx channel
         let sock_clone = Arc::clone(&sock);
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+
+        // Time-based approach to blocking, define a max wait:
+        let max_block_ms = 50; // ms total wait if OS buffer is full
+
         let smoother_thread = thread::spawn(move || {
-            let mut retry_count = 0;
+            log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
+            use std::time::Instant;
+
             loop {
-                // Use recv_timeout to avoid indefinite blocking
+                // We poll for new chunks with a short timeout, so we can check shutdown.
                 match smoother_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(data) => {
-                        log::debug!(
-                            "SenderThread: SmootherThread: received buffer with {} bytes, sending to UDP.",
-                            data.len()
-                        );
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::info!("SmootherThread: Shutdown flag set, exiting.");
                             break;
                         }
+
+                        // Attempt to send this data to UDP
+                        let mut dropped = false;
+                        let start_time = Instant::now();
+
                         loop {
-                            if shutdown_flag_clone.load(Ordering::SeqCst) {
-                                log::info!("SmootherThread: Shutdown flag set, breaking loop.");
-                                break;
-                            }
                             match sock_clone.send(&data) {
-                                Ok(_) => {
+                                Ok(bytes_sent) => {
+                                    // If partial sends are possible on your platform, check `bytes_sent`.
+                                    // Typically for UDP, it's all or nothing.
                                     stats_sent += 1;
-                                    if retry_count > 0 {
-                                        log::warn!(
-                                            "SmootherThread: Retried {} times, sent packet of sent={} dropped={}",
-                                            retry_count,
+                                    log::debug!("SmootherThread: Packet of {} bytes sent of {} bytes data len.", bytes_sent, data.len());
+                                    break; // Successfully sent
+                                }
+                                Err(e) => {
+                                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                                        // The OS buffer is full. We'll wait up to max_block_ms total
+                                        let elapsed_ms = start_time.elapsed().as_millis();
+                                        if elapsed_ms > max_block_ms as u128 {
+                                            stats_dropped += 1;
+                                            dropped = true;
+                                            log::warn!(
+                                                "SmootherThread: Socket still full after {}ms. \
+                                                 Dropping packet. (sent={}, dropped={})",
+                                                elapsed_ms,
+                                                stats_sent,
+                                                stats_dropped
+                                            );
+                                            break;
+                                        }
+                                        // Sleep a little and retry
+                                        thread::sleep(Duration::from_millis(1));
+                                        continue;
+                                    } else {
+                                        // Fatal error or something else => drop this packet
+                                        stats_dropped += 1;
+                                        dropped = true;
+                                        log::error!(
+                                            "SmootherThread: UDP error: {}. Dropping packet. \
+                                             (sent={}, dropped={})",
+                                            e,
                                             stats_sent,
                                             stats_dropped
                                         );
-                                    }
-                                    retry_count = 0;
-                                    break;
-                                }
-                                Err(e) => {
-                                    // Handle WouldBlock specifically
-                                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                                        log::warn!(
-                                        "SmootherThread: UDP socket buffer full, dropping packet of sent={} dropped={}",
-                                        stats_sent, stats_dropped
-                                        );
-                                    } else {
-                                        log::error!("SmootherThread: Fatal UDP error: {}", e);
-                                        retry_count = 0;
-                                        stats_dropped += 1;
                                         break;
                                     }
                                 }
                             }
-                            if retry_count >= retries {
-                                log::error!(
-                                    "SmootherThread: Retried {} times, dropping packet of sent={} dropped={}",
-                                    retries,
-                                    stats_sent,
-                                    stats_dropped
-                                );
-                                stats_dropped += 1;
-                                retry_count = 0;
-                                break;
-                            } else {
-                                retry_count += 1;
-                                // sleep 1ms before retrying
-                                thread::sleep(Duration::from_millis(1));
-                            }
                         }
-                        // free data buffer
-                        drop(data);
+
+                        if dropped {
+                            // Just discard `data`.
+                            log::debug!("SmootherThread: Packet dropped due to blocking or error.");
+                        }
+
+                        // Finally check for shutdown again
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::info!("SmootherThread: Shutdown flag set, exiting.");
                             break;
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
+                        // Periodically check shutdown
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::info!("SmootherThread: Shutdown flag set, exiting.");
                             break;
@@ -355,16 +384,18 @@ fn sender_thread(
                     }
                 }
             }
-            log::info!("SmootherThread: exiting.");
+            log::info!(
+                "SmootherThread: exiting. Sent={}, Dropped={}",
+                stats_sent,
+                stats_dropped
+            );
         });
 
-        // setup channels to communicate pcr pid and bitrate to the smoother in the rx.recv() loop for setup
+        // --- If we are auto-detecting PCR, create a channel from the StreamModel callback
         let (pcr_tx, pcr_rx) = mpsc::channel();
 
-        // setup callback for stream model to detect pcr pid
         let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
             log::info!("StreamModelCallback: received PAT.");
-
             if pat.program_count > 0 {
                 log::info!(
                     "StreamModelCallback: PAT has {} programs.",
@@ -383,65 +414,61 @@ fn sender_thread(
                             i,
                             p.pmt.PCR_PID
                         );
-                        if let Err(e) = pcr_tx.send(p.pmt.PCR_PID) {
-                            log::error!(
-                                "StreamModelCallback: Failed to send PCR to smoother: {}",
-                                e
-                            );
-                        }
-                        break; // Only one program handled for now
+                        let _ = pcr_tx.send(p.pmt.PCR_PID);
+                        break;
                     }
                 }
             } else {
                 log::error!("StreamModelCallback: PAT has no programs.");
-                return;
             }
         };
 
+        // Conditionally create a StreamModel if pcr_pid_arg == 0
         let mut model: Option<StreamModel<_>> = if pcr_pid_arg == 0 {
             Some(StreamModel::new(sm_callback))
         } else {
             None
         };
+
+        // We'll create the smoother once we have a known pcr_pid
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
+        // Process each downloaded segment from the receiver_thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
-                "SenderThread: processing segment #{} of {}bytes and {}s duration",
+                "SenderThread: Segment #{} => {} bytes, {} sec",
                 seg.id,
                 seg.data.len(),
                 seg.duration
             );
+
             if shutdown_flag.load(Ordering::SeqCst) {
                 log::info!("SenderThread: Shutdown flag set, exiting.");
                 break;
             }
 
-            // write the segment to the model for the pcr pid detection if not given
-            if pcr_pid <= 0 && model.is_some() {
+            // If we haven't locked a pcr_pid yet, feed data to the StreamModel for detection
+            if pcr_pid == 0 {
                 if let Some(ref mut m) = model {
                     let _ = m.write(&seg.data);
-                    if let Ok(pcr_pid_detected) = pcr_rx.try_recv() {
-                        if pcr_pid != pcr_pid_detected as u16 {
-                            log::info!("SenderThread: received new PCR PID: {}", pcr_pid_detected);
-                            pcr_pid = pcr_pid_detected as u16;
-                        }
+                    // See if a new PID was detected
+                    if let Ok(detected) = pcr_rx.try_recv() {
+                        pcr_pid = detected as u16;
+                        log::info!("SenderThread: Detected new PCR PID = 0x{:x}", pcr_pid);
                     }
                 }
             }
 
-            // drop the model if we have a pcr pid
+            // If we have a PCR PID, drop the model now (no longer needed)
             if pcr_pid > 0 && model.is_some() {
-                log::warn!("SenderThread: Dropping model after PCR PID detected.");
-                if let Some(m) = model.take() {
-                    drop(m);
-                }
+                log::info!("SenderThread: Dropping model after PCR PID detected.");
+                model.take(); // drop it
             }
 
-            // Send to the smoother if we have a pcr pid
+            // Now feed data into the PcrSmoother if we have a valid PID
             if pcr_pid > 0 {
-                // setup smoother if not already setup
                 if smoother.is_none() {
+                    // create the smoother
                     smoother = Some(PcrSmoother::new(
                         pcr_pid,
                         rate,
@@ -450,14 +477,16 @@ fn sender_thread(
                         Box::new(smoother_callback),
                     ));
                 }
+
                 if let Some(ref mut s) = smoother {
+                    // Write TS data into the smoothing logic
                     let _ = s.write(&seg.data);
 
-                    // Check size
+                    // If the backlog in the smoother is above threshold, reset
                     let current_size = s.get_size();
-                    if current_size > smoother_max_bytes.try_into().unwrap() {
+                    if current_size > smoother_max_bytes as i64 {
                         log::warn!(
-                            "Smoother backlog {} > threshold {}, forcing reset!",
+                            "Smoother backlog = {} > threshold {}. Forcing reset!",
                             current_size,
                             smoother_max_bytes
                         );
@@ -465,29 +494,26 @@ fn sender_thread(
                     }
                 }
             }
+        }
 
-            if shutdown_flag.load(Ordering::SeqCst) {
-                log::info!("SenderThread: Shutdown flag set, exiting.");
-                break;
-            }
+        // Cleanup
+        if let Some(m) = model.take() {
+            log::warn!("SenderThread: Dropping unused StreamModel on exit.");
+            drop(m);
         }
-        if model.is_some() {
-            log::warn!("SenderThread: Model not freed, dropping.");
-            if let Some(m) = model {
-                drop(m);
-            }
-        }
-        if let Some(s) = smoother {
-            log::info!("SenderThread: Dropping smoother.");
+        if let Some(s) = smoother.take() {
+            log::info!("SenderThread: Dropping smoother on exit.");
             drop(s);
         }
 
-        log::info!("SenderThread: sending shutdown signal to smoother.");
-        tx_shutdown.send(()).ok();
+        // Tell the smoother_thread to shut down
+        log::info!("SenderThread: sending shutdown signal to smoother thread.");
+        let _ = tx_shutdown.send(());
 
-        // wait for smoother thread to exit
-        log::info!("SenderThread: waiting for smoother thread to exit.");
-        smoother_thread.join().unwrap();
+        // Wait for the smoother thread to exit
+        log::info!("SenderThread: waiting for smoother thread to exit...");
+        let _ = smoother_thread.join();
+
         println!("SenderThread: exiting.");
     })
 }
@@ -593,6 +619,13 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("udp_send_buffer")
+                .short('b')
+                .long("udp-send-buffer")
+                .default_value("0")
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("max_bitrate")
                 .long("max-bitrate")
                 .help("Maximum output bitrate in kbps")
@@ -605,16 +638,10 @@ fn main() -> Result<()> {
                 .default_value("1000"),
         )
         .arg(
-            Arg::new("send_retries")
-                .long("send_retries")
-                .help("Number of retries before dropping packet")
-                .default_value("0"),
-        )
-        .arg(
             Arg::new("max_bytes_threshold")
                 .long("max-bytes-threshold")
                 .help("Maximum bytes in smoother queue before reset")
-                .default_value("120_000_000"),
+                .default_value("200_000_000"),
         )
         .get_matches();
 
@@ -622,17 +649,17 @@ fn main() -> Result<()> {
         .get_one::<String>("max_bytes_threshold")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(120_000_000);
-    let send_retries = matches
-        .get_one::<String>("send_retries")
-        .unwrap()
-        .parse::<usize>()
-        .unwrap_or(0);
+        .unwrap_or(200_000_000);
     let udp_queue_size = matches
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
         .unwrap_or(1024);
+    let udp_send_buffer = matches
+        .get_one::<String>("max_burst")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(0);
     let segment_queue_size = matches
         .get_one::<String>("segment_queue_size")
         .unwrap()
@@ -707,7 +734,7 @@ fn main() -> Result<()> {
     println!("  Verbose: {}", verbose);
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
-    println!("  Send Retries: {}", send_retries);
+    println!("   UDP Send Buffer Size: {}", udp_send_buffer);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
@@ -727,7 +754,7 @@ fn main() -> Result<()> {
         rate,
         max_bytes_threshold,
         udp_queue_size,
-        send_retries,
+        udp_send_buffer,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
