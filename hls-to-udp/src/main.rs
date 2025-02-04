@@ -479,9 +479,6 @@ fn sender_thread(
                 }
 
                 if let Some(ref mut s) = smoother {
-                    // Write TS data into the smoothing logic
-                    let _ = s.write(&seg.data);
-
                     // If the backlog in the smoother is above threshold, reset
                     let current_size = s.get_size();
                     if current_size > smoother_max_bytes as i64 {
@@ -490,8 +487,13 @@ fn sender_thread(
                             current_size,
                             smoother_max_bytes
                         );
-                        s.reset();
+                        //s.reset(); // FIXME: This seems overboard, just drop for now
+                    } else {
+                        // Write TS data into the smoothing logic
+                        let _ = s.write(&seg.data);
                     }
+                    // drop data
+                    drop(seg.data);
                 }
             }
         }
@@ -734,7 +736,7 @@ fn main() -> Result<()> {
     println!("  Verbose: {}", verbose);
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
-    println!("   UDP Send Buffer Size: {}", udp_send_buffer);
+    println!("  UDP Send Buffer Size: {}", udp_send_buffer);
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);

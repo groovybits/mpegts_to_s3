@@ -24,7 +24,7 @@ log = "0.4.25"
 m3u8-rs = "6"
 reqwest = { version = "0.11", features = ["blocking"] }
 url = "2.2"
-libltntstools-sys = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", branch = "smoother_ram" }
-libltntstools = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", branch = "smoother_ram" }
+libltntstools-sys = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", rev = "c80c5509b404027c87507e33b7cb2d46436b5b83" }
+libltntstools = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", rev = "c80c5509b404027c87507e33b7cb2d46436b5b83" }
 socket2 = "0.5.8"
 ctrlc = "3.4.5"
