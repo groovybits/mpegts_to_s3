@@ -12,7 +12,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 #[derive(Debug)]
@@ -299,7 +299,6 @@ fn sender_thread(
 
         let smoother_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
-            use std::time::Instant;
 
             loop {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
@@ -479,28 +478,21 @@ fn sender_thread(
                 }
 
                 if let Some(ref mut s) = smoother {
-                    // If the backlog in the smoother is above threshold, reset
-                    let current_size = s.get_size();
-                    if current_size > smoother_max_bytes as i64 {
-                        log::warn!(
-                            "Smoother backlog = {} > threshold {}. Forcing reset!",
-                            current_size,
-                            smoother_max_bytes
-                        );
-                        s.reset(); // FIXME: This seems overboard, just drop for now
-                    } else {
-                        // split data into 7 * 188 byte packets
-                        /*let mut pos = 0;
-                        while pos < seg.data.len() {
-                            let end = std::cmp::min(pos + pkt_size as usize, seg.data.len());
-                            let _ = s.write(&seg.data[pos..end].to_vec());
-                            // sleep for a bit to simulate network delay
-                            //thread::sleep(Duration::from_millis(1));
-                            pos = end;
-                        }*/
-                        let _ = s.write(seg.data);
+                    let start_wait = Instant::now();
+                    // Wait until the smoother's buffer size is below the threshold
+                    while s.get_size() > smoother_max_bytes as i64 {
+                        if start_wait.elapsed() > Duration::from_secs(3) {
+                            log::warn!(
+                                "Smoother backlog = {} > threshold {} for over 3 seconds. Resetting smoother!",
+                                s.get_size(),
+                                smoother_max_bytes
+                            );
+                            s.reset();
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
                     }
-                    // drop data
+                    let _ = s.write(&seg.data);
                     drop(seg.data);
                 }
             }
