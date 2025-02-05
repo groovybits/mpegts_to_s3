@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
+use hls_to_udp::PidTracker;
 #[cfg(feature = "libltntstools_enabled")]
 use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
@@ -374,6 +375,9 @@ fn sender_thread(
         let udp_sender_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
 
+            // Create a PidTracker to track PIDs and Continuity Counter Errors
+            let mut pid_tracker = PidTracker::new();
+
             loop {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
                 match smoother_rx.recv_timeout(Duration::from_millis(100)) {
@@ -381,6 +385,17 @@ fn sender_thread(
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::info!("SmootherThread: Shutdown flag set, exiting.");
                             break;
+                        }
+
+                        let num_packets = data.len() / 188;
+                        for i in 0..num_packets {
+                            let start = i * 188;
+                            let end = start + 188;
+                            let ts_packet = &data[start..end];
+                            if let Err(e) = pid_tracker.process_packet(ts_packet) {
+                                eprintln!("Error processing TS packet: {:?}", e);
+                                break;
+                            }
                         }
 
                         // Attempt to send this data to UDP

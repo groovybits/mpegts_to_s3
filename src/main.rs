@@ -31,6 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use udp_to_hls::PidTracker;
 
 use env_logger;
 
@@ -1271,12 +1272,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let mut cap = Capture::from_device(interface.as_str())?
-        .promisc(true)
+        .promisc(false)
         .buffer_size(get_buffer_size())
         .snaplen(get_snaplen())
         .timeout(timeout)
+        .immediate_mode(false)
         .open()?;
 
+    /*let mut cap = cap
+        .setnonblock()
+        .map_err(|e| format!("Failed to set non-blocking mode: {:?}", e))?;
+    */
     let filter_expr = format!("udp and host {} and port {}", filter_ip, filter_port);
     debug!("Setting pcap filter to '{}'", filter_expr);
     cap.filter(&filter_expr, true)?;
@@ -1330,6 +1336,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // Create a PidTracker to track PIDs and Continuity Counter Errors
+    let mut pid_tracker = PidTracker::new();
+
     debug!("Starting main capture loop now...");
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
@@ -1351,11 +1360,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
+        // Split the TS payload into 188-byte packets and feed each into PidTracker
         if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
-            // If manual segmenting
             if let Some(seg) = manual_segmenter.as_mut() {
                 if let Err(e) = seg.write_ts(ts_payload).await {
                     eprintln!("Error writing manual TS segment: {:?}", e);
+                    break;
+                };
+            }
+            let num_packets = ts_payload.len() / 188;
+            for i in 0..num_packets {
+                let start = i * 188;
+                let end = start + 188;
+                let ts_packet = &ts_payload[start..end];
+                if let Err(e) = pid_tracker.process_packet(ts_packet) {
+                    eprintln!("Error processing TS packet: {:?}", e);
                     break;
                 }
             }

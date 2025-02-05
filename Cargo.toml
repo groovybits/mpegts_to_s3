@@ -11,6 +11,9 @@ repository = "https://github.com/groovybits/mpegts_to_s3"
 authors = ["groovybits"]
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
 # Build release optimized with debug info
 [profile.release]
 opt-level = 3
