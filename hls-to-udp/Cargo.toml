@@ -24,7 +24,7 @@ log = "0.4.25"
 m3u8-rs = "6"
 reqwest = { version = "0.11", features = ["blocking"] }
 url = "2.2"
-libltntstools-sys = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", rev = "31889e1dbc29aa42e5f9697970d4c305802ed404" }
-libltntstools = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", rev = "31889e1dbc29aa42e5f9697970d4c305802ed404" }
+libltntstools-sys = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", rev = "2b69c15f2184d01d6e36521683aa1aa37abb8c74" }
+libltntstools = { version = "0.1.0", git = "https://github.com/groovybits/libltntstools", rev = "2b69c15f2184d01d6e36521683aa1aa37abb8c74" }
 socket2 = "0.5.8"
 ctrlc = "3.4.5"

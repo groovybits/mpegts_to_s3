@@ -9,6 +9,12 @@ cleanup() {
     exit 0
 }
 
+if [ "${USE_SMOOTHER}" = "true" ]; then
+    SMOOTHER_ARGS="--use-smoother"
+else
+    SMOOTHER_ARGS=""
+fi
+
 trap cleanup SIGINT SIGTERM
 
 while [ : ]; do
@@ -21,6 +27,8 @@ while [ : ]; do
         -q ${SEGMENT_QUEUE_SIZE} \
         -z ${UDP_QUEUE_SIZE} \
         -b ${UDP_SEND_BUFFER} \
+        ${SMOOTHER_ARGS} \
+        ${EXTRA_ARGS} \
             $@
     sleep 1
 done

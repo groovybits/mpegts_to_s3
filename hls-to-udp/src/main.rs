@@ -205,6 +205,7 @@ fn sender_thread(
     smoother_max_bytes: usize,
     udp_queue_size: usize,
     udp_send_buffer: usize,
+    use_smoother: bool,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -295,7 +296,7 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 50; // ms total wait if OS buffer is full
+        let max_block_ms = 2000; // ms total wait if OS buffer is full
 
         let smoother_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
@@ -310,57 +311,59 @@ fn sender_thread(
                         }
 
                         // Attempt to send this data to UDP
-                        let mut dropped = false;
                         let start_time = Instant::now();
 
-                        loop {
-                            match sock_clone.send(&data) {
-                                Ok(bytes_sent) => {
-                                    // If partial sends are possible on your platform, check `bytes_sent`.
-                                    // Typically for UDP, it's all or nothing.
-                                    stats_sent += 1;
-                                    log::debug!("SmootherThread: Packet of {} bytes sent of {} bytes data len.", bytes_sent, data.len());
-                                    break; // Successfully sent
-                                }
-                                Err(e) => {
-                                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                                        // The OS buffer is full. We'll wait up to max_block_ms total
-                                        let elapsed_ms = start_time.elapsed().as_millis();
-                                        if elapsed_ms > max_block_ms as u128 {
+                        const CHUNK_SIZE: usize = 7 * 188;
+                        // Divide the data into CHUNK_SIZE chunks (with a possible smaller chunk at the end)
+                        for chunk in data.chunks(CHUNK_SIZE) {
+                            let mut chunk_dropped = false;
+                            loop {
+                                match sock_clone.send(chunk) {
+                                    Ok(bytes_sent) => {
+                                        // For UDP all or nothing is typical,
+                                        // but we log the sent bytes for completeness.
+                                        stats_sent += 1;
+                                        log::debug!(
+                                            "SmootherThread: Packet of {} bytes sent from a chunk of {} bytes.",
+                                            bytes_sent,
+                                            chunk.len()
+                                        );
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                                            let elapsed_ms = start_time.elapsed().as_millis();
+                                            if elapsed_ms > max_block_ms as u128 {
+                                                stats_dropped += 1;
+                                                chunk_dropped = true;
+                                                log::warn!(
+                                                    "SmootherThread: Socket still full after {}ms. Dropping chunk. (sent={}, dropped={})",
+                                                    elapsed_ms,
+                                                    stats_sent,
+                                                    stats_dropped
+                                                );
+                                                break;
+                                            }
+                                            thread::sleep(Duration::from_millis(1));
+                                        } else {
                                             stats_dropped += 1;
-                                            dropped = true;
-                                            log::warn!(
-                                                "SmootherThread: Socket still full after {}ms. \
-                                                 Dropping packet. (sent={}, dropped={})",
-                                                elapsed_ms,
+                                            chunk_dropped = true;
+                                            log::error!(
+                                                "SmootherThread: UDP error: {}. Dropping chunk. (sent={}, dropped={})",
+                                                e,
                                                 stats_sent,
                                                 stats_dropped
                                             );
                                             break;
                                         }
-                                        // Sleep a little and retry
-                                        thread::sleep(Duration::from_millis(1));
-                                        continue;
-                                    } else {
-                                        // Fatal error or something else => drop this packet
-                                        stats_dropped += 1;
-                                        dropped = true;
-                                        log::error!(
-                                            "SmootherThread: UDP error: {}. Dropping packet. \
-                                             (sent={}, dropped={})",
-                                            e,
-                                            stats_sent,
-                                            stats_dropped
-                                        );
-                                        break;
                                     }
                                 }
                             }
-                        }
-
-                        if dropped {
-                            // Just discard `data`.
-                            log::debug!("SmootherThread: Packet dropped due to blocking or error.");
+                            if chunk_dropped {
+                                log::debug!(
+                                    "SmootherThread: Chunk dropped due to blocking or error."
+                                );
+                            }
                         }
 
                         // Finally check for shutdown again
@@ -466,7 +469,7 @@ fn sender_thread(
 
             // Now feed data into the PcrSmoother if we have a valid PID
             if pcr_pid > 0 {
-                if smoother.is_none() {
+                if use_smoother && smoother.is_none() {
                     // create the smoother
                     smoother = Some(PcrSmoother::new(
                         pcr_pid,
@@ -477,7 +480,10 @@ fn sender_thread(
                     ));
                 }
 
-                if let Some(ref mut s) = smoother {
+                if !use_smoother {
+                    // send directly into channel as UDP packets
+                    let _ = smoother_tx.send(seg.data.to_vec());
+                } else if let Some(ref mut s) = smoother {
                     let start_wait = Instant::now();
                     // Wait until the smoother's buffer size is below the threshold
                     while s.get_size() > smoother_max_bytes as i64 {
@@ -633,8 +639,15 @@ fn main() -> Result<()> {
                 .help("Maximum bytes in smoother queue before reset")
                 .default_value("500_000_000"),
         )
+        .arg(
+            Arg::new("use_smoother")
+                .long("use-smoother")
+                .action(clap::ArgAction::SetTrue)
+                .help("Use the PcrSmoother for rate control (default: false)"),
+        )
         .get_matches();
 
+    let use_smoother = matches.get_flag("use_smoother");
     let max_bytes_threshold = matches
         .get_one::<String>("max_bytes_threshold")
         .unwrap()
@@ -745,6 +758,7 @@ fn main() -> Result<()> {
         max_bytes_threshold,
         udp_queue_size,
         udp_send_buffer,
+        use_smoother,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
