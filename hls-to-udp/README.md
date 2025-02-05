@@ -2,7 +2,7 @@
 
 This Rust-based client reads from an HLS M3U8 playlist and rebroadcasts it as MPEG-TS over UDP. It is designed to handle the HLS produced by https://github.com/groovybits/mpegts_to_s3.git and is intended to be used as a relay for replaying that content.
 
-To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [https://github.com/LTNGlobal-opensource/libltntstools](https://github.com/LTNGlobal-opensource/libltntstools). 
+To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [https://github.com/LTNGlobal-opensource/libltntstools](https://github.com/LTNGlobal-opensource/libltntstools) you must build with the `libltntstools_enabled` feature flag set.
 
 ## Features
 
@@ -14,6 +14,7 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [htt
 - Rust (latest stable version)
 - Cargo (Rust package manager)
 - LibPcap
+- LibLTNTSTools (optional) Use the `libltntstools_enabled` feature flag to enable the Bitrate Smoother
 
 ## Installation
 
@@ -31,16 +32,16 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [htt
     | **-u, --m3u8-url <m3u8_url>**                          | The URL of the M3U8 playlist                      | (none)  |
     | **-o, --udp-output <udp_output>**                      | The destination UDP address                       | (none)  |
     | **-p, --poll-ms <poll_ms>**                            | The poll interval in milliseconds                 | 100     |
-    | **-s, --history-size <history_size>**                  | The number of segments to retain                  | 1800    |
+    | **-s, --history-size <history_size>**                  | The number of segments to retain                  | 999999  |
     | **-v, --verbose <verbose>**                            | Verbose mode                                      | 0       |
-    | **-l, --latency <latency>**                            | Additional latency in milliseconds                | 100     |
+    | **-l, --latency <latency>**                            | Additional latency in milliseconds                | 2000    |
     | **-c, --pcr-pid <pcr_pid>**                            | PID to use for PCR timestamps                     | 0x00    |
-    | **-r, --rate <rate>**                                  | Bitrate in kbps                                   | 5000    |
+    | **--smoother_buffers <count>**                         | Smoother buffer count                             | 5000    |
     | **-k, --packet-size <packet_size>**                    | TS packet size in bytes                           | 1316    |
-    | **-q, --segment-queue-size <segment_queue_size>**      | The queue size for segments                       | 32      |
-    | **-z, --udp-queue-size <udp_queue_size>**              | The queue size for UDP packets                    | 1024    |
-    | **--max-bitrate <max_bitrate>**                        | Maximum output bitrate in kbps                    | 5000    |
-    | **--max-burst <max_burst>**                            | Maximum burst size in kilobytes                   | 1000    |
+    | **-q, --segment-queue-size <segment_queue_size>**      | The queue size for segments                       | 3       |
+    | **-z, --udp-queue-size <udp_queue_size>**              | The queue size for UDP packets                    | 1       |
+    | **--use-smoother**                                     | Use the LibLTNTSTools Bitrate Smoother            | false   |
+    | **--udp-send-buffer <udp_send_buffer>**                | Size of the UDP Send buffer                       | 1358    |
     | **-h, --help**                                         | Print help                                        | -       |
     | **-V, --version**                                      | Print version                                     | -       |
 
@@ -55,6 +56,7 @@ To smooth the output we use the LTN TS Tools Bitrate Smoother Rust Bindings [htt
     - `SEGMENT_QUEUE_SIZE`: Segment queue size (default: `32`)
     - `UDP_QUEUE_SIZE`: UDP queue size (default: `1024`)
     - `UDP_SEND_BUFFER`: Size of the UDP Send buffer (default: `0` - OS default)
+    - `USE_SMOOTHER`: Use the LibLTNTSTools Bitrate Smoother (default: `false`) Requires --features=libltntstools_enabled
 
 ## Example
 
