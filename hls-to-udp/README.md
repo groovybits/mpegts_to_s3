@@ -23,6 +23,24 @@ To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [http
     cargo build --release
     ```
 
+## Live vs. VOD Mode
+
+- **Live Mode**: The client will read the M3U8 playlist and rebroadcast it as MPEG-TS over UDP.
+- **VOD Mode**: The client will read the M3U8 playlist and rebroadcast it as MPEG-TS over UDP, but will only send the segments between the `start_time` and `end_time` parameters.
+
+You need to set the `--vod` flag to enable VOD mode. The `--start-time` and `--end-time` flags are used to specify the start and end times in seconds.
+
+### VOD Mode Example
+
+This will playback the hour of 2025/02/05/05 between 10 and 120 seconds for that hour.
+
+```sh
+hls-to-udp -u "http://127.0.0.1:9000/hls/channel01/2025/02/05/05/index.m3u8/index.m3u8" \
+    -o 224.0.0.200:4800 \
+    --vod --start-time 10000 
+    --end-time 120000
+```
+
 ## Usage
 
     **hls-to-udp [OPTIONS] --m3u8-url <m3u8_url> --udp-output <udp_output_port:udp_output_ip>**
@@ -42,6 +60,9 @@ To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [http
     | **-z, --udp-queue-size <udp_queue_size>**              | The queue size for UDP packets                    | 1       |
     | **--use-smoother**                                     | Use the LibLTNTSTools Bitrate Smoother            | false   |
     | **--udp-send-buffer <udp_send_buffer>**                | Size of the UDP Send buffer                       | 1358    |
+    | **--vod**                                              | Use VOD mode                                      | false   |
+    | **--start-time <start_time>**                          | Start time in seconds                             | 0       |
+    | **--end-time <end_time>**                              | End time in seconds                               | 0       |
     | **-h, --help**                                         | Print help                                        | -       |
     | **-V, --version**                                      | Print version                                     | -       |
 
