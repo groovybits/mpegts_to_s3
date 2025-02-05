@@ -61,6 +61,8 @@ fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
 
 fn receiver_thread(
     m3u8_url: String,
+    start_time: u64,
+    end_time: u64,
     poll_interval_ms: u64,
     hist_capacity: usize,
     vod: bool,
@@ -81,6 +83,7 @@ fn receiver_thread(
         let mut next_seg_id: usize = 1;
         let mut first_poll = if vod { false } else { true };
 
+        // Main loop
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 log::info!("ReceiverThread: Shutdown flag set, exiting.");
@@ -138,11 +141,67 @@ fn receiver_thread(
                     log::info!("ReceiverThread: Shutdown flag set, breaking loop.");
                     break;
                 }
+
+                // Format of segments for time calculations
+                // http://127.0.0.1:9000/hls/channel01/2025/02/05/06/segment_20250205-060936__8511.ts
+                // bucket, channel, year, month, day, hour, segment_YYYYMMDD-HHMMSS__INDEX.ts
+
                 let uri = &seg.uri;
                 if seg_history.contains(uri) {
                     continue;
                 }
                 seg_history.insert(uri.to_string());
+
+                // If VOD mode is enabled, filter segments based on the start_time and end_time
+                if vod && (start_time > 0 || end_time > 0) {
+                    let parse_segment_offset = |uri: &str| -> Option<u64> {
+                        let filename = uri.split('/').last()?;
+                        if !filename.starts_with("segment_") {
+                            return None;
+                        }
+                        let content = &filename["segment_".len()..]; // "YYYYMMDD-HHMMSS__INDEX.ts"
+                        let parts: Vec<&str> = content.split("__").collect();
+                        let datetime_part = parts.get(0)?; // "YYYYMMDD-HHMMSS"
+                        let dt_parts: Vec<&str> = datetime_part.split('-').collect();
+                        if dt_parts.len() != 2 {
+                            return None;
+                        }
+                        let time_str = dt_parts[1]; // "HHMMSS"
+                        if time_str.len() != 6 {
+                            return None;
+                        }
+                        // Parse the minute and second fields only, ignoring the hour.
+                        let min: u64 = time_str[2..4].parse().ok()?;
+                        let sec: u64 = time_str[4..6].parse().ok()?;
+                        // Return the offset in milliseconds from the beginning of the hour.
+                        Some((min * 60 + sec) * 1000)
+                    };
+
+                    if let Some(offset_ms) = parse_segment_offset(uri) {
+                        if offset_ms < start_time {
+                            log::debug!(
+                                "Skipping segment {}: offset {}ms is before start_time {}ms",
+                                uri,
+                                offset_ms,
+                                start_time
+                            );
+                            continue;
+                        }
+                        if end_time > 0 && offset_ms > end_time {
+                            log::info!(
+                                "Segment {} offset {}ms exceeds end_time {}ms",
+                                uri,
+                                offset_ms,
+                                end_time
+                            );
+                            if vod {
+                                log::info!("VOD mode: finished processing required time range.");
+                                shutdown_flag.store(true, Ordering::SeqCst);
+                            }
+                            break;
+                        }
+                    }
+                }
 
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
@@ -667,8 +726,30 @@ fn main() -> Result<()> {
                 .action(clap::ArgAction::SetTrue)
                 .help("Use VOD mode (default: false)"),
         )
+        .arg(
+            Arg::new("start_time")
+                .long("start-time")
+                .help("Start time offset in milliseconds from start of m3u8 playlist for VOD mode (default: 0)")
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("end_time")
+                .long("end-time")
+                .help("End time offset in milliseconds from start of m3u8 playlist for VOD mode (default: 0 - end of playlist)")
+                .default_value("0"),
+        )
         .get_matches();
 
+    let start_time = matches
+        .get_one::<String>("start_time")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let end_time = matches
+        .get_one::<String>("end_time")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap_or(0);
     let vod = matches.get_flag("vod");
     #[cfg(not(feature = "libltntstools_enabled"))]
     let mut use_smoother = matches.get_flag("use_smoother");
@@ -765,6 +846,8 @@ fn main() -> Result<()> {
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
     println!("  UDP Send Buffer Size: {}", udp_send_buffer);
+    println!("  Start Time: {} ms", start_time);
+    println!("  End Time: {} ms", end_time);
 
     #[cfg(feature = "libltntstools_enabled")]
     {
@@ -784,6 +867,8 @@ fn main() -> Result<()> {
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
     let dl_handle = receiver_thread(
         m3u8_url,
+        start_time,
+        end_time,
         poll_ms,
         hist_cap,
         vod.clone(),
