@@ -2,13 +2,9 @@ use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
-#[cfg(feature = "libltntstools_enabled")]
-use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
-#[cfg(feature = "libltntstools_enabled")]
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -214,10 +210,7 @@ fn sender_thread(
     tx_shutdown: SyncSender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        #[cfg(not(feature = "libltntstools_enabled"))]
         let pcr_pid = pcr_pid_arg;
-        #[cfg(feature = "libltntstools_enabled")]
-        let mut pcr_pid = pcr_pid_arg;
         let mut stats_dropped = 0usize;
         let mut stats_sent = 0usize;
 
@@ -283,23 +276,6 @@ fn sender_thread(
 
         // --- Channels for the Smoother callback => UDP send thread
         let (smoother_tx, smoother_rx) = mpsc::sync_channel::<Vec<u8>>(udp_queue_size);
-
-        // This callback is given to the Smoother to produce chunked TS data
-        #[cfg(feature = "libltntstools_enabled")]
-        let smoother_callback = |v: Vec<u8>| {
-            log::debug!(
-                "SmootherCallback: received buffer with {} bytes for UDP.",
-                v.len()
-            );
-            if let Err(e) = smoother_tx.send(v) {
-                log::error!(
-                    "SmootherCallback: Failed to send buffer to UDP thread: {}",
-                    e
-                );
-                // Attempt to shut down gracefully if the channel is disconnected
-                tx_shutdown.send(()).ok();
-            }
-        };
 
         // --- UDP-sending thread, reading from smoother_rx channel
         let sock_clone = Arc::clone(&sock);
@@ -402,52 +378,6 @@ fn sender_thread(
             );
         });
 
-        // --- If we are auto-detecting PCR, create a channel from the StreamModel callback
-        #[cfg(feature = "libltntstools_enabled")]
-        let (pcr_tx, pcr_rx) = mpsc::channel();
-
-        #[cfg(feature = "libltntstools_enabled")]
-        let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
-            log::info!("StreamModelCallback: received PAT.");
-            if pat.program_count > 0 {
-                log::info!(
-                    "StreamModelCallback: PAT has {} programs.",
-                    pat.program_count
-                );
-                for i in 0..pat.program_count {
-                    let p = &pat.programs[i as usize];
-                    log::info!(
-                        "StreamModelCallback: Program #{}: PID: 0x{:x}",
-                        i,
-                        p.program_number
-                    );
-                    if p.pmt.PCR_PID > 0 {
-                        log::info!(
-                            "StreamModelCallback: Program #{}: PCR PID: 0x{:x}",
-                            i,
-                            p.pmt.PCR_PID
-                        );
-                        let _ = pcr_tx.send(p.pmt.PCR_PID);
-                        break;
-                    }
-                }
-            } else {
-                log::error!("StreamModelCallback: PAT has no programs.");
-            }
-        };
-
-        // Conditionally create a StreamModel if pcr_pid_arg == 0
-        #[cfg(feature = "libltntstools_enabled")]
-        let mut model: Option<StreamModel<_>> = if pcr_pid_arg == 0 && use_smoother {
-            Some(StreamModel::new(sm_callback))
-        } else {
-            None
-        };
-
-        // We'll create the smoother once we have a known pcr_pid
-        #[cfg(feature = "libltntstools_enabled")]
-        let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
-
         // Process each downloaded segment from the receiver_thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
@@ -462,70 +392,15 @@ fn sender_thread(
                 break;
             }
 
-            // If we haven't locked a pcr_pid yet, feed data to the StreamModel for detection
-            #[cfg(feature = "libltntstools_enabled")]
-            if pcr_pid == 0 && use_smoother {
-                if let Some(ref mut m) = model {
-                    let _ = m.write(&seg.data);
-                    // See if a new PID was detected
-                    if let Ok(detected) = pcr_rx.try_recv() {
-                        pcr_pid = detected as u16;
-                        log::info!("SenderThread: Detected new PCR PID = 0x{:x}", pcr_pid);
-                    }
-                }
-            }
-
-            // If we have a PCR PID, drop the model
-            #[cfg(feature = "libltntstools_enabled")]
-            if use_smoother && pcr_pid > 0 && model.is_some() {
-                log::info!("SenderThread: Dropping model after PCR PID detected.");
-                model.take(); // drop it
-            }
-
             // Now feed data into the PcrSmoother if we have a valid PID
             if !use_smoother || pcr_pid > 0 {
-                #[cfg(feature = "libltntstools_enabled")]
-                if use_smoother && smoother.is_none() {
-                    // create the smoother
-                    smoother = Some(PcrSmoother::new(
-                        pcr_pid,
-                        smoother_buffers,
-                        pkt_size,
-                        latency,
-                        Box::new(smoother_callback),
-                    ));
-                }
-
                 if !use_smoother {
                     // send directly into channel as UDP packets
                     let ret = smoother_tx.send(seg.data.to_vec());
                     if let Err(e) = ret {
                         log::error!("SenderThread: UDP send error: {}", e);
                     }
-                } else {
-                    #[cfg(feature = "libltntstools_enabled")]
-                    if let Some(ref mut s) = smoother {
-                        let ret = s.write(&seg.data);
-                        if let Err(e) = ret {
-                            log::error!("SenderThread: Smoother write error: {}", e);
-                        }
-                        drop(seg.data);
-                    }
                 }
-            }
-        }
-
-        // Cleanup
-        if use_smoother {
-            #[cfg(feature = "libltntstools_enabled")]
-            if let Some(m) = model.take() {
-                log::warn!("SenderThread: Dropping unused StreamModel on exit.");
-                drop(m);
-            }
-            #[cfg(feature = "libltntstools_enabled")]
-            if let Some(s) = smoother.take() {
-                log::info!("SenderThread: Dropping smoother on exit.");
-                drop(s);
             }
         }
 
@@ -653,18 +528,9 @@ fn main() -> Result<()> {
                 .help("Maximum bytes in smoother queue before reset")
                 .default_value("500_000_000"),
         )
-        .arg(
-            Arg::new("use_smoother")
-                .long("use-smoother")
-                .action(clap::ArgAction::SetTrue)
-                .help("Use the PcrSmoother for rate control (default: false)"),
-        )
         .get_matches();
 
-    #[cfg(not(feature = "libltntstools_enabled"))]
-    let mut use_smoother = matches.get_flag("use_smoother");
-    #[cfg(feature = "libltntstools_enabled")]
-    let use_smoother = matches.get_flag("use_smoother");
+    let use_smoother = false;
     let max_bytes_threshold = matches
         .get_one::<String>("max_bytes_threshold")
         .unwrap()
@@ -756,20 +622,6 @@ fn main() -> Result<()> {
     println!("  Segment Queue Size: {}", segment_queue_size);
     println!("  UDP Queue Size: {}", udp_queue_size);
     println!("  UDP Send Buffer Size: {}", udp_send_buffer);
-
-    #[cfg(feature = "libltntstools_enabled")]
-    {
-        log::info!("HLStoUDP: LibLTNTSTools enabled.");
-    }
-    #[cfg(not(feature = "libltntstools_enabled"))]
-    {
-        log::info!("HLStoUDP: LibLTNTSTools disabled.");
-        if use_smoother {
-            log::warn!("HLStoUDP: Smoother requested but LibLTNTSTools is disabled.");
-            log::warn!("HLStoUDP: Disabling smoother.");
-            use_smoother = false;
-        }
-    }
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
