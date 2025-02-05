@@ -63,6 +63,7 @@ fn receiver_thread(
     m3u8_url: String,
     poll_interval_ms: u64,
     hist_capacity: usize,
+    vod: bool,
     tx: SyncSender<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -78,7 +79,7 @@ fn receiver_thread(
         };
         let mut seg_history = SegmentHistory::new(hist_capacity);
         let mut next_seg_id: usize = 1;
-        let mut first_poll = true;
+        let mut first_poll = if vod { false } else { true };
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -209,6 +210,7 @@ fn sender_thread(
     udp_queue_size: usize,
     udp_send_buffer: usize,
     use_smoother: bool,
+    vod: bool,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -221,8 +223,8 @@ fn sender_thread(
         let mut stats_dropped = 0usize;
         let mut stats_sent = 0usize;
 
-        log::debug!("SenderThread: Starting UDP sender thread with input values udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, smoother_max_bytes={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
-            udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, smoother_max_bytes, udp_queue_size, udp_send_buffer, use_smoother);
+        log::debug!("SenderThread: Starting UDP sender thread with input values vod={} udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, smoother_max_bytes={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
+            vod, udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, smoother_max_bytes, udp_queue_size, udp_send_buffer, use_smoother);
 
         // Create raw socket with socket2
         let socket = match socket2::Socket::new(
@@ -659,8 +661,15 @@ fn main() -> Result<()> {
                 .action(clap::ArgAction::SetTrue)
                 .help("Use the PcrSmoother for rate control (default: false)"),
         )
+        .arg(
+            Arg::new("vod")
+                .long("vod")
+                .action(clap::ArgAction::SetTrue)
+                .help("Use VOD mode (default: false)"),
+        )
         .get_matches();
 
+    let vod = matches.get_flag("vod");
     #[cfg(not(feature = "libltntstools_enabled"))]
     let mut use_smoother = matches.get_flag("use_smoother");
     #[cfg(feature = "libltntstools_enabled")]
@@ -777,6 +786,7 @@ fn main() -> Result<()> {
         m3u8_url,
         poll_ms,
         hist_cap,
+        vod.clone(),
         tx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
@@ -791,6 +801,7 @@ fn main() -> Result<()> {
         udp_queue_size,
         udp_send_buffer,
         use_smoother,
+        vod,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
