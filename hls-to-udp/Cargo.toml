@@ -1,6 +1,6 @@
 [package]
 name = "hls-to-udp"
-version = "1.0.12"
+version = "1.0.13"
 edition = "2021"
 description = "HLS VOD to MPEG-TS UDP Re-cast."
 keywords = ["mpegts", "s3", "hls", "udp"]
