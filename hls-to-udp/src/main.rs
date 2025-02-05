@@ -498,25 +498,17 @@ fn sender_thread(
 
                 if !use_smoother {
                     // send directly into channel as UDP packets
-                    let _ = smoother_tx.send(seg.data.to_vec());
+                    let ret = smoother_tx.send(seg.data.to_vec());
+                    if let Err(e) = ret {
+                        log::error!("SenderThread: UDP send error: {}", e);
+                    }
                 } else {
                     #[cfg(feature = "libltntstools_enabled")]
                     if let Some(ref mut s) = smoother {
-                        let start_wait = Instant::now();
-                        // Wait until the smoother's buffer size is below the threshold
-                        while s.get_size() > smoother_max_bytes as i64 {
-                            if start_wait.elapsed() > Duration::from_secs(3) {
-                                log::warn!(
-                                "Smoother backlog = {} > threshold {} for over 3 seconds. Resetting smoother!",
-                                s.get_size(),
-                                smoother_max_bytes
-                            );
-                                s.reset();
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(10));
+                        let ret = s.write(&seg.data);
+                        if let Err(e) = ret {
+                            log::error!("SenderThread: Smoother write error: {}", e);
                         }
-                        let _ = s.write(&seg.data);
                         drop(seg.data);
                     }
                 }
