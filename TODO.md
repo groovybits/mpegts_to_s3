@@ -3,18 +3,17 @@
 ### CRITICAL BUGS
 - [ ] Smoother has IAT spikes and sometimes CC errors
 - [ ] Smoother can eat ram over time beyond reasonable amounts
-- [ ] Timing output could be given higher accuracy
 
 ### NON-CRITICAL BUGS
-- NONE
+- [ ] Timing output could be given higher accuracy
 
 ### FEATURES
-- [ ] Improve duration derivation in segmentation
+- [ ] Improve duration derivation in segmentation, precision
 - [ ] Add policy support with more details to S3 signing
-- [ ] Discontinuity flagging in HLS Manifest
-- [ ] Add testing and documentation
-- [ ] Live mode vs. VOD mode for input/output buffering expectations
-- [ ] Give start/stop in/out edit points against walltime for retreival
+- [ ] Add Discontinuity flagging in HLS Manifest
+- [ ] Add more testing and wiki documentation
+- [X] Live mode vs. VOD mode for input/output buffering expectations
+- [X] Give start/stop in/out edit points against walltime for retreival
 
 ---
 January 2025 - @bitbytebit 
