@@ -9,6 +9,7 @@ use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 #[cfg(feature = "libltntstools_enabled")]
 use std::io::Write;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -270,6 +271,7 @@ fn sender_thread(
     udp_send_buffer: usize,
     use_smoother: bool,
     vod: bool,
+    output_file: String,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -557,6 +559,19 @@ fn sender_thread(
                     ));
                 }
 
+                // Write to output file if requested
+                if !output_file.is_empty() {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&output_file)
+                    {
+                        if let Err(e) = f.write_all(&seg.data) {
+                            log::error!("SenderThread: Failed to write to output file: {}", e);
+                        }
+                    }
+                }
+
                 if !use_smoother {
                     // send directly into channel as UDP packets
                     let ret = smoother_tx.send(seg.data.to_vec());
@@ -738,8 +753,17 @@ fn main() -> Result<()> {
                 .help("End time offset in milliseconds from start of m3u8 playlist for VOD mode (default: 0 - end of playlist)")
                 .default_value("0"),
         )
+        .arg(
+            Arg::new("output_file")
+                .short('f')
+                .long("output-file")
+                .help("Output file for debugging")
+                .default_value("")
+                .action(ArgAction::Set),
+        )
         .get_matches();
 
+    let output_file = matches.get_one::<String>("output_file").unwrap().clone();
     let start_time = matches
         .get_one::<String>("start_time")
         .unwrap()
@@ -848,6 +872,10 @@ fn main() -> Result<()> {
     println!("  UDP Send Buffer Size: {}", udp_send_buffer);
     println!("  Start Time: {} ms", start_time);
     println!("  End Time: {} ms", end_time);
+    println!("  VOD Mode: {}", vod);
+    println!("  Use Smoother: {}", use_smoother);
+    println!("  Max Bytes Threshold: {}", max_bytes_threshold);
+    println!("  Output File: {:?}", output_file);
 
     #[cfg(feature = "libltntstools_enabled")]
     {
@@ -887,6 +915,7 @@ fn main() -> Result<()> {
         udp_send_buffer,
         use_smoother,
         vod,
+        output_file,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
