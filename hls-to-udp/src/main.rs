@@ -249,7 +249,7 @@ fn receiver_thread(
                 next_seg_id += 1;
             }
 
-            if media_pl.end_list {
+            if vod || media_pl.end_list {
                 log::info!("ReceiverThread: ENDLIST found => done downloading.");
                 break;
             }
