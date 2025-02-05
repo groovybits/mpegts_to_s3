@@ -148,9 +148,10 @@ fn receiver_thread(
                         continue;
                     }
                 };
-                println!(
+                log::info!(
                     "ReceiverThread: Downloading segment {} => {}",
-                    next_seg_id, seg_url
+                    next_seg_id,
+                    seg_url
                 );
 
                 let seg_bytes = match client.get(seg_url).send() {
@@ -187,7 +188,7 @@ fn receiver_thread(
             }
 
             if media_pl.end_list {
-                println!("ReceiverThread: ENDLIST found => done downloading.");
+                log::info!("ReceiverThread: ENDLIST found => done downloading.");
                 break;
             }
 
@@ -201,7 +202,7 @@ fn sender_thread(
     latency: i32,
     pcr_pid_arg: u16,
     pkt_size: i32,
-    rate: i32,
+    smoother_buffers: i32,
     smoother_max_bytes: usize,
     udp_queue_size: usize,
     udp_send_buffer: usize,
@@ -296,7 +297,7 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 2000; // ms total wait if OS buffer is full
+        let max_block_ms = 10000; // ms total wait if OS buffer is full
 
         let smoother_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
@@ -313,9 +314,8 @@ fn sender_thread(
                         // Attempt to send this data to UDP
                         let start_time = Instant::now();
 
-                        const CHUNK_SIZE: usize = 7 * 188;
-                        // Divide the data into CHUNK_SIZE chunks (with a possible smaller chunk at the end)
-                        for chunk in data.chunks(CHUNK_SIZE) {
+                        // Divide the data into packet size chunks (with a possible smaller chunk at the end)
+                        for chunk in data.chunks(pkt_size as usize) {
                             let mut chunk_dropped = false;
                             loop {
                                 match sock_clone.send(chunk) {
@@ -336,7 +336,7 @@ fn sender_thread(
                                             if elapsed_ms > max_block_ms as u128 {
                                                 stats_dropped += 1;
                                                 chunk_dropped = true;
-                                                log::warn!(
+                                                log::error!(
                                                     "SmootherThread: Socket still full after {}ms. Dropping chunk. (sent={}, dropped={})",
                                                     elapsed_ms,
                                                     stats_sent,
@@ -473,7 +473,7 @@ fn sender_thread(
                     // create the smoother
                     smoother = Some(PcrSmoother::new(
                         pcr_pid,
-                        rate,
+                        smoother_buffers,
                         pkt_size,
                         latency,
                         Box::new(smoother_callback),
@@ -574,7 +574,7 @@ fn main() -> Result<()> {
             Arg::new("history_size")
                 .short('s')
                 .long("history-size")
-                .default_value("1800")
+                .default_value("999999")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -588,7 +588,7 @@ fn main() -> Result<()> {
             Arg::new("latency")
                 .short('l')
                 .long("latency")
-                .default_value("1000")
+                .default_value("2000")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -599,9 +599,8 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("rate")
-                .short('r')
-                .long("rate")
+            Arg::new("smoother_buffers")
+                .long("smoother_buffers")
                 .default_value("5000")
                 .action(ArgAction::Set),
         )
@@ -616,21 +615,21 @@ fn main() -> Result<()> {
             Arg::new("segment_queue_size")
                 .short('q')
                 .long("segment-queue-size")
-                .default_value("32")
+                .default_value("3")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("udp_queue_size")
                 .short('z')
                 .long("udp-queue-size")
-                .default_value("1024")
+                .default_value("1")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("udp_send_buffer")
                 .short('b')
                 .long("udp-send-buffer")
-                .default_value("0")
+                .default_value("1358")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -657,24 +656,24 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(1024);
+        .unwrap_or(1);
     let udp_send_buffer = matches
         .get_one::<String>("udp_send_buffer")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(0);
+        .unwrap_or(1358);
     let segment_queue_size = matches
         .get_one::<String>("segment_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(32);
+        .unwrap_or(3);
     let pkt_size = matches
         .get_one::<String>("packet_size")
         .unwrap()
         .parse::<i32>()
         .unwrap_or(1316);
-    let rate = matches
-        .get_one::<String>("rate")
+    let smoother_buffers = matches
+        .get_one::<String>("smoother_buffers")
         .unwrap()
         .parse::<i32>()
         .unwrap_or(5000);
@@ -682,7 +681,7 @@ fn main() -> Result<()> {
         .get_one::<String>("latency")
         .unwrap()
         .parse::<i32>()
-        .unwrap_or(1000);
+        .unwrap_or(2000);
     let pcr_pid_str = matches.get_one::<String>("pcr_pid").unwrap();
     let pcr_pid = if pcr_pid_str.starts_with("0x") {
         u16::from_str_radix(&pcr_pid_str[2..], 16).unwrap_or(0x00)
@@ -700,7 +699,7 @@ fn main() -> Result<()> {
         .get_one::<String>("history_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(1800);
+        .unwrap_or(999999);
     let verbose = matches
         .get_one::<String>("verbose")
         .unwrap()
@@ -732,7 +731,7 @@ fn main() -> Result<()> {
     println!("  History Size: {}", hist_cap);
     println!("  Latency: {} ms", latency);
     println!("  PCR PID: 0x{:x}", pcr_pid);
-    println!("  Rate: {}", rate);
+    println!("  Smoother Buffers: {}", smoother_buffers);
     println!("  Packet Size: {} bytes", pkt_size);
     println!("  Verbose: {}", verbose);
     println!("  Segment Queue Size: {}", segment_queue_size);
@@ -754,7 +753,7 @@ fn main() -> Result<()> {
         latency,
         pcr_pid,
         pkt_size,
-        rate,
+        smoother_buffers,
         max_bytes_threshold,
         udp_queue_size,
         udp_send_buffer,
