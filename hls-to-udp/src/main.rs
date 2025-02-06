@@ -8,8 +8,6 @@ use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
-#[cfg(feature = "libltntstools_enabled")]
-use std::io::Write;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
