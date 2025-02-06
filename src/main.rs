@@ -253,7 +253,7 @@ impl HourlyIndexCreator {
 
         std::fs::rename(&temp_path, &index_path)?;
 
-        let s3_object_path = format!("{}/{}/index.m3u8", output_dir, hour_dir);
+        let s3_object_path = format!("{}/{}", output_dir, hour_dir);
 
         self.upload_local_file_to_s3(
             &index_path,
