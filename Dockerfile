@@ -31,7 +31,9 @@ RUN dnf install -yq zlib-devel openssl-devel clang clang-devel libpcap-devel nas
 COPY Makefile .
 COPY Cargo.toml .
 COPY src/main.rs src/main.rs
+COPY src/lib.rs src/lib.rs
 COPY hls-to-udp/src/main.rs hls-to-udp/src/main.rs
+COPY hls-to-udp/src/lib.rs hls-to-udp/src/lib.rs
 COPY hls-to-udp/Cargo.toml hls-to-udp/Cargo.toml
 
 ## Install Rust
