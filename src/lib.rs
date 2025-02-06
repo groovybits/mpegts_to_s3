@@ -28,10 +28,11 @@ impl PidTracker {
     /// - Respects the continuity “discontinuity_indicator” in the adaptation field if present.
     /// - Only increments/checks continuity if the packet has a payload.
     /// - Logs an error and returns `Err(pid)` on continuity mismatches.
-    pub fn process_packet(&mut self, packet: &[u8]) -> Result<(), u16> {
+    pub fn process_packet(&mut self, label: String, packet: &[u8]) -> Result<(), u16> {
         if packet.len() != TS_PACKET_SIZE {
             log::error!(
-                "PidTracker: Packet size is incorrect (got {}, expected {}).",
+                "PidTracker: ({}) Packet size is incorrect (got {}, expected {}).",
+                label,
                 packet.len(),
                 TS_PACKET_SIZE
             );
@@ -70,7 +71,8 @@ impl PidTracker {
             //   188 total bytes - 4 bytes of header - 1 byte of 'length' = 183
             if adaptation_length > 183 {
                 log::error!(
-                    "PidTracker: Adaptation field length {} is invalid for PID {}.",
+                    "PidTracker: ({}) Adaptation field length {} is invalid for PID {}.",
+                    label,
                     adaptation_length,
                     pid
                 );
@@ -107,7 +109,8 @@ impl PidTracker {
             let expected_cc = (last_cc + 1) & 0x0F;
             if current_cc != expected_cc {
                 log::error!(
-                    "PidTracker: Continuity error for PID {}: expected {} but got {}",
+                    "PidTracker: ({}) Continuity error for PID {}: expected {} but got {}",
+                    label,
                     pid,
                     expected_cc,
                     current_cc

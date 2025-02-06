@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
-use hls_to_udp::PidTracker;
+use hls_to_udp::{PidTracker, TS_PACKET_SIZE};
 #[cfg(feature = "libltntstools_enabled")]
 use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
@@ -387,23 +387,26 @@ fn sender_thread(
                             break;
                         }
 
-                        let num_packets = data.len() / 188;
-                        for i in 0..num_packets {
-                            let start = i * 188;
-                            let end = start + 188;
-                            let ts_packet = &data[start..end];
-                            if let Err(e) = pid_tracker.process_packet(ts_packet) {
-                                eprintln!("Error processing TS packet: {:?}", e);
-                                break;
-                            }
-                        }
-
                         // Attempt to send this data to UDP
                         let start_time = Instant::now();
 
                         // Divide the data into packet size chunks (with a possible smaller chunk at the end)
                         for chunk in data.chunks(pkt_size as usize) {
                             let mut chunk_dropped = false;
+
+                            // Check each TS packet for continuity errors
+                            for packet_chunk in chunk.chunks(TS_PACKET_SIZE) {
+                                if let Err(e) = pid_tracker
+                                    .process_packet("UDPsender".to_string(), packet_chunk)
+                                {
+                                    log::error!(
+                                        "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
+                                        e
+                                    );
+                                    break;
+                                }
+                            }
+
                             loop {
                                 match sock_clone.send(chunk) {
                                     Ok(bytes_sent) => {
@@ -526,6 +529,9 @@ fn sender_thread(
         #[cfg(feature = "libltntstools_enabled")]
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
+        // Create a PidTracker to track PIDs and Continuity Counter Errors
+        let mut pid_tracker = PidTracker::new();
+
         // Process each downloaded segment from the receiver_thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
@@ -584,6 +590,18 @@ fn sender_thread(
                         if let Err(e) = f.write_all(&seg.data) {
                             log::error!("SenderThread: Failed to write to output file: {}", e);
                         }
+                    }
+                }
+
+                // Feed it into your continuity checker
+                for packet_chunk in seg.data.chunks(TS_PACKET_SIZE) {
+                    if let Err(e) =
+                        pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
+                    {
+                        log::error!(
+                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?}",
+                            e
+                        );
                     }
                 }
 

@@ -31,7 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use udp_to_hls::PidTracker;
+use udp_to_hls::{PidTracker, TS_PACKET_SIZE};
 
 use env_logger;
 
@@ -82,9 +82,9 @@ fn get_pcap_packet_count() -> usize {
 
 fn get_pcap_packet_size() -> usize {
     std::env::var("PCAP_PACKET_SIZE")
-        .unwrap_or_else(|_| "188".to_string())
+        .unwrap_or_else(|_|  TS_PACKET_SIZE.to_string())
         .parse()
-        .unwrap_or(188)
+        .unwrap_or(TS_PACKET_SIZE)
 }
 
 fn get_pcap_packet_header_size() -> usize {
@@ -331,8 +331,8 @@ impl HourlyIndexCreator {
         object_key: &str,
         content_type: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        println!(
-            "Uploading hourly index -> s3://{}/{} (content_type={})",
+        log::info!(
+            "UDPtoHLS: [upload_local_file_to_s3()] Uploading hourly index -> s3://{}/{} (content_type={})",
             self.bucket, object_key, content_type
         );
         let body_bytes = ByteStream::from_path(local_path).await?;
@@ -1367,7 +1367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             leftover_ts.extend_from_slice(ts_data);
 
             // 2) Carve out every 188-byte TS packet from leftover
-            while leftover_ts.len() >= 188 {
+            while leftover_ts.len() >= TS_PACKET_SIZE {
                 // If it does not start with sync 0x47, drop one byte and recheck
                 if leftover_ts[0] != 0x47 {
                     leftover_ts.remove(0);
@@ -1375,17 +1375,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
 
                 // Grab one 188-byte packet
-                let ts_packet = leftover_ts.drain(..188).collect::<Vec<u8>>();
+                let ts_packet = leftover_ts.drain(..TS_PACKET_SIZE).collect::<Vec<u8>>();
 
                 // Feed it into your continuity checker
-                if let Err(e) = pid_tracker.process_packet(&ts_packet) {
-                    eprintln!("Continuity error: {:?}", e);
+                if let Err(e) = pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &ts_packet) {
+                    log::error!("UDPtoHLS: (ExtractMpegTSpayload) Continuity error: {:?}", e);
                 }
 
                 // Also feed it into the segmenter
                 if let Some(seg) = manual_segmenter.as_mut() {
                     if let Err(e) = seg.write_ts(&ts_packet).await {
-                        eprintln!("Segment write error: {:?}", e);
+                        log::error!("Segment write error: {:?}", e);
                         break;
                     }
                 }
