@@ -830,7 +830,6 @@ fn main() -> Result<()> {
         )
         .arg(
             Arg::new("quiet")
-                .short('q')
                 .long("quiet")
                 .help("Suppress all non error output")
                 .action(ArgAction::SetTrue),

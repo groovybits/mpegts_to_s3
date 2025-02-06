@@ -17,7 +17,7 @@ if [ "${USE_UNSIGNED_URLS}" = "true" ]; then
 fi
 
 if [ "${QUIET}" = "true" ]; then
-    QUIET="-q"
+    QUIET="--quiet"
 fi
 
 trap cleanup SIGINT SIGTERM

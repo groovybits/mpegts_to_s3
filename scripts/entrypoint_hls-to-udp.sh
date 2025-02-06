@@ -13,7 +13,7 @@ else
 fi
 
 if [ "${QUIET}" = "true" ]; then
-    QUIET="-q"
+    QUIET="--quiet"
 fi
 
 trap cleanup SIGINT SIGTERM
