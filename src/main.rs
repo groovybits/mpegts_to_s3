@@ -17,7 +17,7 @@ use ctrlc;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use pcap::Capture;
+use pcap::{Capture, PacketCodec};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -82,7 +82,7 @@ fn get_pcap_packet_count() -> usize {
 
 fn get_pcap_packet_size() -> usize {
     std::env::var("PCAP_PACKET_SIZE")
-        .unwrap_or_else(|_|  TS_PACKET_SIZE.to_string())
+        .unwrap_or_else(|_| TS_PACKET_SIZE.to_string())
         .parse()
         .unwrap_or(TS_PACKET_SIZE)
 }
@@ -1001,6 +1001,22 @@ impl ManualSegmenter {
     }
 }
 
+// Define the BoxCodec for pcap streaming
+pub struct BoxCodec;
+
+impl PacketCodec for BoxCodec {
+    type Item = (Box<[u8]>, std::time::SystemTime);
+
+    fn decode(&mut self, packet: pcap::Packet) -> Self::Item {
+        let timestamp = std::time::UNIX_EPOCH
+            + std::time::Duration::new(
+                packet.header.ts.tv_sec as u64,
+                packet.header.ts.tv_usec as u32 * 1000,
+            );
+        (packet.data.into(), timestamp)
+    }
+}
+
 // ------------- MAIN -------------
 
 #[tokio::main]
@@ -1116,6 +1132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .long("verbose")
                 .default_value("0"),
         )
+        .arg(
+            Arg::new("pcap_stats_interval")
+                .long("pcap_stats_interval")
+                .default_value("30")
+                .help("Interval in seconds to print PCAP stats"),
+        )
         .get_matches();
 
     debug!("Command-line arguments parsed: {:?}", matches);
@@ -1123,6 +1145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // print version
     println!("MpegTStoS3 version: {}", get_version());
 
+    let pcap_stats_interval: u64 = matches
+        .get_one::<String>("pcap_stats_interval")
+        .unwrap()
+        .parse()
+        .unwrap_or(30);
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
     let region_name = matches.get_one::<String>("region").unwrap();
     let bucket = matches.get_one::<String>("bucket").unwrap();
@@ -1267,8 +1294,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     debug!(
-        "Opening PCAP on interface={} with snaplen=65535, buffer=8MB, timeout={}",
-        interface, timeout
+        "Opening PCAP on interface={} with snaplen={}, buffer={}b, timeout={}",
+        get_snaplen(),
+        get_buffer_size(),
+        interface,
+        timeout
     );
 
     let mut cap = Capture::from_device(interface.as_str())?
@@ -1340,29 +1370,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut pid_tracker = PidTracker::new();
     let mut leftover_ts = Vec::new();
 
-    debug!("Starting main capture loop now...");
+    // Setup bounded channel for pcap capture thread communication
+    let (pcap_tx, pcap_rx) = std_mpsc::sync_channel(100000); // Buffer 100000 * 188 bytes = 18.8MB
+
+    // Move capture handle into the thread
+    let capture_shutdown = shutdown_flag.clone();
+
+    // Take ownership of cap for the capture thread
+    let capture_thread = std::thread::spawn(move || {
+        let mut stats_timer = std::time::Instant::now();
+
+        while !capture_shutdown.load(Ordering::SeqCst) {
+            // Check pcap stats every $[pcap_stats_interval] seconds
+            if stats_timer.elapsed() >= std::time::Duration::from_secs(pcap_stats_interval) {
+                // Create a separate stats check that doesn't conflict with packet capture
+                let stats = cap.stats();
+                if let Ok(stats) = stats {
+                    if stats.dropped > 0 || stats.if_dropped > 0 {
+                        log::warn!("PCAP drops detected - Received: {}, Dropped: {}, Interface Dropped: {}", 
+                        stats.received, stats.dropped, stats.if_dropped);
+                    }
+                }
+                stats_timer = std::time::Instant::now();
+            }
+
+            // Capture next packet
+            let packet_result = cap.next_packet();
+            match packet_result {
+                Ok(packet) => {
+                    // Clone the packet data to avoid lifetime issues
+                    let packet_data = packet.data.to_vec();
+                    if let Err(e) = pcap_tx.send(packet_data) {
+                        log::error!("Failed to send packet to channel: {:?}", e);
+                        break;
+                    }
+                }
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+            }
+        }
+    });
+
+    debug!("Starting main processing loop now...");
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             log::info!("Shutdown flag set, exiting main loop");
             break;
         }
-        let packet = match cap.next_packet() {
-            Ok(pkt) => pkt,
-            Err(_) => {
-                // Possibly no packet arrived in the last 'timeout' ms
-                // If manual segment, close segment on inactivity:
+
+        let packet_data = match pcap_rx.recv() {
+            Ok(data) => data,
+            Err(e) => {
+                log::error!("Channel receive error: {:?}", e);
+                // If manual segment, close segment on error:
                 if let Some(seg) = manual_segmenter.as_mut() {
                     if let Err(e) = seg.close_current_segment_file().await {
                         eprintln!("Error closing segment: {:?}", e);
-                        break;
                     }
                 }
-                continue;
+                break;
             }
         };
 
         // Now get whatever raw TS bytes we can
-        if let Some(ts_data) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
+        if let Some(ts_data) = extract_mpegts_payload(&packet_data, filter_ip, filter_port) {
             // 1) Append new TS data to leftover buffer
             leftover_ts.extend_from_slice(ts_data);
 
@@ -1370,15 +1443,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             while leftover_ts.len() >= TS_PACKET_SIZE {
                 // If it does not start with sync 0x47, drop one byte and recheck
                 if leftover_ts[0] != 0x47 {
-                    leftover_ts.remove(0);
-                    continue;
+                    log::warn!("UDPtoHLS: (ExtractMpegTSpayload) Packet does not start with sync byte 0x47");
                 }
 
                 // Grab one 188-byte packet
                 let ts_packet = leftover_ts.drain(..TS_PACKET_SIZE).collect::<Vec<u8>>();
 
                 // Feed it into your continuity checker
-                if let Err(e) = pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &ts_packet) {
+                if let Err(e) =
+                    pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &ts_packet)
+                {
                     log::error!("UDPtoHLS: (ExtractMpegTSpayload) Continuity error: {:?}", e);
                 }
 
@@ -1398,6 +1472,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Ensure all loops see the shutdown flag:
     shutdown_flag.store(true, Ordering::SeqCst);
+
+    // Join the capture thread:
+    log::info!("Waiting for capture thread to exit...");
+    if let Err(e) = capture_thread.join() {
+        log::error!("Capture thread join error: {:?}", e);
+    }
 
     if let Some(mut seg) = manual_segmenter.take() {
         log::info!("Closing final segment...");
