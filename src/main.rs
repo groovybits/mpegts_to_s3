@@ -48,7 +48,7 @@ fn get_max_segment_size_bytes() -> usize {
     std::env::var("MAX_SEGMENT_SIZE_BYTES")
         .unwrap_or_else(|_| "25000000".to_string())
         .parse()
-        .unwrap_or(25_000_000)
+        .unwrap_or(5_000_000)
 }
 
 fn get_file_max_age_seconds() -> u64 {
@@ -1338,6 +1338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create a PidTracker to track PIDs and Continuity Counter Errors
     let mut pid_tracker = PidTracker::new();
+    let mut leftover_ts = Vec::new();
 
     debug!("Starting main capture loop now...");
     loop {
@@ -1360,29 +1361,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        // Split the TS payload into 188-byte packets and feed each into PidTracker
-        if let Some(ts_payload) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
-            if let Some(seg) = manual_segmenter.as_mut() {
-                if let Err(e) = seg.write_ts(ts_payload).await {
-                    eprintln!("Error writing manual TS segment: {:?}", e);
-                    break;
-                };
-            }
-            let num_packets = ts_payload.len() / 188;
-            for i in 0..num_packets {
-                let start = i * 188;
-                let end = start + 188;
-                let ts_packet = &ts_payload[start..end];
-                if let Err(e) = pid_tracker.process_packet(ts_packet) {
-                    eprintln!("Error processing TS packet: {:?}", e);
-                    break;
+        // Now get whatever raw TS bytes we can
+        if let Some(ts_data) = extract_mpegts_payload(&packet.data, filter_ip, filter_port) {
+            // 1) Append new TS data to leftover buffer
+            leftover_ts.extend_from_slice(ts_data);
+
+            // 2) Carve out every 188-byte TS packet from leftover
+            while leftover_ts.len() >= 188 {
+                // If it does not start with sync 0x47, drop one byte and recheck
+                if leftover_ts[0] != 0x47 {
+                    leftover_ts.remove(0);
+                    continue;
+                }
+
+                // Grab one 188-byte packet
+                let ts_packet = leftover_ts.drain(..188).collect::<Vec<u8>>();
+
+                // Feed it into your continuity checker
+                if let Err(e) = pid_tracker.process_packet(&ts_packet) {
+                    eprintln!("Continuity error: {:?}", e);
+                }
+
+                // Also feed it into the segmenter
+                if let Some(seg) = manual_segmenter.as_mut() {
+                    if let Err(e) = seg.write_ts(&ts_packet).await {
+                        eprintln!("Segment write error: {:?}", e);
+                        break;
+                    }
                 }
             }
-        } else {
-            debug!(
-                "extract_mpegts_payload returned None => not recognized as TS for {}:{}",
-                filter_ip, filter_port
-            );
         }
     }
     // ---------------------------------------------------
@@ -1724,7 +1731,7 @@ fn extract_mpegts_payload<'a>(
 
     let protocol = data[23];
     if protocol != 17 {
-        return None;
+        return None; // Not UDP
     }
 
     let ip_dst_addr = &data[30..34];
@@ -1737,10 +1744,12 @@ fn extract_mpegts_payload<'a>(
     let udp_length =
         u16::from_be_bytes([data[udp_header_offset + 4], data[udp_header_offset + 5]]) as usize;
 
+    // Check for matching IP/port
     if dst_addr_str != filter_ip || udp_dst_port != filter_port {
         return None;
     }
 
+    // Extract UDP payload
     let udp_payload_offset = udp_header_offset + 8;
     if data.len() < udp_payload_offset {
         return None;
@@ -1749,41 +1758,31 @@ fn extract_mpegts_payload<'a>(
     if data.len() < udp_payload_offset + udp_payload_len {
         return None;
     }
-
     let payload = &data[udp_payload_offset..udp_payload_offset + udp_payload_len];
     if payload.is_empty() {
         return None;
     }
 
-    let (ts_payload, is_rtp) = if payload[0] == 0x80 && payload.len() > 12 && payload[12] == 0x47 {
-        (&payload[12..], true)
-    } else if payload[0] == 0x47 {
-        (payload, false)
+    // Check if this might be RTP-encapsulated TS:
+    if payload[0] == 0x80 && payload.len() > 12 && payload[12] == 0x47 {
+        // We assume no RTP extension header (minimal case)
+        let ts_payload = &payload[12..];
+        if !ts_payload.is_empty() {
+            return Some(ts_payload);
+        } else {
+            return None;
+        }
+    }
+    // Otherwise, check if it directly starts with 0x47 (pure TS)
+    else if payload[0] == 0x47 {
+        return Some(payload);
     } else {
+        // Not recognized as TS or RTP-TS
         warn!(
-            "Unknown payload type found (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
+            "Unknown payload type (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
             payload[0],
             payload.len()
         );
         return None;
-    };
-
-    if is_rtp {
-        debug!("RTP packet found with TS payload size {}", ts_payload.len());
     }
-
-    if ts_payload.len() < 188 {
-        warn!("Short TS packet found of size {}", ts_payload.len());
-        return None;
-    }
-
-    let num_packets = ts_payload.len() / 188;
-    let aligned_len = num_packets * 188;
-    for i in 0..num_packets {
-        if ts_payload[i * 188] != 0x47 {
-            warn!("Misaligned TS packet found at offset {}", i * 188);
-            return None;
-        }
-    }
-    Some(&ts_payload[..aligned_len])
 }
