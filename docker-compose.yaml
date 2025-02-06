@@ -86,6 +86,8 @@ services:
     container_name: "hls-to-udp"
     env_file:
       - "config.env"
+    volumes:
+      - "./hls:/app/hls:rw"
     depends_on:
       - s3minio
       - udp-to-hls

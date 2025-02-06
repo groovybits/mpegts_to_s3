@@ -27,6 +27,7 @@ while [ : ]; do
         -q ${SEGMENT_QUEUE_SIZE} \
         -z ${UDP_QUEUE_SIZE} \
         -b ${UDP_SEND_BUFFER} \
+        -f "${HLS_TO_UDP_OUTPUT_FILE}" \
         ${SMOOTHER_ARGS} \
         ${EXTRA_ARGS} \
             $@
