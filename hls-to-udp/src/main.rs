@@ -474,6 +474,8 @@ fn sender_thread(
                             log::info!("SmootherThread: Shutdown flag set, exiting.");
                             break;
                         }
+                        // free up the data buffer
+                        drop(data);
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         // Periodically check shutdown
@@ -621,6 +623,8 @@ fn sender_thread(
                 if !use_smoother {
                     // send directly into channel as UDP packets
                     let ret = smoother_tx.send(seg.data.to_vec());
+                    // drop the data buffer
+                    drop(seg.data);
                     if let Err(e) = ret {
                         log::error!("SenderThread: UDP send error: {}", e);
                     }
