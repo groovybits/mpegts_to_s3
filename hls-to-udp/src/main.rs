@@ -759,7 +759,7 @@ fn main() -> Result<()> {
             Arg::new("udp_queue_size")
                 .short('z')
                 .long("udp-queue-size")
-                .default_value("4096")
+                .default_value("512")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -834,7 +834,7 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(4096);
+        .unwrap_or(512);
     let udp_send_buffer = matches
         .get_one::<String>("udp_send_buffer")
         .unwrap()
