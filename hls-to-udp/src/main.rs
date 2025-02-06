@@ -752,14 +752,14 @@ fn main() -> Result<()> {
             Arg::new("segment_queue_size")
                 .short('q')
                 .long("segment-queue-size")
-                .default_value("3")
+                .default_value("10")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("udp_queue_size")
                 .short('z')
                 .long("udp-queue-size")
-                .default_value("1")
+                .default_value("4096")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -834,7 +834,7 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(1);
+        .unwrap_or(4096);
     let udp_send_buffer = matches
         .get_one::<String>("udp_send_buffer")
         .unwrap()
@@ -844,7 +844,7 @@ fn main() -> Result<()> {
         .get_one::<String>("segment_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(3);
+        .unwrap_or(10);
     let pkt_size = matches
         .get_one::<String>("packet_size")
         .unwrap()
