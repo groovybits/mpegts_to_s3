@@ -1452,18 +1452,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ts_data) = extract_mpegts_payload(&packet_data, filter_ip, filter_port) {
             leftover_ts.extend_from_slice(ts_data);
 
-            while leftover_ts.len() >= TS_PACKET_SIZE {
-                if leftover_ts[0] != 0x47 {
-                    log::warn!("UDPtoHLS: (ExtractMpegTSpayload) Packet does not start with sync byte 0x47");
+            while leftover_ts.len() >= (7 * TS_PACKET_SIZE) {
+                for chunk in leftover_ts.chunks((TS_PACKET_SIZE) as usize) {
+                    if leftover_ts[0] != 0x47 {
+                        log::warn!("UDPtoHLS: (ExtractMpegTSpayload) Packet does not start with sync byte 0x47");
+                    }
+
+                    if let Err(e) =
+                        pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &chunk)
+                    {
+                        log::error!("UDPtoHLS: (ExtractMpegTSpayload) Continuity error: {:?}", e);
+                    }
                 }
 
-                let ts_packet = leftover_ts.drain(..TS_PACKET_SIZE).collect::<Vec<u8>>();
-
-                if let Err(e) =
-                    pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &ts_packet)
-                {
-                    log::error!("UDPtoHLS: (ExtractMpegTSpayload) Continuity error: {:?}", e);
-                }
+                let ts_packet = leftover_ts
+                    .drain(..(7 * TS_PACKET_SIZE))
+                    .collect::<Vec<u8>>();
 
                 if let Some(seg) = manual_segmenter.as_mut() {
                     if let Err(e) = seg.write_ts(timestamp, &ts_packet).await {

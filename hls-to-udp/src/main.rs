@@ -405,7 +405,7 @@ fn sender_thread(
                         let start_time = Instant::now();
 
                         // Divide the data into packet size chunks (with a possible smaller chunk at the end)
-                        for ref mut chunk in data.chunks(pkt_size as usize) {
+                        for ref mut chunk in data.chunks((7 * TS_PACKET_SIZE) as usize) {
                             let mut chunk_dropped = false;
 
                             // Check each TS packet for continuity errors
@@ -417,7 +417,6 @@ fn sender_thread(
                                         "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
                                         e
                                     );
-                                    break;
                                 }
                             }
 
