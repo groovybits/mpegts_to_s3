@@ -381,7 +381,7 @@ pub fn join_multicast_on_iface(
     sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
 
     println!(
-        "Joined multicast group {} on interface {}, local IP: {}, port {}",
+        "UDPtoHLS: Joined multicast group {} on interface {}, local IP: {}, port {}",
         multicast_addr, interface_name, local_iface_ip, port
     );
     Ok(sock)
@@ -762,7 +762,7 @@ impl ManualSegmenter {
                                     final_path = url_str;
                                 }
                                 Err(e) => {
-                                    warn!(
+                                    error!(
                                         "[DISKLESS] presign failed: {:?}, fallback to mem:// path",
                                         e
                                     );
@@ -771,7 +771,7 @@ impl ManualSegmenter {
                         }
                     }
                     Err(e) => {
-                        warn!(
+                        error!(
                             "[DISKLESS] S3 upload of object_key='{}' failed: {:?}",
                             object_key, e
                         );
@@ -853,12 +853,12 @@ impl ManualSegmenter {
                         );
                     }
                     Err(e) => {
-                        eprintln!("Failed to upload index M3U8 {}: {:?}", s3_key, e);
+                        log::error!("Failed to upload index M3U8 {}: {:?}", s3_key, e);
                     }
                 }
             } else {
-                error!(
-                    "Not uploading index M3U8: local file does not exist at {:?}",
+                log::error!(
+                    "UDPtoHLS: Not uploading index M3U8: local file does not exist at {:?}",
                     local_m3u8
                 );
             }
@@ -885,7 +885,7 @@ impl ManualSegmenter {
             if let (Some(ref endpoint), Some(ref buck)) = (&self.s3_endpoint, &self.s3_bucket) {
                 Ok(format!("{}/{}/{}", endpoint, buck, object_key))
             } else {
-                Err("missing endpoint or bucket for generate_s3_url".into())
+                Err("UDPtoHLS: missing endpoint or bucket for generate_s3_url".into())
             }
         } else {
             if let (Some(ref client), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
@@ -899,7 +899,7 @@ impl ManualSegmenter {
                     .await?;
                 Ok(presigned_req.uri().to_string())
             } else {
-                Err("No s3_client or s3_bucket for presigned url".into())
+                Err("UDPtoHLS: No s3_client or s3_bucket for presigned url".into())
             }
         }
     }
@@ -1016,11 +1016,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ctrlc::set_handler({
         let shutdown_flag = Arc::clone(&shutdown_flag);
         move || {
-            eprintln!("Got CTRL+C, shutting down gracefully...");
+            log::error!("UDPtoHLS: Got CTRL+C, shutting down gracefully...");
             shutdown_flag.store(true, Ordering::SeqCst);
             ctrl_counter += 1;
             if ctrl_counter >= 3 {
-                eprintln!("Got CTRL+C 3 times, forcing exit.");
+                log::error!("UDPtoHLS: Got CTRL+C 3 times, forcing exit.");
                 std::process::exit(1);
             }
         }
@@ -1122,6 +1122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .default_value("0"),
         )
         .arg(
+            Arg::new("quiet")
+                .short('q')
+                .long("quiet")
+                .help("Suppress all non error output")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("pcap_stats_interval")
                 .long("pcap_stats_interval")
                 .default_value("30")
@@ -1129,10 +1136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .get_matches();
 
-    debug!("Command-line arguments parsed: {:?}", matches);
+    debug!("UDPtoHLS: Command-line arguments parsed: {:?}", matches);
 
-    println!("MpegTStoS3 version: {}", get_version());
+    println!("UDPtoHLS: version: {}", get_version());
 
+    let quiet = matches.get_flag("quiet");
     let pcap_stats_interval: u64 = matches
         .get_one::<String>("pcap_stats_interval")
         .unwrap()
@@ -1154,10 +1162,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap()
         .parse()
         .unwrap_or(0);
-    if verbose > 0 {
+    if quiet {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Warn)
+            .format_timestamp_secs()
+            .init();
+    } else if verbose > 0 {
         let log_level = match verbose {
-            1 => log::LevelFilter::Info,
-            2 => log::LevelFilter::Debug,
+            1 => log::LevelFilter::Warn,
+            2 => log::LevelFilter::Info,
+            3 => log::LevelFilter::Debug,
             _ => log::LevelFilter::Trace,
         };
         env_logger::Builder::new()
@@ -1166,11 +1180,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .init();
     } else {
         env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Info)
+            .filter_level(log::LevelFilter::Error)
             .format_timestamp_secs()
             .init();
     }
-    log::info!("MpegTStoS3: Logging initialized. Starting main()...");
+    println!("UDPtoHLS: : Logging initialized. Starting main()...");
 
     let hls_keep_segments: usize = matches
         .get_one::<String>("hls_keep_segments")
@@ -1184,29 +1198,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse()
         .unwrap_or(1);
 
-    info!(
-        "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-          interface={}, timeout={}, output_dir={}, remove_local={} \
-          hls_keep_segments={}, generate_unsigned_urls={}, \
-          capture_to_disk={}, diskless_ring_size={}",
-        endpoint,
-        region_name,
-        bucket,
-        filter_ip,
-        filter_port,
-        interface,
-        timeout,
-        output_dir,
-        remove_local,
-        hls_keep_segments,
-        generate_unsigned_urls,
-        capture_to_disk,
-        diskless_ring_size
-    );
-
     fs::create_dir_all(output_dir)?;
 
-    info!("Initializing S3 client with endpoint: {}", endpoint);
+    println!(
+        "UDPtoHLS: Initializing S3 client with endpoint: {}",
+        endpoint
+    );
     let creds = Credentials::new(get_s3_username(), get_s3_password(), None, None, "dummy");
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -1231,13 +1228,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     let hourly_index_creator = Arc::new(Mutex::new(hourly_index_creator));
 
-    info!("Starting directory watcher on: {}", output_dir);
+    println!("UDPtoHLS: Starting directory watcher on: {}", output_dir);
     let (watch_tx, watch_rx) = std_mpsc::channel();
     let watch_dir = output_dir.to_string();
     let shutdown_flag_wt_clone = Arc::clone(&shutdown_flag);
     let watch_thread = thread::spawn(move || {
         if let Err(e) = watch_directory(&watch_dir, watch_tx, shutdown_flag_wt_clone) {
-            eprintln!("Directory watcher error: {:?}", e);
+            log::error!("UDPtoHLS: Directory watcher error: {:?}", e);
         }
     });
 
@@ -1261,27 +1258,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await
         {
-            error!("File event handler error: {}", e);
+            log::error!("UDPtoHLS: File event handler error: {}", e);
         }
     });
 
-    debug!(
-        "Attempting to join multicast {}:{} on interface={}",
+    println!(
+        "UDPtoHLS: Attempting to join multicast {}:{} on interface={}",
         filter_ip, filter_port, interface
     );
     let _sock = match join_multicast_on_iface(filter_ip, filter_port, interface) {
         Ok(s) => {
-            debug!("Successfully joined multicast group");
+            println!(
+                "UDPtoHLS: Successfully joined multicast group on interface={} filter_ip={} filter_port={}",
+                interface, filter_ip, filter_port
+            );
             s
         }
         Err(e) => {
-            eprintln!("Failed to join multicast group or find interface IP: {}", e);
+            eprintln!(
+                "UDPtoHLS: Failed to join multicast group or find interface IP: {}",
+                e
+            );
             return Ok(());
         }
     };
 
-    debug!(
-        "Opening PCAP on interface={} with snaplen={}, buffer={}b, timeout={}",
+    println!(
+        "UDPtoHLS: Opening PCAP on interface={} with snaplen={}, buffer={}b, timeout={}",
         get_snaplen(),
         get_buffer_size(),
         interface,
@@ -1301,11 +1304,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     let filter_expr = format!("udp and host {} and port {}", filter_ip, filter_port);
-    debug!("Setting pcap filter to '{}'", filter_expr);
+    println!("UDPtoHLS: Setting pcap filter to '{}'", filter_expr);
     cap.filter(&filter_expr, true)?;
 
     println!(
-        "Capturing on '{}', listening for {}:{}, writing HLS to '{}'",
+        "UDPtoHLS: Capturing on '{}', listening for {}:{}, writing HLS to '{}'",
         interface, filter_ip, filter_port, output_dir
     );
 
@@ -1337,7 +1340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mut buf = futures::executor::block_on(buffer_ref.lock());
                     if let Some(front) = buf.queue.pop_front() {
                         debug!(
-                            "Diskless consumer got a segment of len {}, dur={}",
+                            "UDPtoHLS: Diskless consumer got a segment of len {}, dur={}",
                             front.data.len(),
                             front.duration
                         );
@@ -1387,8 +1390,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                  let dropped = stats.dropped - stats_last_drop;
                                  let received = stats.received - stats_last_recv;
                                  if dropped > 0 || stats.if_dropped > 0 {
-                                     log::warn!(
-                                         "PCAP drops detected - Received: {}, Dropped: {}, Interface Dropped: {}",
+                                     log::error!(
+                                         "UDPtoHLS: PCAP drops detected - Received: {}, Dropped: {}, Interface Dropped: {}",
                                          received, dropped, stats.if_dropped
                                      );
                                  }
@@ -1398,7 +1401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                              stats_timer = Instant::now();
                          }
                          if let Err(e) = pcap_tx.send((packet_data, timestamp_ms)) {
-                             log::error!("Failed to send packet to channel: {:?}", e);
+                             log::error!("UDPtoHLS: Pcap Failed to send packet to channel: {:?}", e);
                              break;
                          }
                      }
@@ -1410,14 +1413,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                              tokio::time::sleep(Duration::from_millis(1)).await;
                              continue;
                          }
-                         log::error!("Pcap error: {:?}", e);
+                         log::error!("UDPtoHLS: Pcap error: {:?}", e);
                          break;
                      }
                  }
              }
              if let Ok(stats) = stream.capture_mut().stats() {
                  log::info!(
-                     "Final PCAP stats - Received: {}, Dropped: {}, Interface Dropped: {}",
+                     "UDPtoHLS: Final PCAP stats - Received: {}, Dropped: {}, Interface Dropped: {}",
                      stats.received,
                      stats.dropped,
                      stats.if_dropped
@@ -1429,17 +1432,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("Starting main processing loop now...");
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
-            log::info!("Shutdown flag set, exiting main loop");
+            println!("UDPtoHLS: Shutdown flag set, exiting main loop");
             break;
         }
 
         let (packet_data, timestamp) = match pcap_rx.recv() {
             Ok((data, ts)) => (data, ts),
             Err(e) => {
-                log::error!("Channel receive error: {:?}", e);
+                log::error!("UDPtoHLS: Channel receive error: {:?}", e);
                 if let Some(seg) = manual_segmenter.as_mut() {
                     if let Err(e) = seg.close_current_segment_file().await {
-                        eprintln!("Error closing segment: {:?}", e);
+                        log::error!("UDPtoHLS: Error closing segment: {:?}", e);
                     }
                 }
                 break;
@@ -1464,7 +1467,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 if let Some(seg) = manual_segmenter.as_mut() {
                     if let Err(e) = seg.write_ts(timestamp, &ts_packet).await {
-                        log::error!("Segment write error: {:?}", e);
+                        log::error!("UDPtoHLS: Segment write error: {:?}", e);
                         break;
                     }
                 }
@@ -1474,38 +1477,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     shutdown_flag.store(true, Ordering::SeqCst);
 
-    log::info!("Waiting for capture thread to exit...");
+    log::info!("UDPtoHLS: Waiting for capture thread to exit...");
     if let Err(e) = capture_thread.join() {
-        log::error!("Capture thread join error: {:?}", e);
+        log::error!("UDPtoHLS: Capture thread join error: {:?}", e);
     }
 
     if let Some(mut seg) = manual_segmenter.take() {
-        log::info!("Closing final segment...");
+        log::info!("UDPtoHLS: Closing final segment...");
         if let Err(e) = seg.finalize().await {
-            eprintln!("Error closing final segment: {:?}", e);
+            eprintln!("UDPtoHLS: Error closing final segment: {:?}", e);
         }
         drop(seg);
     }
 
     if let Some(handle) = diskless_consumer {
-        log::info!("Waiting for diskless consumer thread to exit...");
+        log::info!("UDPtoHLS: Waiting for diskless consumer thread to exit...");
         if let Err(e) = handle.join() {
-            log::error!("Diskless consumer thread join error: {:?}", e);
+            log::error!("UDPtoHLS: Diskless consumer thread join error: {:?}", e);
         }
     }
 
-    log::info!("Waiting for upload task to exit...");
+    log::info!("UDPtoHLS: Waiting for upload task to exit...");
     match upload_task.await {
-        Ok(_) => log::info!("Upload task exited cleanly."),
-        Err(e) => log::error!("Upload task panicked: {:?}", e),
+        Ok(_) => log::info!("UDPtoHLS: Upload task exited cleanly."),
+        Err(e) => log::error!("UDPtoHLS: Upload task panicked: {:?}", e),
     }
 
-    log::info!("Waiting for watch thread to exit...");
+    log::info!("UDPtoHLS: Waiting for watch thread to exit...");
     if let Err(e) = watch_thread.join() {
-        log::error!("Watch thread join error: {:?}", e);
+        log::error!("UDPtoHLS: Watch thread join error: {:?}", e);
     }
 
-    log::info!("All threads/tasks exited. Shutting down.");
+    log::info!("UDPtoHLS: All threads/tasks exited. Shutting down.");
     Ok(())
 }
 
@@ -1533,7 +1536,7 @@ fn watch_directory(
                     break;
                 }
             }
-            Ok(Err(e)) => eprintln!("Notify error: {:?}", e),
+            Ok(Err(e)) => log::error!("Notify error: {:?}", e),
             Err(_) => break,
         }
     }
@@ -1599,7 +1602,10 @@ async fn handle_file_events(
                                 }
 
                                 if stable_count < 3 {
-                                    error!("File {} did not stabilize, skipping", full_path_str);
+                                    error!(
+                                        "UDPtoHLS: File {} did not stabilize, skipping",
+                                        full_path_str
+                                    );
                                     continue;
                                 }
                             }
@@ -1608,7 +1614,7 @@ async fn handle_file_events(
                                 Ok(rp) => rp,
                                 Err(e) => {
                                     warn!(
-                                        "Skipping {}: strip_base_dir() error: {}",
+                                        "UDPtoHLS: Skipping {}: strip_base_dir() error: {}",
                                         full_path_str, e
                                     );
                                     continue;
@@ -1689,7 +1695,7 @@ async fn upload_file_to_s3(
     };
 
     let file_size = fs::metadata(path)?.len();
-    println!(
+    log::info!(
         "Uploading {} ({} bytes) -> s3://{}/{} as {}",
         path.display(),
         file_size,
@@ -1704,7 +1710,7 @@ async fn upload_file_to_s3(
         let file_contents = fs::read(path)?;
         let read_size = file_contents.len();
 
-        println!(
+        log::debug!(
             "File checks for {}\n  Metadata size: {}\n  Actual read size: {}",
             path.display(),
             metadata_size,
@@ -1713,7 +1719,7 @@ async fn upload_file_to_s3(
 
         let body_stream = ByteStream::from(file_contents);
 
-        println!(
+        log::info!(
             "Uploading {} (metadata: {} bytes, read: {} bytes) -> s3://{}/{}",
             path.display(),
             metadata_size,
@@ -1732,15 +1738,23 @@ async fn upload_file_to_s3(
             .await
         {
             Ok(_) => {
-                println!("Uploaded {} ({} bytes)", key_str, file_size);
+                log::info!("UDPtoHLS: Uploaded {} ({} bytes)", key_str, file_size);
                 if remove_local {
                     if let Err(e) = fs::remove_file(path) {
-                        eprintln!("Failed removing local file {}: {:?}", path.display(), e);
+                        log::error!(
+                            "UDPtoHLS: Failed removing local file {}: {:?}",
+                            path.display(),
+                            e
+                        );
                     }
                     let dur_sidecar = path.with_extension("dur");
                     if dur_sidecar.exists() {
                         if let Err(e) = fs::remove_file(&dur_sidecar) {
-                            eprintln!("Failed removing local sidecar {:?}: {:?}", dur_sidecar, e);
+                            log::error!(
+                                "UDPtoHLS: Failed removing local sidecar {:?}: {:?}",
+                                dur_sidecar,
+                                e
+                            );
                         }
                     }
                 }
@@ -1751,9 +1765,10 @@ async fn upload_file_to_s3(
                 if retries == 0 {
                     return Err(Box::new(e));
                 }
-                eprintln!(
-                    "Upload failed, retrying ({} attempts left): {:?}",
-                    retries, e
+                log::error!(
+                    "UDPtoHLS: Upload failed, retrying ({} attempts left): {:?}",
+                    retries,
+                    e
                 );
                 sleep(Duration::from_secs(1)).await;
             }
@@ -1839,7 +1854,7 @@ fn extract_mpegts_payload<'a>(
         return Some(payload);
     } else {
         warn!(
-            "Unknown payload type (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
+            "UDPtoHLS: Unknown payload type (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
             payload[0],
             payload.len()
         );

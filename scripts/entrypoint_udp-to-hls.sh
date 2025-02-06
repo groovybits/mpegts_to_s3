@@ -1,8 +1,5 @@
 #!/bin/sh
 
-export RUST_BACKTRACE=1
-export RUST_LOG=info
-
 cleanup() {
     echo "Caught signal, cleaning up..."
     kilall udp-to-hls
@@ -19,10 +16,14 @@ if [ "${USE_UNSIGNED_URLS}" = "true" ]; then
     UNSIGNED_URL_ARGS="--unsigned_urls"
 fi
 
+if [ "${QUIET}" = "true" ]; then
+    QUIET="-q"
+fi
+
 trap cleanup SIGINT SIGTERM
 
 while [ : ]; do
-    udp-to-hls \
+    RUST_BACKTRACE=full udp-to-hls \
         -n ${NETWORK_INTERFACE} \
         -i ${SOURCE_IP} \
         -p ${SOURCE_PORT} \
@@ -30,7 +31,7 @@ while [ : ]; do
         -b ${MINIO_BUCKET_NAME} \
         -o ${CHANNEL_NAME} \
         --hls_keep_segments ${M3U8_LIVE_SEGMENT_COUNT} \
-        ${CAPTURE_TO_DISK} ${UNSIGNED_URL_ARGS} $@
+        ${CAPTURE_TO_DISK} ${UNSIGNED_URL_ARGS} ${QUIET} $@
 
     sleep 1
 done

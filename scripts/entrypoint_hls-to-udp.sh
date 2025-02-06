@@ -1,8 +1,5 @@
 #!/bin/sh
 
-export RUST_BACKTRACE=1
-export RUST_LOG=info
-
 cleanup() {
     echo "Caught signal, cleaning up..."
     kilall hls-to-udp
@@ -15,10 +12,14 @@ else
     SMOOTHER_ARGS=""
 fi
 
+if [ "${QUIET}" = "true" ]; then
+    QUIET="-q"
+fi
+
 trap cleanup SIGINT SIGTERM
 
 while [ : ]; do
-    hls-to-udp \
+    RUST_BACKTRACE=full hls-to-udp \
         -u ${HLS_INPUT_URL} \
         -o ${UDP_OUTPUT_IP}:${UDP_OUTPUT_PORT} \
         -l ${SMOOTHER_LATENCY} \
@@ -28,7 +29,7 @@ while [ : ]; do
         -z ${UDP_QUEUE_SIZE} \
         -b ${UDP_SEND_BUFFER} \
         -f "${HLS_TO_UDP_OUTPUT_FILE}" \
-        ${SMOOTHER_ARGS} \
+        ${SMOOTHER_ARGS} ${QUIET} \
         ${EXTRA_ARGS} \
             $@
     sleep 1
