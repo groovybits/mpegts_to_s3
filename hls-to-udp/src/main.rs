@@ -360,16 +360,16 @@ fn sender_thread(
         let sock = Arc::new(sock); // Wrap in Arc for thread safety
 
         // --- Channels for the Smoother callback => UDP send thread
-        let (smoother_tx, smoother_rx) = mpsc::sync_channel::<Vec<u8>>(udp_queue_size);
+        let (udp_tx, udp_rx) = mpsc::sync_channel::<Vec<u8>>(udp_queue_size);
 
         // This callback is given to the Smoother to produce chunked TS data
         #[cfg(feature = "libltntstools_enabled")]
-        let smoother_callback = |v: Vec<u8>| {
+        let udp_callback = |v: Vec<u8>| {
             log::debug!(
                 "HLStoUDP: SmootherCallback received buffer with {} bytes for UDP.",
                 v.len()
             );
-            if let Err(e) = smoother_tx.send(v) {
+            if let Err(e) = udp_tx.send(v) {
                 log::error!(
                     "HLStoUDP SmootherCallback: Failed to send buffer to UDP thread: {}",
                     e
@@ -379,7 +379,7 @@ fn sender_thread(
             }
         };
 
-        // --- UDP-sending thread, reading from smoother_rx channel
+        // --- UDP-sending thread, reading from udp_rx channel
         let sock_clone = Arc::clone(&sock);
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
@@ -387,17 +387,17 @@ fn sender_thread(
         let max_block_ms = 100000; // ms total wait if OS buffer is full
 
         let udp_sender_thread = thread::spawn(move || {
-            println!("HLStoUDP: SmootherThread started (hybrid non-blocking + partial block).");
+            println!("HLStoUDP: UDPThread started (hybrid non-blocking + partial block).");
 
             // Create a PidTracker to track PIDs and Continuity Counter Errors
             let mut pid_tracker = PidTracker::new();
 
             loop {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
-                match smoother_rx.recv_timeout(Duration::from_millis(100)) {
+                match udp_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(data) => {
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
-                            log::warn!("HLStoUDP: SmootherThread Shutdown flag set, exiting.");
+                            log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
 
@@ -427,14 +427,14 @@ fn sender_thread(
                                         // For UDP all or nothing is typical,
                                         // but we log the sent bytes for completeness.
                                         log::debug!(
-                                            "HLStoUDP: SmootherThread Packet of {} bytes sent from a chunk of {} bytes.",
+                                            "HLStoUDP: UDPThread Packet of {} bytes sent from a chunk of {} bytes.",
                                             bytes_sent,
                                             chunk.len()
                                         );
                                         // check if we sent all the data
                                         if bytes_sent < chunk.len() {
                                             log::warn!(
-                                                "HLStoUDP: SmootherThread Partial send of {} bytes from a chunk of {} bytes.",
+                                                "HLStoUDP: UDPThread Partial send of {} bytes from a chunk of {} bytes.",
                                                 bytes_sent,
                                                 chunk.len()
                                             );
@@ -451,7 +451,7 @@ fn sender_thread(
                                                 stats_dropped += 1;
                                                 chunk_dropped = true;
                                                 log::error!(
-                                                    "HLStoUDP: SmootherThread Socket still full after {}ms. Dropping chunk. (sent={}, dropped={})",
+                                                    "HLStoUDP: UDPThread Socket still full after {}ms. Dropping chunk. (sent={}, dropped={})",
                                                     elapsed_ms,
                                                     stats_sent,
                                                     stats_dropped
@@ -459,14 +459,14 @@ fn sender_thread(
                                                 break;
                                             }
                                             log::debug!(
-                                                "HLStoUDP: SmootherThread Socket full, waiting for buffer space, {}ms.", elapsed_ms
+                                                "HLStoUDP: UDPThread Socket full, waiting for buffer space, {}ms.", elapsed_ms
                                             );
                                             thread::sleep(Duration::from_millis(1));
                                         } else {
                                             stats_dropped += 1;
                                             chunk_dropped = true;
                                             log::error!(
-                                                "HLStoUDP: SmootherThread UDP error: {}. Dropping chunk. (sent={}, dropped={})",
+                                                "HLStoUDP: UDPThread UDP error: {}. Dropping chunk. (sent={}, dropped={})",
                                                 e,
                                                 stats_sent,
                                                 stats_dropped
@@ -478,14 +478,14 @@ fn sender_thread(
                             }
                             if chunk_dropped {
                                 log::debug!(
-                                    "HLStoUDP: SmootherThread Chunk dropped due to blocking or error."
+                                    "HLStoUDP: UDPThread Chunk dropped due to blocking or error."
                                 );
                             }
                         }
 
                         // Finally check for shutdown again
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
-                            log::warn!("HLStoUDP: SmootherThread Shutdown flag set, exiting.");
+                            log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
                         // free up the data buffer
@@ -494,19 +494,19 @@ fn sender_thread(
                     Err(RecvTimeoutError::Timeout) => {
                         // Periodically check shutdown
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
-                            log::warn!("HLStoUDP: SmootherThread Shutdown flag set, exiting.");
+                            log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        log::warn!("HLStoUDP: SmootherThread channel disconnected, exiting.");
+                        log::warn!("HLStoUDP: UDPThread channel disconnected, exiting.");
                         break;
                     }
                 }
             }
             log::warn!(
-                "HLStoUDP: SmootherThread exiting. Sent={}, Dropped={}",
+                "HLStoUDP: UDPThread exiting. Sent={}, Dropped={}",
                 stats_sent,
                 stats_dropped
             );
@@ -608,7 +608,7 @@ fn sender_thread(
                         smoother_buffers,
                         pkt_size,
                         latency,
-                        Box::new(smoother_callback),
+                        Box::new(udp_callback),
                     ));
                 }
 
@@ -642,7 +642,7 @@ fn sender_thread(
 
                 if !use_smoother {
                     // send directly into channel as UDP packets
-                    let ret = smoother_tx.send(seg.data.to_vec());
+                    let ret = udp_tx.send(seg.data.to_vec());
                     // drop the data buffer
                     drop(seg.data);
                     if let Err(e) = ret {
