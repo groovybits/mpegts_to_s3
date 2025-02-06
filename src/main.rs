@@ -602,11 +602,17 @@ impl ManualSegmenter {
     }
 
     async fn write_ts(&mut self, timestamp: u64, data: &[u8]) -> std::io::Result<()> {
-        let ts_instant = SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp);
-        let instant = Instant::now() - SystemTime::now().duration_since(ts_instant).unwrap();
+        //let ts_instant = SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp);
+        //let instant = Instant::now() - SystemTime::now().duration_since(ts_instant).unwrap();
+
+        log::debug!(
+            "Writing TS packet, len={}, timestamp={}",
+            data.len(),
+            timestamp
+        );
 
         if self.segment_open_time.is_none() {
-            self.segment_open_time = Some(instant);
+            self.segment_open_time = Some(Instant::now());
         }
 
         if !self.diskless_mode {
