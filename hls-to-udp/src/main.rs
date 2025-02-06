@@ -346,7 +346,7 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 10000; // ms total wait if OS buffer is full
+        let max_block_ms = 30000; // ms total wait if OS buffer is full
 
         let udp_sender_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");

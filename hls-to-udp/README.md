@@ -63,6 +63,7 @@ hls-to-udp -u "http://127.0.0.1:9000/hls/channel01/2025/02/05/05/index.m3u8/inde
     | **--vod**                                              | Use VOD mode                                      | false   |
     | **--start-time <start_time>**                          | Start time in seconds                             | 0       |
     | **--end-time <end_time>**                              | End time in seconds                               | 0       |
+    | **-f, --output_file <output_file>**                    | Output file for debugging                         | -       |
     | **-h, --help**                                         | Print help                                        | -       |
     | **-V, --version**                                      | Print version                                     | -       |
 
@@ -78,6 +79,7 @@ hls-to-udp -u "http://127.0.0.1:9000/hls/channel01/2025/02/05/05/index.m3u8/inde
     - `UDP_QUEUE_SIZE`: UDP queue size (default: `1024`)
     - `UDP_SEND_BUFFER`: Size of the UDP Send buffer (default: `0` - OS default)
     - `USE_SMOOTHER`: Use the LibLTNTSTools Bitrate Smoother (default: `false`) Requires --features=libltntstools_enabled
+    - `HLS_TO_UDP_OUTPUT_FILE`: Output file for debugging (default: ``)
 
 ## Example
 
