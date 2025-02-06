@@ -2,9 +2,11 @@ use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
+use hls_to_udp::{PidTracker, TS_PACKET_SIZE};
 use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -245,7 +247,7 @@ fn receiver_thread(
                 next_seg_id += 1;
             }
 
-            if media_pl.end_list {
+            if vod || media_pl.end_list {
                 log::info!("ReceiverThread: ENDLIST found => done downloading.");
                 break;
             }
@@ -266,6 +268,7 @@ fn sender_thread(
     udp_send_buffer: usize,
     use_smoother: bool,
     vod: bool,
+    output_file: String,
     rx: Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
@@ -348,6 +351,9 @@ fn sender_thread(
         let udp_sender_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
 
+            // Create a PidTracker to track PIDs and Continuity Counter Errors
+            let mut pid_tracker = PidTracker::new();
+
             loop {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
                 match smoother_rx.recv_timeout(Duration::from_millis(100)) {
@@ -363,6 +369,20 @@ fn sender_thread(
                         // Divide the data into packet size chunks (with a possible smaller chunk at the end)
                         for chunk in data.chunks(pkt_size as usize) {
                             let mut chunk_dropped = false;
+
+                            // Check each TS packet for continuity errors
+                            for packet_chunk in chunk.chunks(TS_PACKET_SIZE) {
+                                if let Err(e) = pid_tracker
+                                    .process_packet("UDPsender".to_string(), packet_chunk)
+                                {
+                                    log::error!(
+                                        "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
+                                        e
+                                    );
+                                    break;
+                                }
+                            }
+
                             loop {
                                 match sock_clone.send(chunk) {
                                     Ok(bytes_sent) => {
@@ -439,6 +459,9 @@ fn sender_thread(
             );
         });
 
+        // Create a PidTracker to track PIDs and Continuity Counter Errors
+        let mut pid_tracker = PidTracker::new();
+
         // Process each downloaded segment from the receiver_thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
@@ -455,6 +478,31 @@ fn sender_thread(
 
             // Now feed data into the PcrSmoother if we have a valid PID
             if !use_smoother || pcr_pid > 0 {
+                // Write to output file if requested
+                if !output_file.is_empty() {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&output_file)
+                    {
+                        if let Err(e) = f.write_all(&seg.data) {
+                            log::error!("SenderThread: Failed to write to output file: {}", e);
+                        }
+                    }
+                }
+
+                // Feed it into your continuity checker
+                for packet_chunk in seg.data.chunks(TS_PACKET_SIZE) {
+                    if let Err(e) =
+                        pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
+                    {
+                        log::error!(
+                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?}",
+                            e
+                        );
+                    }
+                }
+
                 if !use_smoother {
                     // send directly into channel as UDP packets
                     let ret = smoother_tx.send(seg.data.to_vec());
@@ -613,8 +661,17 @@ fn main() -> Result<()> {
                 .help("End time offset in milliseconds from start of m3u8 playlist for VOD mode (default: 0 - end of playlist)")
                 .default_value("0"),
         )
+        .arg(
+            Arg::new("output_file")
+                .short('f')
+                .long("output-file")
+                .help("Output file for debugging")
+                .default_value("")
+                .action(ArgAction::Set),
+        )
         .get_matches();
 
+    let output_file = matches.get_one::<String>("output_file").unwrap().clone();
     let start_time = matches
         .get_one::<String>("start_time")
         .unwrap()
@@ -719,6 +776,9 @@ fn main() -> Result<()> {
     println!("  UDP Send Buffer Size: {}", udp_send_buffer);
     println!("  Start Time: {} ms", start_time);
     println!("  End Time: {} ms", end_time);
+    println!("  VOD Mode: {}", vod);
+    println!("  Max Bytes Threshold: {}", max_bytes_threshold);
+    println!("  Output File: {:?}", output_file);
 
     let use_smoother = false;
 
@@ -746,6 +806,7 @@ fn main() -> Result<()> {
         udp_send_buffer,
         use_smoother,
         vod,
+        output_file,
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
