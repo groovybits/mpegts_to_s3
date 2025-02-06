@@ -545,7 +545,7 @@ impl ManualSegmenter {
             m3u8_initialized: false,
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
-            diskless_mode: false,
+            diskless_mode: true,
             diskless_buffer: Arc::new(Mutex::new(DisklessBuffer::new(0))),
             segment_open_time: None,
             bytes_this_segment: 0,
@@ -585,7 +585,9 @@ impl ManualSegmenter {
 
     fn with_diskless_mode(mut self, diskless: bool, ring_size: usize) -> Self {
         self.diskless_mode = diskless;
-        self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
+        if diskless {
+            self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
+        }
         self
     }
 
@@ -1096,9 +1098,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("diskless_mode")
-                .long("diskless_mode")
-                .help("Keep TS segments in memory instead of writing them to disk.")
+            Arg::new("capture_to_disk")
+                .long("capture_to_disk")
+                .help("Capture UDP packets to disk as local segments for debugging.")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -1140,7 +1142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
-    let diskless_mode = matches.get_flag("diskless_mode");
+    let capture_to_disk = matches.get_flag("capture_to_disk");
     let verbose = matches
         .get_one::<String>("verbose")
         .unwrap()
@@ -1180,7 +1182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
           interface={}, timeout={}, output_dir={}, remove_local={} \
           hls_keep_segments={}, generate_unsigned_urls={}, \
-          diskless_mode={}, diskless_ring_size={}",
+          capture_to_disk={}, diskless_ring_size={}",
         endpoint,
         region_name,
         bucket,
@@ -1192,7 +1194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         remove_local,
         hls_keep_segments,
         generate_unsigned_urls,
-        diskless_mode,
+        capture_to_disk,
         diskless_ring_size
     );
 
@@ -1305,7 +1307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut manual_segmenter = Some(
         ManualSegmenter::new(output_dir)
             .with_max_segments(hls_keep_segments)
-            .with_diskless_mode(diskless_mode, diskless_ring_size)
+            .with_diskless_mode(!capture_to_disk, diskless_ring_size)
             .with_s3(
                 Some(s3_client.clone()),
                 Some(bucket.clone()),
@@ -1317,7 +1319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Diskless consumer thread (if needed)
-    let diskless_consumer = if diskless_mode {
+    let diskless_consumer = if !capture_to_disk {
         if let Some(_seg_ref) = &manual_segmenter {
             let buffer_ref = _seg_ref.diskless_buffer.clone();
             let shutdown_flag_clone = Arc::clone(&shutdown_flag);

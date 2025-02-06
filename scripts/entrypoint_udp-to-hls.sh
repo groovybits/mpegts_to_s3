@@ -9,10 +9,10 @@ cleanup() {
     exit 0
 }
 
-if [ "${DISKLESS_MODE}" = "true" ]; then
-    DISKLESS_ARGS="--diskless_mode"
+if [ "${CAPTURE_TO_DISK}" = "true" ]; then
+    CAPTURE_TO_DISK="--capture_to_disk"
 else
-    DISKLESS_ARGS=""
+    CAPTURE_TO_DISK=""
 fi
 
 if [ "${USE_UNSIGNED_URLS}" = "true" ]; then
@@ -30,7 +30,7 @@ while [ : ]; do
         -b ${MINIO_BUCKET_NAME} \
         -o ${CHANNEL_NAME} \
         --hls_keep_segments ${M3U8_LIVE_SEGMENT_COUNT} \
-        ${DISKLESS_ARGS} ${UNSIGNED_URL_ARGS} $@
+        ${CAPTURE_TO_DISK} ${UNSIGNED_URL_ARGS} $@
 
     sleep 1
 done
