@@ -166,6 +166,7 @@ SEGMENT_DURATION_SECONDS=2 \
   - `PCAP_PACKET_COUNT`: Number of packets to capture at a time (default: `7`)
   - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `false`)
   - `M3U8_LIVE_SEGMENT_COUNT`: Number of segments to keep in the live m3u8 (default: `3`)
+  = `DISKLESS_MODE`: Keep TS segments in memory only (default: `false`)
 
 #### hls-to-udp Environment Variables:
 

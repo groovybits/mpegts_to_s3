@@ -9,6 +9,12 @@ cleanup() {
     exit 0
 }
 
+if [ "${DISKLESS_MODE}" = "true" ]; then
+    DISKLESS_ARGS="--diskless_mode"
+else
+    DISKLESS_ARGS=""
+fi
+
 trap cleanup SIGINT SIGTERM
 
 while [ : ]; do
@@ -20,7 +26,7 @@ while [ : ]; do
         -b ${MINIO_BUCKET_NAME} \
         -o ${CHANNEL_NAME} \
         --hls_keep_segments ${M3U8_LIVE_SEGMENT_COUNT} \
-        --diskless_mode $@
+        ${DISKLESS_ARGS} $@
 
     sleep 1
 done
