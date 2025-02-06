@@ -370,7 +370,7 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 30000; // ms total wait if OS buffer is full
+        let max_block_ms = 100000; // ms total wait if OS buffer is full
 
         let udp_sender_thread = thread::spawn(move || {
             log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
@@ -391,7 +391,7 @@ fn sender_thread(
                         let start_time = Instant::now();
 
                         // Divide the data into packet size chunks (with a possible smaller chunk at the end)
-                        for chunk in data.chunks(pkt_size as usize) {
+                        for ref mut chunk in data.chunks(pkt_size as usize) {
                             let mut chunk_dropped = false;
 
                             // Check each TS packet for continuity errors
@@ -412,12 +412,22 @@ fn sender_thread(
                                     Ok(bytes_sent) => {
                                         // For UDP all or nothing is typical,
                                         // but we log the sent bytes for completeness.
-                                        stats_sent += 1;
                                         log::debug!(
                                             "SmootherThread: Packet of {} bytes sent from a chunk of {} bytes.",
                                             bytes_sent,
                                             chunk.len()
                                         );
+                                        // check if we sent all the data
+                                        if bytes_sent < chunk.len() {
+                                            log::warn!(
+                                                "SmootherThread: Partial send of {} bytes from a chunk of {} bytes.",
+                                                bytes_sent,
+                                                chunk.len()
+                                            );
+                                            *chunk = &chunk[bytes_sent..];
+                                            continue;
+                                        }
+                                        stats_sent += 1;
                                         break;
                                     }
                                     Err(e) => {
@@ -434,6 +444,9 @@ fn sender_thread(
                                                 );
                                                 break;
                                             }
+                                            log::debug!(
+                                                "SmootherThread: Socket full, waiting for buffer space, {}ms.", elapsed_ms
+                                            );
                                             thread::sleep(Duration::from_millis(1));
                                         } else {
                                             stats_dropped += 1;
@@ -595,8 +608,8 @@ fn sender_thread(
 
                 // Feed it into your continuity checker
                 for packet_chunk in seg.data.chunks(TS_PACKET_SIZE) {
-                    if let Err(e) =
-                        pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
+                    if let Err(e) = pid_tracker
+                        .process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
                     {
                         log::error!(
                             "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?}",
