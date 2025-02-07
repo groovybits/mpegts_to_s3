@@ -1356,9 +1356,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    let mut pid_tracker = PidTracker::new();
-    let mut leftover_ts = Vec::new();
-
     let (pcap_tx, pcap_rx) = std_mpsc::sync_channel::<(Vec<u8>, u64)>(100000);
 
     let capture_shutdown = Arc::clone(&shutdown_flag);
@@ -1429,6 +1426,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
          });
     });
 
+    let mut pid_tracker = PidTracker::new();
+    let mut leftover_ts = VecDeque::new();
+    let mut batch_buffer = Vec::new();
+
     debug!("Starting main processing loop now...");
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
@@ -1450,30 +1451,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_data) = extract_mpegts_payload(&packet_data, filter_ip, filter_port) {
-            leftover_ts.extend_from_slice(ts_data);
+            leftover_ts.extend(ts_data.iter().copied());
 
-            while leftover_ts.len() >= (7 * TS_PACKET_SIZE) {
-                for chunk in leftover_ts.chunks((TS_PACKET_SIZE) as usize) {
-                    if leftover_ts[0] != 0x47 {
-                        log::warn!("UDPtoHLS: (ExtractMpegTSpayload) Packet does not start with sync byte 0x47");
-                    }
-
-                    if let Err(e) =
-                        pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &chunk)
-                    {
-                        log::error!("UDPtoHLS: (ExtractMpegTSpayload) Continuity error: {:?}", e);
+            while leftover_ts.len() >= TS_PACKET_SIZE {
+                // Extract one TS packet (188 bytes)
+                let mut packet = Vec::with_capacity(TS_PACKET_SIZE);
+                for _ in 0..TS_PACKET_SIZE {
+                    if let Some(byte) = leftover_ts.pop_front() {
+                        packet.push(byte);
+                    } else {
+                        break;
                     }
                 }
 
-                let ts_packet = leftover_ts
-                    .drain(..(7 * TS_PACKET_SIZE))
-                    .collect::<Vec<u8>>();
+                if packet.len() != TS_PACKET_SIZE {
+                    // Incomplete packet, push back and break
+                    leftover_ts.extend(packet.into_iter());
+                    break;
+                }
 
-                if let Some(seg) = manual_segmenter.as_mut() {
-                    if let Err(e) = seg.write_ts(timestamp, &ts_packet).await {
-                        log::error!("UDPtoHLS: Segment write error: {:?}", e);
-                        break;
+                // Process the packet (PID tracking)
+                if packet[0] != 0x47 {
+                    log::warn!("UDPtoHLS: Packet does not start with sync byte 0x47");
+                }
+                if let Err(e) =
+                    pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &packet)
+                {
+                    log::error!("UDPtoHLS: Continuity error: {:?}", e);
+                }
+
+                // Accumulate packets into a batch
+                batch_buffer.extend(packet);
+
+                // Write in batches of 7 packets
+                if batch_buffer.len() >= 7 * TS_PACKET_SIZE {
+                    if let Some(seg) = manual_segmenter.as_mut() {
+                        if let Err(e) = seg.write_ts(timestamp, &batch_buffer).await {
+                            log::error!("UDPtoHLS: Segment write error: {:?}", e);
+                            break;
+                        }
                     }
+                    batch_buffer.clear();
                 }
             }
         }
