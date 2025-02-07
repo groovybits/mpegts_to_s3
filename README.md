@@ -77,9 +77,8 @@ SEGMENT_DURATION_SECONDS=2 \
 ../target/release/udp-to-hls \
     -n eth0 \         # Network interface for packet capture
     -i 224.0.0.200 \  # Multicast IP to filter
-    -p 10001 \         # UDP port to filter
-    -o ts \           # Output directory for .ts segments
-    --diskless_mode   # Diskless mode avoids writing .ts segments to disk
+    -p 10001 \        # UDP port to filter
+    -o channel01      # Unique Identifier and Output directory for .ts segments
 ```
 
 #### 4. Playback
@@ -141,7 +140,7 @@ SEGMENT_DURATION_SECONDS=2 \
    | --remove_local                         | Remove local .ts/.m3u8 after uploading?                      |                          |
    | --hls_keep_segments <hls_keep_segments>| Max segments kept in ${output_Dir}.m3u8                      | 3                        |
    | --unsigned_urls                        | Generate unsigned S3 URLs instead of presigned URLs          |                          |
-   | --diskless_mode                        | Keep TS segments in memory only                              |                          |
+   | --capture_to_disk                      | Directly output to disk TS segments and S3 too               |                          |
    | --diskless_ring_size <diskless_rs>     | Number of segments in memory buffer                          | 1                        |
    | -v, --verbose <verbose>                | Verbose level                                                | 0                        |
    | -h, --help                             | Print help                                                   |                          |
@@ -166,7 +165,7 @@ SEGMENT_DURATION_SECONDS=2 \
   - `PCAP_PACKET_COUNT`: Number of packets to capture at a time (default: `7`)
   - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `false`)
   - `M3U8_LIVE_SEGMENT_COUNT`: Number of segments to keep in the live m3u8 (default: `3`)
-  - `DISKLESS_MODE`: Keep TS segments in memory only (default: `false`)
+  - `CAPTURE_TO_DISK`: Capture to disk instead of memory (default: `true`) For local plan HTTP playback bypassing S3 and the hls-to-udp relay
   - `USE_UNSIGNED_URLS`: Generate unsigned S3 URLs instead of presigned URLs (default: `false`)
 
 #### hls-to-udp Environment Variables:
