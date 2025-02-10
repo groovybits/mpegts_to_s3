@@ -384,7 +384,7 @@ fn sender_thread(
         // Time-based approach to blocking, define a max wait:
         let max_block_ms = 10000; // ms total wait if OS buffer is full
 
-        let send_bitrate = 0; //20_000_000; // 20Mbps
+        let send_bitrate = 0; //20_000_000; // Fails to send properly when setting bitrates
 
         // buffer the 7 * 188 byte packets till we have a complete packet and up to 2 meg
         let mut buffer: Vec<u8> = Vec::with_capacity(10485700);
@@ -419,7 +419,7 @@ fn sender_thread(
 
                         // Process only if we have enough data for a full packet
                         if buffer.len() < 7 * TS_PACKET_SIZE {
-                            log::warn!(
+                            log::debug!(
                                 "HLStoUDP: UDPThread Buffer not full yet ({} bytes).",
                                 buffer.len()
                             );
@@ -832,7 +832,7 @@ fn main() -> Result<()> {
             Arg::new("udp_send_buffer")
                 .short('b')
                 .long("udp-send-buffer")
-                .default_value("1358")
+                .default_value("2097140")
                 .action(ArgAction::Set),
         )
         .arg(
