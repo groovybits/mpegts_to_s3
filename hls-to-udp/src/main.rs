@@ -382,7 +382,12 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 100000; // ms total wait if OS buffer is full
+        let max_block_ms = 10000; // ms total wait if OS buffer is full
+
+        let send_bitrate = 0; //20_000_000; // 20Mbps
+
+        // buffer the 7 * 188 byte packets till we have a complete packet and up to 2 meg
+        let mut buffer: Vec<u8> = Vec::with_capacity(10485700);
 
         let udp_sender_thread = thread::spawn(move || {
             println!("HLStoUDP: UDPThread started (hybrid non-blocking + partial block).");
@@ -392,18 +397,42 @@ fn sender_thread(
 
             loop {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
-                match udp_rx.recv_timeout(Duration::from_millis(100)) {
+                match udp_rx.recv_timeout(Duration::from_millis(1000)) {
                     Ok(data) => {
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
 
+                        // Append the data to the buffer
+                        if buffer.len() + data.len() > buffer.capacity() {
+                            log::warn!(
+                                "HLStoUDP: UDPThread Buffer full, dropping data. (buffer={}, data={})",
+                                buffer.len(),
+                                data.len()
+                            );
+                            drop(data);
+                            continue;
+                        }
+                        buffer.extend_from_slice(&data);
+                        drop(data);
+
+                        // Process only if we have enough data for a full packet
+                        if buffer.len() < 7 * TS_PACKET_SIZE {
+                            log::warn!(
+                                "HLStoUDP: UDPThread Buffer not full yet ({} bytes).",
+                                buffer.len()
+                            );
+                            continue;
+                        }
+
                         // Attempt to send this data to UDP
                         let start_time = Instant::now();
 
-                        // Divide the data into packet size chunks (with a possible smaller chunk at the end)
-                        for ref mut chunk in data.chunks((7 * TS_PACKET_SIZE) as usize) {
+                        while buffer.len() >= 7 * TS_PACKET_SIZE {
+                            // Remove exactly 7 * TS_PACKET_SIZE bytes from the buffer
+                            let mut chunk =
+                                buffer.drain(0..(7 * TS_PACKET_SIZE)).collect::<Vec<u8>>();
                             let mut chunk_dropped = false;
 
                             // Check each TS packet for continuity errors
@@ -419,23 +448,41 @@ fn sender_thread(
                             }
 
                             loop {
-                                match sock_clone.send(chunk) {
+                                // check how fast we are sending and conform to the bitrate
+                                let elapsed_ms = start_time.elapsed().as_millis();
+                                let sent_bytes = stats_sent * pkt_size as usize;
+                                let sent_bps = if elapsed_ms <= 0 {
+                                    0
+                                } else {
+                                    sent_bytes as u32 * 8 / elapsed_ms as u32
+                                };
+
+                                if send_bitrate > 0 && sent_bps > send_bitrate {
+                                    log::warn!(
+                                        "HLStoUDP: UDPThread Sending too fast, waiting for {}ms. (sent={}, dropped={})",
+                                        elapsed_ms,
+                                        stats_sent,
+                                        stats_dropped
+                                    );
+                                    thread::sleep(Duration::from_micros(1000));
+                                    continue;
+                                }
+
+                                match sock_clone.send(&chunk) {
                                     Ok(bytes_sent) => {
-                                        // For UDP all or nothing is typical,
-                                        // but we log the sent bytes for completeness.
                                         log::debug!(
                                             "HLStoUDP: UDPThread Packet of {} bytes sent from a chunk of {} bytes.",
                                             bytes_sent,
                                             chunk.len()
                                         );
-                                        // check if we sent all the data
                                         if bytes_sent < chunk.len() {
                                             log::warn!(
                                                 "HLStoUDP: UDPThread Partial send of {} bytes from a chunk of {} bytes.",
                                                 bytes_sent,
                                                 chunk.len()
                                             );
-                                            *chunk = &chunk[bytes_sent..];
+                                            // Remove the sent bytes and retry sending the remainder
+                                            chunk = chunk[bytes_sent..].to_vec();
                                             continue;
                                         }
                                         stats_sent += 1;
@@ -458,7 +505,7 @@ fn sender_thread(
                                             log::debug!(
                                                 "HLStoUDP: UDPThread Socket full, waiting for buffer space, {}ms.", elapsed_ms
                                             );
-                                            thread::sleep(Duration::from_millis(1));
+                                            thread::sleep(Duration::from_micros(1000));
                                         } else {
                                             stats_dropped += 1;
                                             chunk_dropped = true;
@@ -485,8 +532,6 @@ fn sender_thread(
                             log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
-                        // free up the data buffer
-                        drop(data);
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         // Periodically check shutdown
