@@ -542,14 +542,14 @@ fn sender_thread(
                                                 "HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes, elapsed {} ms, rate {} bps.",
                                                 chunk.len(), elapsed_ms, sent_bps
                                             );
-                                            if !use_smoother {
+                                            //if !use_smoother {
                                                 let sleep_time_micros: u64 =
                                                     (chunk.len() / TS_PACKET_SIZE) as u64
                                                         * frame_time_micros;
                                                 thread::sleep(Duration::from_micros(
                                                     sleep_time_micros,
                                                 ));
-                                            }
+                                            //}
                                         } else {
                                             total_bytes_dropped += chunk.len();
                                             chunk_dropped = true;
