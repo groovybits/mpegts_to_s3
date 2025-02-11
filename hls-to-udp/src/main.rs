@@ -469,7 +469,8 @@ fn sender_thread(
                                     sent_bytes as u32 * 8 / elapsed_ms as u32
                                 };
                                 log::debug!(
-                                    "HLStoUDP: UDPThread Sending at {} bps (sent={} bytes, dropped={} bytes)",
+                                    "HLStoUDP: UDPThread Sending {} bytes buffer at {} bps (sent={} bytes, dropped={} bytes)",
+                                    chunk.len(),
                                     sent_bps,
                                     total_bytes_sent,
                                     total_bytes_dropped
@@ -541,7 +542,8 @@ fn sender_thread(
                             }
                             if chunk_dropped {
                                 log::debug!(
-                                    "HLStoUDP: UDPThread Chunk dropped due to blocking or error."
+                                    "HLStoUDP: UDPThread Chunk of size {} bytes dropped due to blocking or error.",
+                                        chunk.len()
                                 );
                             }
                         }
