@@ -400,12 +400,12 @@ fn sender_thread(
         // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
         let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
         let min_packet_size = if use_smoother {
-            1 * TS_PACKET_SIZE
+            pkt_size as usize
         } else {
-            7 * TS_PACKET_SIZE
+            pkt_size as usize
         };
         let max_packet_size = if use_smoother {
-            7 * TS_PACKET_SIZE
+            pkt_size as usize
         } else {
             pkt_size as usize
         };
@@ -452,6 +452,7 @@ fn sender_thread(
 
                         // Attempt to send this data to UDP
                         let buffer_start_time = Instant::now();
+                        let mut index = 0;
 
                         while buffer.len() >= min_packet_size {
                             // Determine the packet size to send (up to max_packet_size, aligned on TS_PACKET_SIZE)
@@ -470,10 +471,22 @@ fn sender_thread(
                                 if let Err(e) = pid_tracker
                                     .process_packet("UDPsender".to_string(), packet_chunk)
                                 {
-                                    log::error!(
+                                    if e == 0xFFFF {
+                                        log::error!(
+                                            "HLStoUDP: (UDPSender) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.",
+                                            packet_chunk.len(),
+                                            index,
+                                            chunk.len() / TS_PACKET_SIZE,
+                                            chunk.len()
+                                        );
+                                        index += 1;
+                                        continue;
+                                    } else {
+                                        log::error!(
                                         "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
                                         e
                                     );
+                                    }
                                 }
                             }
 
@@ -572,6 +585,7 @@ fn sender_thread(
                                     chunk.len()
                                 );
                             }
+                            index += 1;
                         }
 
                         // Finally, check for shutdown again

@@ -39,23 +39,23 @@ use env_logger;
 
 fn get_segment_duration_ms() -> f64 {
     std::env::var("SEGMENT_DURATION_MS")
-        .unwrap_or_else(|_| "1000.0".to_string())
+        .unwrap_or_else(|_| "2000.0".to_string())
         .parse()
-        .unwrap_or(1000.0)
+        .unwrap_or(2000.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
     std::env::var("MAX_SEGMENT_SIZE_BYTES")
-        .unwrap_or_else(|_| "25000000".to_string())
+        .unwrap_or_else(|_| "5242756".to_string())
         .parse()
-        .unwrap_or(5_000_000)
+        .unwrap_or(5242756)
 }
 
 fn get_file_max_age_seconds() -> u64 {
     std::env::var("FILE_MAX_AGE_SECONDS")
-        .unwrap_or_else(|_| "5".to_string())
+        .unwrap_or_else(|_| "30".to_string())
         .parse()
-        .unwrap_or(5)
+        .unwrap_or(30)
 }
 
 fn get_url_signing_seconds() -> u64 {
