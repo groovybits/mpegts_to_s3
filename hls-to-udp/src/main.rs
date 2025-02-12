@@ -7,9 +7,10 @@ use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ struct DownloadedSegment {
     id: usize,
     data: Vec<u8>,
     duration: f64,
+    uri: String,
 }
 
 struct SegmentHistory {
@@ -54,7 +56,7 @@ impl SegmentHistory {
 
 fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
     base.join(seg_path)
-        .map_err(|e| anyhow!("ResolveSegmentUrl: Failed URL join: {}", e))
+        .map_err(|e| anyhow!("HLStoUDP: ResolveSegmentUrl: Failed URL join: {}", e))
 }
 
 fn receiver_thread(
@@ -73,7 +75,7 @@ fn receiver_thread(
         let base_url = match Url::parse(&m3u8_url) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("ReceiverThread: Invalid M3U8 URL: {}", e);
+                log::error!("HLStoUDP: ReceiverThread Invalid M3U8 URL: {}", e);
                 return;
             }
         };
@@ -84,27 +86,30 @@ fn receiver_thread(
         // Main loop
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
-                log::info!("ReceiverThread: Shutdown flag set, exiting.");
+                println!("HLStoUDP: ReceiverThread Shutdown flag set, exiting.");
                 break;
             }
             let playlist_text = match client.get(&m3u8_url).send() {
                 Ok(r) => {
                     if !r.status().is_success() {
-                        eprintln!("ReceiverThread: 3U8 fetch HTTP error: {}", r.status());
+                        log::error!(
+                            "HLStoUDP: ReceiverThread 3U8 fetch HTTP error: {}",
+                            r.status()
+                        );
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     match r.text() {
                         Ok(txt) => txt,
                         Err(e) => {
-                            eprintln!("ReceiverThread: M3U8 read error: {}", e);
+                            log::error!("HLStoUDP: ReceiverThread M3U8 read error: {}", e);
                             thread::sleep(Duration::from_millis(100));
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("ReceiverThread: M3U8 request error: {}", e);
+                    log::error!("HLStoUDP: ReceiverThread M3U8 request error: {}", e);
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -113,17 +118,104 @@ fn receiver_thread(
             let parsed = parse_playlist_res(playlist_text.as_bytes());
             let media_pl = match parsed {
                 Ok(Playlist::MediaPlaylist(mp)) => mp,
-                Ok(_) => {
-                    eprintln!("ReceiverThread: Got Master/unknown playlist...");
-                    thread::sleep(Duration::from_millis(poll_interval_ms));
-                    continue;
+                Ok(Playlist::MasterPlaylist(mp)) => {
+                    log::info!("HLStoUDP: ReceiverThread Got Master playlist, parsing...");
+
+                    /* get the variant that has the largest bandwidth */
+                    let mut variant = None;
+                    let mut best_bandwidth = 0;
+                    for v in &mp.variants {
+                        if v.bandwidth > best_bandwidth {
+                            best_bandwidth = v.bandwidth;
+                            variant = Some(v);
+                        }
+                    }
+                    if variant.is_none() {
+                        log::error!("HLStoUDP: ReceiverThread No valid variant found.");
+                        thread::sleep(Duration::from_millis(poll_interval_ms));
+                        continue;
+                    }
+                    let best_playlist = if let Some(variant) = variant {
+                        let mut variant_uri = variant.uri.clone();
+                        /* check if we have a relative url or not via http: prefix, adjust variant_uri if needed, getting the original m3u8_url's base */
+                        if variant_uri.starts_with("http:") || variant_uri.starts_with("https:") {
+                            // do nothing
+                        } else {
+                            let mut base_uri = base_url.clone();
+                            /* get path dirname without end file */
+                            let path_parts: Vec<&str> = base_uri.path_segments().unwrap().collect();
+                            let path_dirname = path_parts.join("/");
+                            base_uri.set_path(path_dirname.as_str());
+                            base_uri.set_query(None);
+                            base_uri.set_fragment(None);
+                            variant_uri = base_uri.join(&variant_uri).unwrap().to_string();
+                        };
+                        let variant_playlist_text = match client.get(&variant_uri).send() {
+                            Ok(r) => {
+                                if !r.status().is_success() {
+                                    log::error!(
+                                        "HLStoUDP: ReceiverThread Variant playlist {} fetch HTTP error: {}",
+                                        variant_uri,
+                                        r.status()
+                                    );
+                                    continue;
+                                }
+                                match r.text() {
+                                    Ok(txt) => txt,
+                                    Err(e) => {
+                                        log::error!(
+                                            "HLStoUDP: ReceiverThread Variant playlist {} read error: {}",
+                                            variant_uri,
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "HLStoUDP: ReceiverThread Variant playlist {} request error: {}",
+                                    variant_uri,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        let pl = parse_playlist_res(variant_playlist_text.as_bytes());
+                        let variant_media_pl = match pl {
+                            Ok(Playlist::MediaPlaylist(mp)) => mp,
+                            Ok(Playlist::MasterPlaylist(_)) => {
+                                log::error!("HLStoUDP: ReceiverThread Got nested Master playlist, ignoring...");
+                                continue;
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "HLStoUDP: ReceiverThread Parse error in variant playlist: {:?}, ignoring...",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        variant_media_pl
+                    } else {
+                        log::error!("HLStoUDP: ReceiverThread No valid sub-playlist found.");
+                        thread::sleep(Duration::from_millis(poll_interval_ms));
+                        continue;
+                    };
+                    best_playlist
                 }
                 Err(e) => {
-                    eprintln!("ReceiverThread: Parse error: {:?}, ignoring...", e);
+                    log::error!("HLStoUDP: ReceiverThread Parse error: {:?}, ignoring...", e);
                     thread::sleep(Duration::from_millis(poll_interval_ms));
                     continue;
                 }
             };
+
+            if media_pl.segments.is_empty() {
+                log::warn!("HLStoUDP: ReceiverThread No segments found in playlist.");
+                thread::sleep(Duration::from_millis(poll_interval_ms));
+                continue;
+            }
 
             if first_poll {
                 for seg in &media_pl.segments {
@@ -136,7 +228,7 @@ fn receiver_thread(
 
             for seg in &media_pl.segments {
                 if shutdown_flag.load(Ordering::SeqCst) {
-                    log::info!("ReceiverThread: Shutdown flag set, breaking loop.");
+                    println!("HLStoUDP: ReceiverThread Shutdown flag set, breaking loop.");
                     break;
                 }
 
@@ -144,7 +236,33 @@ fn receiver_thread(
                 // http://127.0.0.1:9000/hls/channel01/2025/02/05/06/segment_20250205-060936__8511.ts
                 // bucket, channel, year, month, day, hour, segment_YYYYMMDD-HHMMSS__INDEX.ts
 
-                let uri = &seg.uri;
+                let mut seg_uri = seg.uri.clone();
+                if seg_uri.starts_with("http:") || seg_uri.starts_with("https:") {
+                    // do nothing
+                } else {
+                    let mut base_uri = base_url.clone();
+                    /* get path dirname without end file */
+                    let path_parts: Vec<&str> = base_uri.path_segments().unwrap().collect();
+                    let path_dirname = path_parts.join("/");
+                    base_uri.set_path(path_dirname.as_str());
+                    base_uri.set_query(None);
+                    base_uri.set_fragment(None);
+                    seg_uri = base_uri.join(&seg_uri).unwrap().to_string();
+                };
+                let uri = &seg_uri;
+
+                /* confirm a valid uri */
+                if uri.is_empty() {
+                    log::error!("HLStoUDP: ReceiverThread Empty segment URI, skipping.");
+                    continue;
+                }
+
+                /* check uri is proper format with uri crate */
+                if Url::parse(uri).is_err() {
+                    log::error!("HLStoUDP: ReceiverThread Bad segment URI: {}", uri);
+                    continue;
+                }
+
                 if seg_history.contains(uri) {
                     continue;
                 }
@@ -178,7 +296,7 @@ fn receiver_thread(
                     if let Some(offset_ms) = parse_segment_offset(uri) {
                         if offset_ms < start_time {
                             log::debug!(
-                                "Skipping segment {}: offset {}ms is before start_time {}ms",
+                                "HLStoUDP: Skipping segment {}: offset {}ms is before start_time {}ms",
                                 uri,
                                 offset_ms,
                                 start_time
@@ -186,14 +304,16 @@ fn receiver_thread(
                             continue;
                         }
                         if end_time > 0 && offset_ms > end_time {
-                            log::info!(
-                                "Segment {} offset {}ms exceeds end_time {}ms",
+                            log::debug!(
+                                "HLStoUDP: Segment {} offset {}ms exceeds end_time {}ms",
                                 uri,
                                 offset_ms,
                                 end_time
                             );
                             if vod {
-                                log::info!("VOD mode: finished processing required time range.");
+                                log::debug!(
+                                    "HLStoUDP: VOD mode: finished processing required time range."
+                                );
                                 shutdown_flag.store(true, Ordering::SeqCst);
                             }
                             break;
@@ -204,12 +324,12 @@ fn receiver_thread(
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
                     Err(e) => {
-                        eprintln!("ReceiverThread: Bad segment URL: {}", e);
+                        log::error!("HLStoUDP: ReceiverThread Bad segment URL: {}", e);
                         continue;
                     }
                 };
-                log::info!(
-                    "ReceiverThread: Downloading segment {} => {}",
+                log::debug!(
+                    "HLStoUDP: ReceiverThread Downloading segment {} => {}",
                     next_seg_id,
                     seg_url
                 );
@@ -217,19 +337,22 @@ fn receiver_thread(
                 let seg_bytes = match client.get(seg_url).send() {
                     Ok(resp) => {
                         if !resp.status().is_success() {
-                            eprintln!("ReceiverThread: Segment fetch error: {}", resp.status());
+                            log::error!(
+                                "HLStoUDP: ReceiverThread Segment fetch error: {}",
+                                resp.status()
+                            );
                             continue;
                         }
                         match resp.bytes() {
                             Ok(b) => b.to_vec(),
                             Err(e) => {
-                                eprintln!("ReceiverThread: Segment read err: {}", e);
+                                log::error!("HLStoUDP: ReceiverThread Segment read err: {}", e);
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("ReceiverThread: Segment request error: {}", e);
+                        log::error!("HLStoUDP: ReceiverThread Segment request error: {}", e);
                         continue;
                     }
                 };
@@ -238,9 +361,11 @@ fn receiver_thread(
                     id: next_seg_id,
                     data: seg_bytes,
                     duration: seg.duration.into(),
+                    uri: uri.to_string(),
                 };
                 if tx.send(seg_struct).is_err() {
-                    eprintln!("ReceiverThread: Receiver dropped, downloader exiting.");
+                    // get error information
+                    log::error!("HLStoUDP: ReceiverThread Receiver dropped, downloader exiting");
                     tx_shutdown.send(()).ok();
                     return;
                 }
@@ -248,7 +373,7 @@ fn receiver_thread(
             }
 
             if vod || media_pl.end_list {
-                log::info!("ReceiverThread: ENDLIST found => done downloading.");
+                log::warn!("HLStoUDP: ReceiverThread ENDLIST found => done downloading.");
                 break;
             }
 
@@ -269,17 +394,19 @@ fn sender_thread(
     use_smoother: bool,
     vod: bool,
     output_file: String,
-    rx: Receiver<DownloadedSegment>,
+    rx: mpsc::Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let pcr_pid = pcr_pid_arg;
-        let mut stats_dropped = 0usize;
-        let mut stats_sent = 0usize;
+        let mut total_bytes_dropped = 0usize;
+        let mut total_bytes_sent = 0usize;
 
-        log::debug!("SenderThread: Starting UDP sender thread with input values vod={} udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, smoother_max_bytes={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
-            vod, udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, smoother_max_bytes, udp_queue_size, udp_send_buffer, use_smoother);
+        log::debug!(
+            "SenderThread: Starting UDP sender thread with input values vod={} udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, smoother_max_bytes={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
+            vod, udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, smoother_max_bytes, udp_queue_size, udp_send_buffer, use_smoother
+        );
 
         // Create raw socket with socket2
         let socket = match socket2::Socket::new(
@@ -289,7 +416,7 @@ fn sender_thread(
         ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("SenderThread: Socket creation error: {}", e);
+                log::error!("HLStoUDP: SenderThread Socket creation error: {}", e);
                 return;
             }
         };
@@ -297,77 +424,130 @@ fn sender_thread(
         // Configure socket before converting to std::net::UdpSocket
         if udp_send_buffer > 0 {
             log::info!(
-                "SenderThread: Setting send buffer to {} bytes.",
+                "HLStoUDP: SenderThread Setting send buffer to {} bytes.",
                 udp_send_buffer
             );
-
             let desired_send_buffer = udp_send_buffer;
             if let Err(e) = socket.set_send_buffer_size(desired_send_buffer) {
-                eprintln!("SenderThread: Failed to set send buffer: {}", e);
+                log::error!("HLStoUDP: SenderThread Failed to set send buffer: {}", e);
             }
-
-            // Get actual buffer size
             match socket.send_buffer_size() {
                 Ok(actual) => {
                     if actual < desired_send_buffer {
                         log::warn!(
-                        "OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.",
-                        actual / 1024,
-                        desired_send_buffer / 1024
-                    );
+                            "HLStoUDP: OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.",
+                            actual / 1024,
+                            desired_send_buffer / 1024
+                        );
                     }
                 }
-                Err(e) => eprintln!("SenderThread: Couldn't get buffer size: {}", e),
+                Err(e) => log::error!("HLStoUDP: SenderThread Couldn't get buffer size: {}", e),
             }
         }
 
         // Convert to stdlib socket
-        let sock: std::net::UdpSocket = socket.into();
+        let sock: UdpSocket = socket.into();
 
         // Keep socket in non-blocking mode (hybrid approach: we do small manual blocking when full)
         if let Err(e) = sock.set_nonblocking(true) {
-            eprintln!("SenderThread: Failed to set non-blocking socket: {}", e);
+            log::error!(
+                "HLStoUDP: SenderThread Failed to set non-blocking socket: {}",
+                e
+            );
             return;
         }
 
         // Connect the UDP socket
         if let Err(e) = sock.connect(&udp_addr) {
-            eprintln!("SenderThread: Failed to connect UDP socket: {}", e);
+            log::error!(
+                "HLStoUDP: SenderThread: Failed to connect UDP socket: {}",
+                e
+            );
             return;
         }
 
         let sock = Arc::new(sock); // Wrap in Arc for thread safety
 
         // --- Channels for the Smoother callback => UDP send thread
-        let (smoother_tx, smoother_rx) = mpsc::sync_channel::<Vec<u8>>(udp_queue_size);
+        let (udp_tx, udp_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(udp_queue_size);
 
-        // --- UDP-sending thread, reading from smoother_rx channel
         let sock_clone = Arc::clone(&sock);
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 30000; // ms total wait if OS buffer is full
+        let max_block_ms = 10000; // ms total wait if OS buffer is full
+        let timeout_interval = Duration::from_millis(10000); // 10 seconds
+
+        let frame_time_micros = 20; // micros per 188 byte packet
+
+        // Use a VecDeque as a ring buffer to avoid memmove overhead.
+        // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
+        let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
+        let min_packet_size = if use_smoother {
+            pkt_size as usize
+        } else {
+            pkt_size as usize
+        };
+        let max_packet_size = if use_smoother {
+            pkt_size as usize
+        } else {
+            pkt_size as usize
+        };
+
+        let capture_start_time = Instant::now();
 
         let udp_sender_thread = thread::spawn(move || {
-            log::info!("SmootherThread: started (hybrid non-blocking + partial block).");
+            println!("HLStoUDP: UDPThread started (hybrid non-blocking + partial block).");
 
             // Create a PidTracker to track PIDs and Continuity Counter Errors
             let mut pid_tracker = PidTracker::new();
 
             loop {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
-                match smoother_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(data) => {
+                match udp_rx.recv_timeout(timeout_interval) {
+                    Ok(arc_data) => {
+                        // Use the inner Vec<u8> from the Arc wrapper.
+                        let data = arc_data.as_ref();
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
-                            log::info!("SmootherThread: Shutdown flag set, exiting.");
+                            log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
 
-                        // Attempt to send this data to UDP
-                        let start_time = Instant::now();
+                        // Check if appending data would exceed our buffer capacity.
+                        if buffer.len() + data.len() > buffer.capacity() {
+                            log::warn!(
+                                "HLStoUDP: UDPThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)",
+                                buffer.len(),
+                                data.len()
+                            );
+                            continue;
+                        }
+                        // Extend our VecDeque with the new data.
+                        buffer.extend(data.iter().copied());
 
-                        // Divide the data into packet size chunks (with a possible smaller chunk at the end)
-                        for chunk in data.chunks(pkt_size as usize) {
+                        // Process only if we have enough data for a full packet
+                        if buffer.len() < min_packet_size {
+                            log::debug!(
+                                "HLStoUDP: UDPThread Buffer not full yet ({} bytes).",
+                                buffer.len()
+                            );
+                            continue;
+                        }
+
+                        // Attempt to send this data to UDP
+                        let buffer_start_time = Instant::now();
+                        let mut index = 0;
+
+                        while buffer.len() >= min_packet_size {
+                            // Determine the packet size to send (up to max_packet_size, aligned on TS_PACKET_SIZE)
+                            let mut packet_size = max_packet_size;
+                            if buffer.len() < max_packet_size {
+                                packet_size = buffer.len();
+                                // Align with TS_PACKET_SIZE boundary.
+                                packet_size = packet_size - (packet_size % TS_PACKET_SIZE);
+                            }
+                            // Drain exactly packet_size bytes from the front of the VecDeque.
+                            let mut chunk: Vec<u8> = buffer.drain(0..packet_size).collect();
                             let mut chunk_dropped = false;
 
                             // Check each TS packet for continuity errors
@@ -375,50 +555,108 @@ fn sender_thread(
                                 if let Err(e) = pid_tracker
                                     .process_packet("UDPsender".to_string(), packet_chunk)
                                 {
-                                    log::error!(
+                                    if e == 0xFFFF {
+                                        log::error!(
+                                            "HLStoUDP: (UDPSender) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.",
+                                            packet_chunk.len(),
+                                            index,
+                                            chunk.len() / TS_PACKET_SIZE,
+                                            chunk.len()
+                                        );
+                                        index += 1;
+                                        continue;
+                                    } else {
+                                        log::error!(
                                         "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
                                         e
                                     );
-                                    break;
+                                    }
                                 }
                             }
 
                             loop {
-                                match sock_clone.send(chunk) {
+                                // Calculate sending rate information.
+                                let elapsed_ms = capture_start_time.elapsed().as_millis();
+                                let sent_bytes = total_bytes_sent;
+                                let sent_bps = if elapsed_ms <= 0 {
+                                    0
+                                } else {
+                                    sent_bytes as u32 * 8 / elapsed_ms as u32
+                                };
+                                log::debug!(
+                                    "HLStoUDP: UDPThread Sending {} bytes buffer at {} bps (sent={} bytes, dropped={} bytes)",
+                                    chunk.len(),
+                                    sent_bps,
+                                    total_bytes_sent,
+                                    total_bytes_dropped
+                                );
+
+                                match sock_clone.send(&chunk) {
                                     Ok(bytes_sent) => {
-                                        // For UDP all or nothing is typical,
-                                        // but we log the sent bytes for completeness.
-                                        stats_sent += 1;
                                         log::debug!(
-                                            "SmootherThread: Packet of {} bytes sent from a chunk of {} bytes.",
+                                            "HLStoUDP: UDPThread Packet of {} bytes sent from a chunk of {} bytes at {} bps.",
                                             bytes_sent,
-                                            chunk.len()
+                                            chunk.len(),
+                                            sent_bps
                                         );
+                                        if bytes_sent < chunk.len() {
+                                            log::warn!(
+                                                "HLStoUDP: UDPThread Partial send of {} bytes from a chunk of {} bytes at {} bps.",
+                                                bytes_sent,
+                                                chunk.len(),
+                                                sent_bps
+                                            );
+                                            // Remove the sent bytes and retry sending the remainder.
+                                            chunk = chunk[bytes_sent..].to_vec();
+                                            continue;
+                                        }
+                                        total_bytes_sent += chunk.len();
+                                        if !use_smoother {
+                                            // Slow down the sending rate.
+                                            let sleep_time: u64 = (chunk.len() / TS_PACKET_SIZE)
+                                                as u64
+                                                * frame_time_micros;
+                                            thread::sleep(Duration::from_micros(sleep_time));
+                                        }
                                         break;
                                     }
                                     Err(e) => {
                                         if e.kind() == std::io::ErrorKind::WouldBlock {
-                                            let elapsed_ms = start_time.elapsed().as_millis();
+                                            let elapsed_ms =
+                                                buffer_start_time.elapsed().as_millis();
                                             if elapsed_ms > max_block_ms as u128 {
-                                                stats_dropped += 1;
+                                                total_bytes_dropped += chunk.len();
                                                 chunk_dropped = true;
                                                 log::error!(
-                                                    "SmootherThread: Socket still full after {}ms. Dropping chunk. (sent={}, dropped={})",
+                                                    "HLStoUDP: UDPThread Socket still full after {} ms. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
                                                     elapsed_ms,
-                                                    stats_sent,
-                                                    stats_dropped
+                                                    chunk.len(),
+                                                    total_bytes_sent,
+                                                    total_bytes_dropped,
+                                                    sent_bps
                                                 );
                                                 break;
                                             }
-                                            thread::sleep(Duration::from_millis(1));
+                                            log::warn!(
+                                                "HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes, elapsed {} ms, rate {} bps.",
+                                                chunk.len(), elapsed_ms, sent_bps
+                                            );
+                                            //if !use_smoother {
+                                            let sleep_time_micros: u64 =
+                                                (chunk.len() / TS_PACKET_SIZE) as u64
+                                                    * frame_time_micros;
+                                            thread::sleep(Duration::from_micros(sleep_time_micros));
+                                            //}
                                         } else {
-                                            stats_dropped += 1;
+                                            total_bytes_dropped += chunk.len();
                                             chunk_dropped = true;
                                             log::error!(
-                                                "SmootherThread: UDP error: {}. Dropping chunk. (sent={}, dropped={})",
+                                                "HLStoUDP: UDPThread UDP error: {}. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
                                                 e,
-                                                stats_sent,
-                                                stats_dropped
+                                                chunk.len(),
+                                                total_bytes_sent,
+                                                total_bytes_dropped,
+                                                sent_bps
                                             );
                                             break;
                                         }
@@ -427,52 +665,54 @@ fn sender_thread(
                             }
                             if chunk_dropped {
                                 log::debug!(
-                                    "SmootherThread: Chunk dropped due to blocking or error."
+                                    "HLStoUDP: UDPThread Chunk of size {} bytes dropped due to blocking or error.",
+                                    chunk.len()
                                 );
                             }
+                            index += 1;
                         }
 
-                        // Finally check for shutdown again
+                        // Finally, check for shutdown again
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
-                            log::info!("SmootherThread: Shutdown flag set, exiting.");
+                            log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         // Periodically check shutdown
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
-                            log::info!("SmootherThread: Shutdown flag set, exiting.");
+                            log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        log::info!("SmootherThread: channel disconnected, exiting.");
+                        log::warn!("HLStoUDP: UDPThread channel disconnected, exiting.");
                         break;
                     }
                 }
             }
-            log::info!(
-                "SmootherThread: exiting. Sent={}, Dropped={}",
-                stats_sent,
-                stats_dropped
+            log::warn!(
+                "HLStoUDP: UDPThread exiting. Sent={} bytes, Dropped={} bytes",
+                total_bytes_sent,
+                total_bytes_dropped
             );
         });
 
         // Create a PidTracker to track PIDs and Continuity Counter Errors
         let mut pid_tracker = PidTracker::new();
 
-        // Process each downloaded segment from the receiver_thread
+        // Process each downloaded segment from the receiver thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
-                "SenderThread: Segment #{} => {} bytes, {} sec",
+                "HLStoUDP: SenderThread Segment #{} => {} bytes, {} sec",
                 seg.id,
                 seg.data.len(),
                 seg.duration
             );
 
             if shutdown_flag.load(Ordering::SeqCst) {
-                log::info!("SenderThread: Shutdown flag set, exiting.");
+                log::warn!("HLStoUDP: SenderThread Shutdown flag set, exiting.");
                 break;
             }
 
@@ -486,42 +726,59 @@ fn sender_thread(
                         .open(&output_file)
                     {
                         if let Err(e) = f.write_all(&seg.data) {
-                            log::error!("SenderThread: Failed to write to output file: {}", e);
+                            log::error!(
+                                "HLStoUDP: SenderThread Failed to write to output file: {}",
+                                e
+                            );
                         }
                     }
                 }
 
                 // Feed it into your continuity checker
+                let mut index = 0;
                 for packet_chunk in seg.data.chunks(TS_PACKET_SIZE) {
-                    if let Err(e) =
-                        pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
+                    if let Err(e) = pid_tracker
+                        .process_packet("ReceiveDownloadSegment".to_string(), packet_chunk)
                     {
-                        log::error!(
-                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?}",
-                            e
-                        );
+                        if e == 0xFFFF {
+                            log::error!(
+                                "HLStoUDP: (ReceiveDownloadSegment) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment. URI: {}",
+                                packet_chunk.len(),
+                                index,
+                                seg.data.len() / TS_PACKET_SIZE,
+                                seg.data.len(),
+                                seg.uri
+                            );
+                            continue;
+                        } else {
+                            log::error!(
+                                "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?} in segment {} of {} chunks of {} bytes total. URI: {}",
+                                e, index, seg.data.len() / TS_PACKET_SIZE, seg.data.len(), seg.uri
+                            );
+                        }
                     }
-                }
 
-                if !use_smoother {
-                    // send directly into channel as UDP packets
-                    let ret = smoother_tx.send(seg.data.to_vec());
-                    if let Err(e) = ret {
-                        log::error!("SenderThread: UDP send error: {}", e);
+                    if !use_smoother {
+                        // Send directly into channel as UDP packets, wrapping data in an Arc.
+                        if let Err(e) = udp_tx.send(Arc::new(packet_chunk.to_vec())) {
+                            log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
+                        }
                     }
+                    index += 1;
                 }
+                drop(seg); // drop the segment data
             }
         }
 
         // Tell the udp_sender_thread to shut down
-        log::info!("SenderThread: sending shutdown signal to smoother thread.");
+        log::warn!("HLStoUDP: SenderThread sending shutdown signal to smoother thread.");
         let _ = tx_shutdown.send(());
 
         // Wait for the smoother thread to exit
-        log::info!("SenderThread: waiting for smoother thread to exit...");
+        log::info!("HLStoUDP: SenderThread waiting for smoother thread to exit...");
         let _ = udp_sender_thread.join();
 
-        println!("SenderThread: exiting.");
+        println!("HLStoUDP: SenderThread exiting.");
     })
 }
 
@@ -535,11 +792,11 @@ fn main() -> Result<()> {
     ctrlc::set_handler({
         let shutdown_flag = Arc::clone(&shutdown_flag);
         move || {
-            eprintln!("Got CTRL+C, shutting down gracefully...");
+            eprintln!("HLStoUDP: Got CTRL+C, shutting down gracefully...");
             shutdown_flag.store(true, Ordering::SeqCst);
             ctrl_counter += 1;
             if ctrl_counter >= 3 {
-                eprintln!("Got CTRL+C 3 times, forcing exit.");
+                eprintln!("HLStoUDP: Got CTRL+C 3 times, forcing exit.");
                 std::process::exit(1);
             }
         }
@@ -614,21 +871,21 @@ fn main() -> Result<()> {
             Arg::new("segment_queue_size")
                 .short('q')
                 .long("segment-queue-size")
-                .default_value("3")
+                .default_value("10")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("udp_queue_size")
                 .short('z')
                 .long("udp-queue-size")
-                .default_value("1")
+                .default_value("512")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("udp_send_buffer")
                 .short('b')
                 .long("udp-send-buffer")
-                .default_value("1358")
+                .default_value("2097140")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -640,13 +897,13 @@ fn main() -> Result<()> {
         .arg(
             Arg::new("use_smoother")
                 .long("use-smoother")
-                .action(clap::ArgAction::SetTrue)
+                .action(ArgAction::SetTrue)
                 .help("Use the PcrSmoother for rate control (default: false)"),
         )
         .arg(
             Arg::new("vod")
                 .long("vod")
-                .action(clap::ArgAction::SetTrue)
+                .action(ArgAction::SetTrue)
                 .help("Use VOD mode (default: false)"),
         )
         .arg(
@@ -669,8 +926,18 @@ fn main() -> Result<()> {
                 .default_value("")
                 .action(ArgAction::Set),
         )
+        .arg(
+            Arg::new("quiet")
+                .long("quiet")
+                .help("Suppress all non error output")
+                .action(ArgAction::SetTrue),
+        )
         .get_matches();
 
+    log::debug!("HLStoUDP: Command-line arguments parsed: {:?}", matches);
+    println!("HLStoUDP: version: {}", get_version());
+
+    let quiet = matches.get_flag("quiet");
     let output_file = matches.get_one::<String>("output_file").unwrap().clone();
     let start_time = matches
         .get_one::<String>("start_time")
@@ -692,7 +959,7 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(1);
+        .unwrap_or(512);
     let udp_send_buffer = matches
         .get_one::<String>("udp_send_buffer")
         .unwrap()
@@ -702,7 +969,7 @@ fn main() -> Result<()> {
         .get_one::<String>("segment_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(3);
+        .unwrap_or(10);
     let pkt_size = matches
         .get_one::<String>("packet_size")
         .unwrap()
@@ -741,10 +1008,16 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<u8>()
         .unwrap_or(0);
-    if verbose > 0 {
+    if quiet {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Warn)
+            .format_timestamp_secs()
+            .init();
+    } else if verbose > 0 {
         let log_level = match verbose {
-            1 => log::LevelFilter::Info,
-            2 => log::LevelFilter::Debug,
+            1 => log::LevelFilter::Warn,
+            2 => log::LevelFilter::Info,
+            3 => log::LevelFilter::Debug,
             _ => log::LevelFilter::Trace,
         };
         env_logger::Builder::new()
@@ -753,11 +1026,10 @@ fn main() -> Result<()> {
             .init();
     } else {
         env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Info)
+            .filter_level(log::LevelFilter::Error)
             .format_timestamp_secs()
             .init();
     }
-
     log::info!("HLStoUDP: Logging initialized. Starting main()...");
 
     println!("Starting udp-to-hls:");
@@ -818,13 +1090,13 @@ fn main() -> Result<()> {
             break;
         }
         if let Ok(_) = rx_shutdown.try_recv() {
-            log::info!("Main: Shutdown signal received, breaking loop.");
+            log::warn!("HLStoUDP: Shutdown signal received, breaking loop.");
             shutdown_flag.store(true, Ordering::SeqCst);
             break;
         }
     }
 
-    log::info!("Main: Waiting for downloader thread to exit...");
+    println!("Main: Waiting for downloader thread to exit...");
     dl_handle.join().unwrap();
 
     // FIXME: This is causing a deadlock, need to figure out why

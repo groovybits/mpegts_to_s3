@@ -39,23 +39,23 @@ use env_logger;
 
 fn get_segment_duration_ms() -> f64 {
     std::env::var("SEGMENT_DURATION_MS")
-        .unwrap_or_else(|_| "1000.0".to_string())
+        .unwrap_or_else(|_| "2000.0".to_string())
         .parse()
-        .unwrap_or(1000.0)
+        .unwrap_or(2000.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
     std::env::var("MAX_SEGMENT_SIZE_BYTES")
-        .unwrap_or_else(|_| "25000000".to_string())
+        .unwrap_or_else(|_| "5242756".to_string())
         .parse()
-        .unwrap_or(5_000_000)
+        .unwrap_or(5242756)
 }
 
 fn get_file_max_age_seconds() -> u64 {
     std::env::var("FILE_MAX_AGE_SECONDS")
-        .unwrap_or_else(|_| "5".to_string())
+        .unwrap_or_else(|_| "30".to_string())
         .parse()
-        .unwrap_or(5)
+        .unwrap_or(30)
 }
 
 fn get_url_signing_seconds() -> u64 {
@@ -332,9 +332,9 @@ impl HourlyIndexCreator {
         content_type: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log::info!(
-             "UDPtoHLS: [upload_local_file_to_s3()] Uploading hourly index -> s3://{}/{} (content_type={})",
-             self.bucket, object_key, content_type
-         );
+              "UDPtoHLS: [upload_local_file_to_s3()] Uploading hourly index -> s3://{}/{} (content_type={})",
+              self.bucket, object_key, content_type
+          );
         let body_bytes = ByteStream::from_path(local_path).await?;
         self.s3_client
             .put_object()
@@ -381,7 +381,7 @@ pub fn join_multicast_on_iface(
     sock.join_multicast_v4(&group_v4, &local_iface_ip)?;
 
     println!(
-        "Joined multicast group {} on interface {}, local IP: {}, port {}",
+        "UDPtoHLS: Joined multicast group {} on interface {}, local IP: {}, port {}",
         multicast_addr, interface_name, local_iface_ip, port
     );
     Ok(sock)
@@ -545,7 +545,7 @@ impl ManualSegmenter {
             m3u8_initialized: false,
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
-            diskless_mode: false,
+            diskless_mode: true,
             diskless_buffer: Arc::new(Mutex::new(DisklessBuffer::new(0))),
             segment_open_time: None,
             bytes_this_segment: 0,
@@ -585,7 +585,9 @@ impl ManualSegmenter {
 
     fn with_diskless_mode(mut self, diskless: bool, ring_size: usize) -> Self {
         self.diskless_mode = diskless;
-        self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
+        if diskless {
+            self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
+        }
         self
     }
 
@@ -600,11 +602,17 @@ impl ManualSegmenter {
     }
 
     async fn write_ts(&mut self, timestamp: u64, data: &[u8]) -> std::io::Result<()> {
-        let ts_instant = SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp);
-        let instant = Instant::now() - SystemTime::now().duration_since(ts_instant).unwrap();
+        //let ts_instant = SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp);
+        //let instant = Instant::now() - SystemTime::now().duration_since(ts_instant).unwrap();
+
+        log::debug!(
+            "Writing TS packet, len={}, timestamp={}",
+            data.len(),
+            timestamp
+        );
 
         if self.segment_open_time.is_none() {
-            self.segment_open_time = Some(instant);
+            self.segment_open_time = Some(Instant::now());
         }
 
         if !self.diskless_mode {
@@ -653,12 +661,12 @@ impl ManualSegmenter {
 
         if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
             info!(
-                  "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
-                  elapsed_wall,
-                  desired_secs,
-                  enough_bytes_based_on_bitrate,
-                  fallback_time_expired
-              );
+                   "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
+                   elapsed_wall,
+                   desired_secs,
+                   enough_bytes_based_on_bitrate,
+                   fallback_time_expired
+               );
             self.close_current_segment_file().await?;
             if !self.diskless_mode {
                 self.open_new_segment_file()?;
@@ -754,7 +762,7 @@ impl ManualSegmenter {
                                     final_path = url_str;
                                 }
                                 Err(e) => {
-                                    warn!(
+                                    error!(
                                         "[DISKLESS] presign failed: {:?}, fallback to mem:// path",
                                         e
                                     );
@@ -763,7 +771,7 @@ impl ManualSegmenter {
                         }
                     }
                     Err(e) => {
-                        warn!(
+                        error!(
                             "[DISKLESS] S3 upload of object_key='{}' failed: {:?}",
                             object_key, e
                         );
@@ -845,12 +853,12 @@ impl ManualSegmenter {
                         );
                     }
                     Err(e) => {
-                        eprintln!("Failed to upload index M3U8 {}: {:?}", s3_key, e);
+                        log::error!("Failed to upload index M3U8 {}: {:?}", s3_key, e);
                     }
                 }
             } else {
-                error!(
-                    "Not uploading index M3U8: local file does not exist at {:?}",
+                log::error!(
+                    "UDPtoHLS: Not uploading index M3U8: local file does not exist at {:?}",
                     local_m3u8
                 );
             }
@@ -877,7 +885,7 @@ impl ManualSegmenter {
             if let (Some(ref endpoint), Some(ref buck)) = (&self.s3_endpoint, &self.s3_bucket) {
                 Ok(format!("{}/{}/{}", endpoint, buck, object_key))
             } else {
-                Err("missing endpoint or bucket for generate_s3_url".into())
+                Err("UDPtoHLS: missing endpoint or bucket for generate_s3_url".into())
             }
         } else {
             if let (Some(ref client), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
@@ -891,7 +899,7 @@ impl ManualSegmenter {
                     .await?;
                 Ok(presigned_req.uri().to_string())
             } else {
-                Err("No s3_client or s3_bucket for presigned url".into())
+                Err("UDPtoHLS: No s3_client or s3_bucket for presigned url".into())
             }
         }
     }
@@ -1008,11 +1016,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ctrlc::set_handler({
         let shutdown_flag = Arc::clone(&shutdown_flag);
         move || {
-            eprintln!("Got CTRL+C, shutting down gracefully...");
+            log::error!("UDPtoHLS: Got CTRL+C, shutting down gracefully...");
             shutdown_flag.store(true, Ordering::SeqCst);
             ctrl_counter += 1;
             if ctrl_counter >= 3 {
-                eprintln!("Got CTRL+C 3 times, forcing exit.");
+                log::error!("UDPtoHLS: Got CTRL+C 3 times, forcing exit.");
                 std::process::exit(1);
             }
         }
@@ -1096,9 +1104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("diskless_mode")
-                .long("diskless_mode")
-                .help("Keep TS segments in memory instead of writing them to disk.")
+            Arg::new("capture_to_disk")
+                .long("capture_to_disk")
+                .help("Capture UDP packets to disk as local segments for debugging.")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -1114,6 +1122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .default_value("0"),
         )
         .arg(
+            Arg::new("quiet")
+                .short('q')
+                .long("quiet")
+                .help("Suppress all non error output")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("pcap_stats_interval")
                 .long("pcap_stats_interval")
                 .default_value("30")
@@ -1121,10 +1136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .get_matches();
 
-    debug!("Command-line arguments parsed: {:?}", matches);
+    debug!("UDPtoHLS: Command-line arguments parsed: {:?}", matches);
 
-    println!("MpegTStoS3 version: {}", get_version());
+    println!("UDPtoHLS: version: {}", get_version());
 
+    let quiet = matches.get_flag("quiet");
     let pcap_stats_interval: u64 = matches
         .get_one::<String>("pcap_stats_interval")
         .unwrap()
@@ -1140,16 +1156,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
-    let diskless_mode = matches.get_flag("diskless_mode");
+    let capture_to_disk = matches.get_flag("capture_to_disk");
     let verbose = matches
         .get_one::<String>("verbose")
         .unwrap()
         .parse()
         .unwrap_or(0);
-    if verbose > 0 {
+    if quiet {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Warn)
+            .format_timestamp_secs()
+            .init();
+    } else if verbose > 0 {
         let log_level = match verbose {
-            1 => log::LevelFilter::Info,
-            2 => log::LevelFilter::Debug,
+            1 => log::LevelFilter::Warn,
+            2 => log::LevelFilter::Info,
+            3 => log::LevelFilter::Debug,
             _ => log::LevelFilter::Trace,
         };
         env_logger::Builder::new()
@@ -1158,11 +1180,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .init();
     } else {
         env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Info)
+            .filter_level(log::LevelFilter::Error)
             .format_timestamp_secs()
             .init();
     }
-    log::info!("MpegTStoS3: Logging initialized. Starting main()...");
+    println!("UDPtoHLS: : Logging initialized. Starting main()...");
 
     let hls_keep_segments: usize = matches
         .get_one::<String>("hls_keep_segments")
@@ -1176,29 +1198,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse()
         .unwrap_or(1);
 
-    info!(
-        "MpegTS to S3: endpoint={}, region={}, bucket={}, udp_ip={}, udp_port={}, \
-          interface={}, timeout={}, output_dir={}, remove_local={} \
-          hls_keep_segments={}, generate_unsigned_urls={}, \
-          diskless_mode={}, diskless_ring_size={}",
-        endpoint,
-        region_name,
-        bucket,
-        filter_ip,
-        filter_port,
-        interface,
-        timeout,
-        output_dir,
-        remove_local,
-        hls_keep_segments,
-        generate_unsigned_urls,
-        diskless_mode,
-        diskless_ring_size
-    );
-
     fs::create_dir_all(output_dir)?;
 
-    info!("Initializing S3 client with endpoint: {}", endpoint);
+    println!(
+        "UDPtoHLS: Initializing S3 client with endpoint: {}",
+        endpoint
+    );
     let creds = Credentials::new(get_s3_username(), get_s3_password(), None, None, "dummy");
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -1223,13 +1228,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     let hourly_index_creator = Arc::new(Mutex::new(hourly_index_creator));
 
-    info!("Starting directory watcher on: {}", output_dir);
+    println!("UDPtoHLS: Starting directory watcher on: {}", output_dir);
     let (watch_tx, watch_rx) = std_mpsc::channel();
     let watch_dir = output_dir.to_string();
     let shutdown_flag_wt_clone = Arc::clone(&shutdown_flag);
     let watch_thread = thread::spawn(move || {
         if let Err(e) = watch_directory(&watch_dir, watch_tx, shutdown_flag_wt_clone) {
-            eprintln!("Directory watcher error: {:?}", e);
+            log::error!("UDPtoHLS: Directory watcher error: {:?}", e);
         }
     });
 
@@ -1253,27 +1258,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await
         {
-            error!("File event handler error: {}", e);
+            log::error!("UDPtoHLS: File event handler error: {}", e);
         }
     });
 
-    debug!(
-        "Attempting to join multicast {}:{} on interface={}",
+    println!(
+        "UDPtoHLS: Attempting to join multicast {}:{} on interface={}",
         filter_ip, filter_port, interface
     );
     let _sock = match join_multicast_on_iface(filter_ip, filter_port, interface) {
         Ok(s) => {
-            debug!("Successfully joined multicast group");
+            println!(
+                 "UDPtoHLS: Successfully joined multicast group on interface={} filter_ip={} filter_port={}",
+                 interface, filter_ip, filter_port
+             );
             s
         }
         Err(e) => {
-            eprintln!("Failed to join multicast group or find interface IP: {}", e);
+            eprintln!(
+                "UDPtoHLS: Failed to join multicast group or find interface IP: {}",
+                e
+            );
             return Ok(());
         }
     };
 
-    debug!(
-        "Opening PCAP on interface={} with snaplen={}, buffer={}b, timeout={}",
+    println!(
+        "UDPtoHLS: Opening PCAP on interface={} with snaplen={}, buffer={}b, timeout={}",
         get_snaplen(),
         get_buffer_size(),
         interface,
@@ -1293,11 +1304,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     let filter_expr = format!("udp and host {} and port {}", filter_ip, filter_port);
-    debug!("Setting pcap filter to '{}'", filter_expr);
+    println!("UDPtoHLS: Setting pcap filter to '{}'", filter_expr);
     cap.filter(&filter_expr, true)?;
 
     println!(
-        "Capturing on '{}', listening for {}:{}, writing HLS to '{}'",
+        "UDPtoHLS: Capturing on '{}', listening for {}:{}, writing HLS to '{}'",
         interface, filter_ip, filter_port, output_dir
     );
 
@@ -1305,7 +1316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut manual_segmenter = Some(
         ManualSegmenter::new(output_dir)
             .with_max_segments(hls_keep_segments)
-            .with_diskless_mode(diskless_mode, diskless_ring_size)
+            .with_diskless_mode(!capture_to_disk, diskless_ring_size)
             .with_s3(
                 Some(s3_client.clone()),
                 Some(bucket.clone()),
@@ -1317,7 +1328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Diskless consumer thread (if needed)
-    let diskless_consumer = if diskless_mode {
+    let diskless_consumer = if !capture_to_disk {
         if let Some(_seg_ref) = &manual_segmenter {
             let buffer_ref = _seg_ref.diskless_buffer.clone();
             let shutdown_flag_clone = Arc::clone(&shutdown_flag);
@@ -1329,7 +1340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mut buf = futures::executor::block_on(buffer_ref.lock());
                     if let Some(front) = buf.queue.pop_front() {
                         debug!(
-                            "Diskless consumer got a segment of len {}, dur={}",
+                            "UDPtoHLS: Diskless consumer got a segment of len {}, dur={}",
                             front.data.len(),
                             front.duration
                         );
@@ -1345,9 +1356,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    let mut pid_tracker = PidTracker::new();
-    let mut leftover_ts = Vec::new();
-
     let (pcap_tx, pcap_rx) = std_mpsc::sync_channel::<(Vec<u8>, u64)>(100000);
 
     let capture_shutdown = Arc::clone(&shutdown_flag);
@@ -1357,81 +1365,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Create a mini–runtime for the capture thread
         let rt = tokio::runtime::Runtime::new().expect("Failed to create capture runtime");
         rt.block_on(async move {
-             let mut stream = cap.stream(BoxCodec).unwrap();
-             let mut stats_timer = Instant::now();
-             let mut stats_last_recv = 0;
-             let mut stats_last_drop = 0;
-             while !capture_shutdown.load(Ordering::SeqCst) {
-                 match stream.next().await {
-                     Some(Ok((data, timestamp))) => {
-                         let packet_data = Vec::from(&*data);
-                         let timestamp_ms = timestamp
-                             .duration_since(UNIX_EPOCH)
-                             .map(|d| d.as_millis() as u64)
-                             .unwrap_or_else(|_| {
-                                 SystemTime::now()
-                                     .duration_since(UNIX_EPOCH)
-                                     .unwrap()
-                                     .as_millis() as u64
-                             });
-                         if stats_timer.elapsed() >= Duration::from_secs(pcap_stats_interval) {
-                             if let Ok(stats) = stream.capture_mut().stats() {
-                                 let dropped = stats.dropped - stats_last_drop;
-                                 let received = stats.received - stats_last_recv;
-                                 if dropped > 0 || stats.if_dropped > 0 {
-                                     log::warn!(
-                                         "PCAP drops detected - Received: {}, Dropped: {}, Interface Dropped: {}",
-                                         received, dropped, stats.if_dropped
-                                     );
-                                 }
-                                 stats_last_recv = stats.received;
-                                 stats_last_drop = stats.dropped;
-                             }
-                             stats_timer = Instant::now();
-                         }
-                         if let Err(e) = pcap_tx.send((packet_data, timestamp_ms)) {
-                             log::error!("Failed to send packet to channel: {:?}", e);
-                             break;
-                         }
-                     }
-                     None => {
-                         tokio::time::sleep(Duration::from_millis(1)).await;
-                     }
-                     Some(Err(e)) => {
-                         if e == pcap::Error::TimeoutExpired {
-                             tokio::time::sleep(Duration::from_millis(1)).await;
-                             continue;
-                         }
-                         log::error!("Pcap error: {:?}", e);
-                         break;
-                     }
-                 }
-             }
-             if let Ok(stats) = stream.capture_mut().stats() {
-                 log::info!(
-                     "Final PCAP stats - Received: {}, Dropped: {}, Interface Dropped: {}",
-                     stats.received,
-                     stats.dropped,
-                     stats.if_dropped
-                 );
-             }
-         });
+              let mut stream = cap.stream(BoxCodec).unwrap();
+              let mut stats_timer = Instant::now();
+              let mut stats_last_recv = 0;
+              let mut stats_last_drop = 0;
+              while !capture_shutdown.load(Ordering::SeqCst) {
+                  match stream.next().await {
+                      Some(Ok((data, timestamp))) => {
+                          let packet_data = Vec::from(&*data);
+                          let timestamp_ms = timestamp
+                              .duration_since(UNIX_EPOCH)
+                              .map(|d| d.as_millis() as u64)
+                              .unwrap_or_else(|_| {
+                                  SystemTime::now()
+                                      .duration_since(UNIX_EPOCH)
+                                      .unwrap()
+                                      .as_millis() as u64
+                              });
+                          if stats_timer.elapsed() >= Duration::from_secs(pcap_stats_interval) {
+                              if let Ok(stats) = stream.capture_mut().stats() {
+                                  let dropped = stats.dropped - stats_last_drop;
+                                  let received = stats.received - stats_last_recv;
+                                  if dropped > 0 || stats.if_dropped > 0 {
+                                      log::error!(
+                                          "UDPtoHLS: PCAP drops detected - Received: {}, Dropped: {}, Interface Dropped: {}",
+                                          received, dropped, stats.if_dropped
+                                      );
+                                  }
+                                  stats_last_recv = stats.received;
+                                  stats_last_drop = stats.dropped;
+                              }
+                              stats_timer = Instant::now();
+                          }
+                          if let Err(e) = pcap_tx.send((packet_data, timestamp_ms)) {
+                              log::error!("UDPtoHLS: Pcap Failed to send packet to channel: {:?}", e);
+                              break;
+                          }
+                      }
+                      None => {
+                          tokio::time::sleep(Duration::from_millis(1)).await;
+                      }
+                      Some(Err(e)) => {
+                          if e == pcap::Error::TimeoutExpired {
+                              tokio::time::sleep(Duration::from_millis(1)).await;
+                              continue;
+                          }
+                          log::error!("UDPtoHLS: Pcap error: {:?}", e);
+                          break;
+                      }
+                  }
+              }
+              if let Ok(stats) = stream.capture_mut().stats() {
+                  log::info!(
+                      "UDPtoHLS: Final PCAP stats - Received: {}, Dropped: {}, Interface Dropped: {}",
+                      stats.received,
+                      stats.dropped,
+                      stats.if_dropped
+                  );
+              }
+          });
     });
+
+    let mut pid_tracker = PidTracker::new();
+    let mut leftover_ts = VecDeque::new();
+    // Use a vector to accumulate TS packets as Arc slices to avoid unnecessary copies.
+    let mut batch_buffer_arcs: Vec<Arc<[u8]>> = Vec::new();
 
     debug!("Starting main processing loop now...");
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
-            log::info!("Shutdown flag set, exiting main loop");
+            println!("UDPtoHLS: Shutdown flag set, exiting main loop");
             break;
         }
 
         let (packet_data, timestamp) = match pcap_rx.recv() {
             Ok((data, ts)) => (data, ts),
             Err(e) => {
-                log::error!("Channel receive error: {:?}", e);
+                log::error!("UDPtoHLS: Channel receive error: {:?}", e);
                 if let Some(seg) = manual_segmenter.as_mut() {
                     if let Err(e) = seg.close_current_segment_file().await {
-                        eprintln!("Error closing segment: {:?}", e);
+                        log::error!("UDPtoHLS: Error closing segment: {:?}", e);
                     }
                 }
                 break;
@@ -1439,26 +1452,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_data) = extract_mpegts_payload(&packet_data, filter_ip, filter_port) {
-            leftover_ts.extend_from_slice(ts_data);
+            leftover_ts.extend(ts_data.iter().copied());
 
             while leftover_ts.len() >= TS_PACKET_SIZE {
-                if leftover_ts[0] != 0x47 {
-                    log::warn!("UDPtoHLS: (ExtractMpegTSpayload) Packet does not start with sync byte 0x47");
-                }
+                let contiguous = leftover_ts.make_contiguous();
 
-                let ts_packet = leftover_ts.drain(..TS_PACKET_SIZE).collect::<Vec<u8>>();
-
-                if let Err(e) =
-                    pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &ts_packet)
-                {
-                    log::error!("UDPtoHLS: (ExtractMpegTSpayload) Continuity error: {:?}", e);
-                }
-
-                if let Some(seg) = manual_segmenter.as_mut() {
-                    if let Err(e) = seg.write_ts(timestamp, &ts_packet).await {
-                        log::error!("Segment write error: {:?}", e);
+                // Ensure the packet starts with sync byte 0x47
+                if contiguous[0] != 0x47 {
+                    if let Some(pos) = contiguous.iter().position(|&x| x == 0x47) {
+                        // Discard bytes until the next sync byte
+                        log::warn!("UDPtoHLS: Invalid TS packet detected, discarding {} bytes of {} bytes total", pos, contiguous.len());
+                        for _ in 0..pos {
+                            leftover_ts.pop_front();
+                        }
+                    } else {
+                        // No sync byte found, clear the buffer
+                        log::error!(
+                            "UDPtoHLS: Invalid TS packet detected, discarding all {} bytes",
+                            contiguous.len()
+                        );
+                        leftover_ts.clear();
                         break;
                     }
+                    continue;
+                }
+
+                if contiguous.len() < TS_PACKET_SIZE {
+                    log::warn!("UDPtoHLS: Incomplete TS packet detected of {} bytes, waiting for more data", contiguous.len());
+                    break;
+                }
+
+                // Create an Arc for the 188-byte TS packet without extra copying
+                let packet_arc: Arc<[u8]> = Arc::from(&contiguous[..TS_PACKET_SIZE]);
+
+                // Process the packet (PID tracking)
+                match pid_tracker
+                    .process_packet("ExtractMpegTSpayload".to_string(), packet_arc.as_ref())
+                {
+                    Ok(()) => {}
+                    Err(0xFFFF) => {
+                        log::warn!("UDPtoHLS: Invalid TS packet detected (pid=0xFFFF), discarding and searching for next sync byte");
+                        leftover_ts.pop_front();
+                        continue;
+                    }
+                    Err(e) => {
+                        log::error!("UDPtoHLS: Continuity error: {:?}", e);
+                    }
+                }
+
+                // Accumulate valid packet into the batch buffer
+                batch_buffer_arcs.push(packet_arc);
+
+                // Remove the processed packet from the leftover buffer
+                for _ in 0..TS_PACKET_SIZE {
+                    leftover_ts.pop_front();
+                }
+
+                // Write in batches of 7 packets
+                if batch_buffer_arcs.len() >= 7 {
+                    let mut concatenated =
+                        Vec::with_capacity(batch_buffer_arcs.len() * TS_PACKET_SIZE);
+                    for arc in &batch_buffer_arcs {
+                        concatenated.extend_from_slice(arc.as_ref());
+                    }
+                    if let Some(seg) = manual_segmenter.as_mut() {
+                        if let Err(e) = seg.write_ts(timestamp, &concatenated).await {
+                            log::error!("UDPtoHLS: Segment write error: {:?}", e);
+                            break;
+                        }
+                    }
+                    batch_buffer_arcs.clear();
                 }
             }
         }
@@ -1466,38 +1529,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     shutdown_flag.store(true, Ordering::SeqCst);
 
-    log::info!("Waiting for capture thread to exit...");
+    log::info!("UDPtoHLS: Waiting for capture thread to exit...");
     if let Err(e) = capture_thread.join() {
-        log::error!("Capture thread join error: {:?}", e);
+        log::error!("UDPtoHLS: Capture thread join error: {:?}", e);
     }
 
     if let Some(mut seg) = manual_segmenter.take() {
-        log::info!("Closing final segment...");
+        log::info!("UDPtoHLS: Closing final segment...");
         if let Err(e) = seg.finalize().await {
-            eprintln!("Error closing final segment: {:?}", e);
+            eprintln!("UDPtoHLS: Error closing final segment: {:?}", e);
         }
         drop(seg);
     }
 
     if let Some(handle) = diskless_consumer {
-        log::info!("Waiting for diskless consumer thread to exit...");
+        log::info!("UDPtoHLS: Waiting for diskless consumer thread to exit...");
         if let Err(e) = handle.join() {
-            log::error!("Diskless consumer thread join error: {:?}", e);
+            log::error!("UDPtoHLS: Diskless consumer thread join error: {:?}", e);
         }
     }
 
-    log::info!("Waiting for upload task to exit...");
+    log::info!("UDPtoHLS: Waiting for upload task to exit...");
     match upload_task.await {
-        Ok(_) => log::info!("Upload task exited cleanly."),
-        Err(e) => log::error!("Upload task panicked: {:?}", e),
+        Ok(_) => log::info!("UDPtoHLS: Upload task exited cleanly."),
+        Err(e) => log::error!("UDPtoHLS: Upload task panicked: {:?}", e),
     }
 
-    log::info!("Waiting for watch thread to exit...");
+    log::info!("UDPtoHLS: Waiting for watch thread to exit...");
     if let Err(e) = watch_thread.join() {
-        log::error!("Watch thread join error: {:?}", e);
+        log::error!("UDPtoHLS: Watch thread join error: {:?}", e);
     }
 
-    log::info!("All threads/tasks exited. Shutting down.");
+    log::info!("UDPtoHLS: All threads/tasks exited. Shutting down.");
     Ok(())
 }
 
@@ -1525,7 +1588,7 @@ fn watch_directory(
                     break;
                 }
             }
-            Ok(Err(e)) => eprintln!("Notify error: {:?}", e),
+            Ok(Err(e)) => log::error!("Notify error: {:?}", e),
             Err(_) => break,
         }
     }
@@ -1591,7 +1654,10 @@ async fn handle_file_events(
                                 }
 
                                 if stable_count < 3 {
-                                    error!("File {} did not stabilize, skipping", full_path_str);
+                                    error!(
+                                        "UDPtoHLS: File {} did not stabilize, skipping",
+                                        full_path_str
+                                    );
                                     continue;
                                 }
                             }
@@ -1600,7 +1666,7 @@ async fn handle_file_events(
                                 Ok(rp) => rp,
                                 Err(e) => {
                                     warn!(
-                                        "Skipping {}: strip_base_dir() error: {}",
+                                        "UDPtoHLS: Skipping {}: strip_base_dir() error: {}",
                                         full_path_str, e
                                     );
                                     continue;
@@ -1681,7 +1747,7 @@ async fn upload_file_to_s3(
     };
 
     let file_size = fs::metadata(path)?.len();
-    println!(
+    log::info!(
         "Uploading {} ({} bytes) -> s3://{}/{} as {}",
         path.display(),
         file_size,
@@ -1696,7 +1762,7 @@ async fn upload_file_to_s3(
         let file_contents = fs::read(path)?;
         let read_size = file_contents.len();
 
-        println!(
+        log::debug!(
             "File checks for {}\n  Metadata size: {}\n  Actual read size: {}",
             path.display(),
             metadata_size,
@@ -1705,7 +1771,7 @@ async fn upload_file_to_s3(
 
         let body_stream = ByteStream::from(file_contents);
 
-        println!(
+        log::info!(
             "Uploading {} (metadata: {} bytes, read: {} bytes) -> s3://{}/{}",
             path.display(),
             metadata_size,
@@ -1724,15 +1790,23 @@ async fn upload_file_to_s3(
             .await
         {
             Ok(_) => {
-                println!("Uploaded {} ({} bytes)", key_str, file_size);
+                log::info!("UDPtoHLS: Uploaded {} ({} bytes)", key_str, file_size);
                 if remove_local {
                     if let Err(e) = fs::remove_file(path) {
-                        eprintln!("Failed removing local file {}: {:?}", path.display(), e);
+                        log::error!(
+                            "UDPtoHLS: Failed removing local file {}: {:?}",
+                            path.display(),
+                            e
+                        );
                     }
                     let dur_sidecar = path.with_extension("dur");
                     if dur_sidecar.exists() {
                         if let Err(e) = fs::remove_file(&dur_sidecar) {
-                            eprintln!("Failed removing local sidecar {:?}: {:?}", dur_sidecar, e);
+                            log::error!(
+                                "UDPtoHLS: Failed removing local sidecar {:?}: {:?}",
+                                dur_sidecar,
+                                e
+                            );
                         }
                     }
                 }
@@ -1743,9 +1817,10 @@ async fn upload_file_to_s3(
                 if retries == 0 {
                     return Err(Box::new(e));
                 }
-                eprintln!(
-                    "Upload failed, retrying ({} attempts left): {:?}",
-                    retries, e
+                log::error!(
+                    "UDPtoHLS: Upload failed, retrying ({} attempts left): {:?}",
+                    retries,
+                    e
                 );
                 sleep(Duration::from_secs(1)).await;
             }
@@ -1831,7 +1906,7 @@ fn extract_mpegts_payload<'a>(
         return Some(payload);
     } else {
         warn!(
-            "Unknown payload type (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
+            "UDPtoHLS: Unknown payload type (expected TS or RTP-TS). First byte=0x{:02x}, size={}",
             payload[0],
             payload.len()
         );
