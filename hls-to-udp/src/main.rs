@@ -1008,7 +1008,7 @@ fn main() -> Result<()> {
             Arg::new("min_packet_size")
                 .short('m')
                 .long("min-packet-size")
-                .default_value("188")
+                .default_value("1316")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1029,7 +1029,7 @@ fn main() -> Result<()> {
             Arg::new("udp_send_buffer")
                 .short('b')
                 .long("udp-send-buffer")
-                .default_value("2097140")
+                .default_value("0")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1112,7 +1112,7 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_send_buffer")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(1358);
+        .unwrap_or(0);
     let segment_queue_size = matches
         .get_one::<String>("segment_queue_size")
         .unwrap()
@@ -1127,7 +1127,7 @@ fn main() -> Result<()> {
         .get_one::<String>("min_packet_size")
         .unwrap()
         .parse::<i32>()
-        .unwrap_or(188);
+        .unwrap_or(1316);
     let smoother_buffers = matches
         .get_one::<String>("smoother_buffers")
         .unwrap()
