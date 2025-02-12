@@ -120,10 +120,91 @@ fn receiver_thread(
             let parsed = parse_playlist_res(playlist_text.as_bytes());
             let media_pl = match parsed {
                 Ok(Playlist::MediaPlaylist(mp)) => mp,
-                Ok(_) => {
-                    log::error!("HLStoUDP: ReceiverThread Got Master/unknown playlist...");
-                    thread::sleep(Duration::from_millis(poll_interval_ms));
-                    continue;
+                Ok(Playlist::MasterPlaylist(mp)) => {
+                    log::info!("HLStoUDP: ReceiverThread Got Master playlist, parsing...");
+
+                    /* get the variant that has the largest bandwidth */
+                    let mut variant = None;
+                    let mut best_bandwidth = 0;
+                    for v in &mp.variants {
+                        if v.bandwidth > best_bandwidth {
+                            best_bandwidth = v.bandwidth;
+                            variant = Some(v);
+                        }
+                    }
+                    if variant.is_none() {
+                        log::error!("HLStoUDP: ReceiverThread No valid variant found.");
+                        thread::sleep(Duration::from_millis(poll_interval_ms));
+                        continue;
+                    }
+                    let best_playlist = if let Some(variant) = variant {
+                        let mut variant_uri = variant.uri.clone();
+                        /* check if we have a relative url or not via http: prefix, adjust variant_uri if needed, getting the original m3u8_url's base */
+                        if variant_uri.starts_with("http:") || variant_uri.starts_with("https:") {
+                            // do nothing
+                        } else {
+                            let mut base_uri = base_url.clone();
+                            /* get path dirname without end file */
+                            let path_parts: Vec<&str> = base_uri.path_segments().unwrap().collect();
+                            let path_dirname = path_parts.join("/");
+                            base_uri.set_path(path_dirname.as_str());
+                            base_uri.set_query(None);
+                            base_uri.set_fragment(None);
+                            variant_uri = base_uri.join(&variant_uri).unwrap().to_string();
+                        };
+                        let variant_playlist_text = match client.get(&variant_uri).send() {
+                            Ok(r) => {
+                                if !r.status().is_success() {
+                                    log::error!(
+                                        "HLStoUDP: ReceiverThread Variant playlist {} fetch HTTP error: {}",
+                                        variant_uri,
+                                        r.status()
+                                    );
+                                    continue;
+                                }
+                                match r.text() {
+                                    Ok(txt) => txt,
+                                    Err(e) => {
+                                        log::error!(
+                                            "HLStoUDP: ReceiverThread Variant playlist {} read error: {}",
+                                            variant_uri,
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "HLStoUDP: ReceiverThread Variant playlist {} request error: {}",
+                                    variant_uri,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        let pl = parse_playlist_res(variant_playlist_text.as_bytes());
+                        let variant_media_pl = match pl {
+                            Ok(Playlist::MediaPlaylist(mp)) => mp,
+                            Ok(Playlist::MasterPlaylist(_)) => {
+                                log::error!("HLStoUDP: ReceiverThread Got nested Master playlist, ignoring...");
+                                continue;
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "HLStoUDP: ReceiverThread Parse error in variant playlist: {:?}, ignoring...",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        variant_media_pl
+                    } else {
+                        log::error!("HLStoUDP: ReceiverThread No valid sub-playlist found.");
+                        thread::sleep(Duration::from_millis(poll_interval_ms));
+                        continue;
+                    };
+                    best_playlist
                 }
                 Err(e) => {
                     log::error!("HLStoUDP: ReceiverThread Parse error: {:?}, ignoring...", e);
@@ -131,6 +212,12 @@ fn receiver_thread(
                     continue;
                 }
             };
+
+            if media_pl.segments.is_empty() {
+                log::warn!("HLStoUDP: ReceiverThread No segments found in playlist.");
+                thread::sleep(Duration::from_millis(poll_interval_ms));
+                continue;
+            }
 
             if first_poll {
                 for seg in &media_pl.segments {
@@ -151,7 +238,33 @@ fn receiver_thread(
                 // http://127.0.0.1:9000/hls/channel01/2025/02/05/06/segment_20250205-060936__8511.ts
                 // bucket, channel, year, month, day, hour, segment_YYYYMMDD-HHMMSS__INDEX.ts
 
-                let uri = &seg.uri;
+                let mut seg_uri = seg.uri.clone();
+                if seg_uri.starts_with("http:") || seg_uri.starts_with("https:") {
+                    // do nothing
+                } else {
+                    let mut base_uri = base_url.clone();
+                    /* get path dirname without end file */
+                    let path_parts: Vec<&str> = base_uri.path_segments().unwrap().collect();
+                    let path_dirname = path_parts.join("/");
+                    base_uri.set_path(path_dirname.as_str());
+                    base_uri.set_query(None);
+                    base_uri.set_fragment(None);
+                    seg_uri = base_uri.join(&seg_uri).unwrap().to_string();
+                };
+                let uri = &seg_uri;
+
+                /* confirm a valid uri */
+                if uri.is_empty() {
+                    log::error!("HLStoUDP: ReceiverThread Empty segment URI, skipping.");
+                    continue;
+                }
+
+                /* check uri is proper format with uri crate */
+                if Url::parse(uri).is_err() {
+                    log::error!("HLStoUDP: ReceiverThread Bad segment URI: {}", uri);
+                    continue;
+                }
+
                 if seg_history.contains(uri) {
                     continue;
                 }
