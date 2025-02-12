@@ -400,6 +400,7 @@ fn sender_thread(
     latency: i32,
     pcr_pid_arg: u16,
     pkt_size: i32,
+    min_pkt_size: i32,
     smoother_buffers: i32,
     smoother_max_bytes: usize,
     udp_queue_size: usize,
@@ -521,16 +522,8 @@ fn sender_thread(
         // Use a VecDeque as a ring buffer to avoid memmove overhead.
         // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
         let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
-        let min_packet_size = if use_smoother {
-            pkt_size as usize
-        } else {
-            TS_PACKET_SIZE
-        };
-        let max_packet_size = if use_smoother {
-            pkt_size as usize
-        } else {
-            pkt_size as usize
-        };
+        let min_packet_size = min_pkt_size as usize;
+        let max_packet_size = pkt_size as usize;
 
         let frame_time_micros = 10; // N micros per 188 byte packet
         let wait_time_micros = 1000; // 1ms wait time when blocking
@@ -1012,6 +1005,13 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("min_packet_size")
+                .short('m')
+                .long("min-packet-size")
+                .default_value("188")
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("segment_queue_size")
                 .short('q')
                 .long("segment-queue-size")
@@ -1123,6 +1123,11 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<i32>()
         .unwrap_or(1316);
+    let min_pkt_size = matches
+        .get_one::<String>("min_packet_size")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(188);
     let smoother_buffers = matches
         .get_one::<String>("smoother_buffers")
         .unwrap()
@@ -1212,6 +1217,7 @@ fn main() -> Result<()> {
         latency,
         pcr_pid,
         pkt_size,
+        min_pkt_size,
         smoother_buffers,
         max_bytes_threshold,
         udp_queue_size,
