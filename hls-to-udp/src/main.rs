@@ -23,6 +23,7 @@ struct DownloadedSegment {
     id: usize,
     data: Vec<u8>,
     duration: f64,
+    uri: String,
 }
 
 struct SegmentHistory {
@@ -249,6 +250,7 @@ fn receiver_thread(
                     id: next_seg_id,
                     data: seg_bytes,
                     duration: seg.duration.into(),
+                    uri: uri.to_string(),
                 };
                 if tx.send(seg_struct).is_err() {
                     // get error information
@@ -543,12 +545,10 @@ fn sender_thread(
                                                 chunk.len(), elapsed_ms, sent_bps
                                             );
                                             //if !use_smoother {
-                                                let sleep_time_micros: u64 =
-                                                    (chunk.len() / TS_PACKET_SIZE) as u64
-                                                        * frame_time_micros;
-                                                thread::sleep(Duration::from_micros(
-                                                    sleep_time_micros,
-                                                ));
+                                            let sleep_time_micros: u64 =
+                                                (chunk.len() / TS_PACKET_SIZE) as u64
+                                                    * frame_time_micros;
+                                            thread::sleep(Duration::from_micros(sleep_time_micros));
                                             //}
                                         } else {
                                             total_bytes_dropped += chunk.len();
@@ -724,31 +724,45 @@ fn sender_thread(
                 }
 
                 // Feed it into your continuity checker
+                let mut index = 0;
                 for packet_chunk in seg.data.chunks(TS_PACKET_SIZE) {
                     if let Err(e) = pid_tracker
                         .process_packet("ReceiveDownloadSegment".to_string(), packet_chunk)
                     {
-                        log::error!(
-                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?}",
-                            e
-                        );
-                    }
-                }
-
-                if !use_smoother {
-                    // Send directly into channel as UDP packets, wrapping data in an Arc.
-                    if let Err(e) = udp_tx.send(Arc::new(seg.data)) {
-                        log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
-                    }
-                } else {
-                    #[cfg(feature = "libltntstools_enabled")]
-                    if let Some(ref mut s) = smoother {
-                        if let Err(e) = s.write(&seg.data) {
-                            log::error!("HLStoUDP: SenderThread Smoother write error: {}", e);
+                        if e == 0xFFFF {
+                            log::error!(
+                                "HLStoUDP: (ReceiveDownloadSegment) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment. URI: {}",
+                                packet_chunk.len(),
+                                index,
+                                seg.data.len() / TS_PACKET_SIZE,
+                                seg.data.len(),
+                                seg.uri
+                            );
+                            continue;
+                        } else {
+                            log::error!(
+                                "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?} in segment {} of {} chunks of {} bytes total. URI: {}",
+                                e, index, seg.data.len() / TS_PACKET_SIZE, seg.data.len(), seg.uri
+                            );
                         }
-                        drop(seg.data);
                     }
+
+                    if !use_smoother {
+                        // Send directly into channel as UDP packets, wrapping data in an Arc.
+                        if let Err(e) = udp_tx.send(Arc::new(packet_chunk.to_vec())) {
+                            log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
+                        }
+                    } else {
+                        #[cfg(feature = "libltntstools_enabled")]
+                        if let Some(ref mut s) = smoother {
+                            if let Err(e) = s.write(&packet_chunk) {
+                                log::error!("HLStoUDP: SenderThread Smoother write error: {}", e);
+                            }
+                        }
+                    }
+                    index += 1;
                 }
+                drop(seg); // drop the segment data
             }
         }
 
