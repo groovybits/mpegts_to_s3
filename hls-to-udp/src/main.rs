@@ -259,15 +259,26 @@ fn receiver_thread(
                     continue;
                 }
 
-                /* check uri is proper format with uri crate */
-                if Url::parse(uri).is_err() {
-                    log::error!("HLStoUDP: ReceiverThread Bad segment URI: {}", uri);
-                    continue;
-                }
-
                 if seg_history.contains(uri) {
                     continue;
                 }
+
+                /* check uri is proper format with uri crate */
+                if Url::parse(uri).is_err() {
+                    log::error!("HLStoUDP: ReceiverThread Bad format for URI: {}", uri);
+                    continue;
+                }
+
+                /* make sure we have a .ts extension on the uri, split off the ?... parts first */
+                let uri_main = uri.split('?').next().unwrap();
+                if !uri_main.ends_with(".ts") {
+                    log::error!(
+                        "HLStoUDP: ReceiverThread Bad segment, not a .ts file URI: {}",
+                        uri
+                    );
+                    continue;
+                }
+
                 seg_history.insert(uri.to_string());
 
                 // If VOD mode is enabled, filter segments based on the start_time and end_time
@@ -389,6 +400,7 @@ fn sender_thread(
     latency: i32,
     pcr_pid_arg: u16,
     pkt_size: i32,
+    min_pkt_size: i32,
     smoother_buffers: i32,
     smoother_max_bytes: usize,
     udp_queue_size: usize,
@@ -505,23 +517,16 @@ fn sender_thread(
 
         // Time-based approach to blocking, define a max wait:
         let max_block_ms = 10000; // ms total wait if OS buffer is full
-        let timeout_interval = Duration::from_millis(10000); // 10 seconds
-
-        let frame_time_micros = 20; // micros per 188 byte packet
+        let timeout_interval = Duration::from_millis(30000); // 30 seconds
 
         // Use a VecDeque as a ring buffer to avoid memmove overhead.
         // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
         let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
-        let min_packet_size = if use_smoother {
-            pkt_size as usize
-        } else {
-            pkt_size as usize
-        };
-        let max_packet_size = if use_smoother {
-            pkt_size as usize
-        } else {
-            pkt_size as usize
-        };
+        let min_packet_size = min_pkt_size as usize;
+        let max_packet_size = pkt_size as usize;
+
+        let frame_time_micros = 10; // N micros per 188 byte packet
+        let wait_time_micros = 1000; // 1ms wait time when blocking
 
         let capture_start_time = Instant::now();
 
@@ -620,6 +625,10 @@ fn sender_thread(
                                     total_bytes_dropped
                                 );
 
+                                // calculate how long we should sleep to maintain a constant rate
+                                let sleep_time_micros: u64 =
+                                    (chunk.len() / TS_PACKET_SIZE) as u64 * frame_time_micros;
+
                                 match sock_clone.send(&chunk) {
                                     Ok(bytes_sent) => {
                                         log::debug!(
@@ -641,11 +650,7 @@ fn sender_thread(
                                         }
                                         total_bytes_sent += chunk.len();
                                         if !use_smoother {
-                                            // Slow down the sending rate.
-                                            let sleep_time: u64 = (chunk.len() / TS_PACKET_SIZE)
-                                                as u64
-                                                * frame_time_micros;
-                                            thread::sleep(Duration::from_micros(sleep_time));
+                                            thread::sleep(Duration::from_micros(sleep_time_micros));
                                         }
                                         break;
                                     }
@@ -670,12 +675,7 @@ fn sender_thread(
                                                 "HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes, elapsed {} ms, rate {} bps.",
                                                 chunk.len(), elapsed_ms, sent_bps
                                             );
-                                            //if !use_smoother {
-                                            let sleep_time_micros: u64 =
-                                                (chunk.len() / TS_PACKET_SIZE) as u64
-                                                    * frame_time_micros;
-                                            thread::sleep(Duration::from_micros(sleep_time_micros));
-                                            //}
+                                            thread::sleep(Duration::from_micros(wait_time_micros));
                                         } else {
                                             total_bytes_dropped += chunk.len();
                                             chunk_dropped = true;
@@ -1005,6 +1005,13 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("min_packet_size")
+                .short('m')
+                .long("min-packet-size")
+                .default_value("1316")
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("segment_queue_size")
                 .short('q')
                 .long("segment-queue-size")
@@ -1022,7 +1029,7 @@ fn main() -> Result<()> {
             Arg::new("udp_send_buffer")
                 .short('b')
                 .long("udp-send-buffer")
-                .default_value("2097140")
+                .default_value("0")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1105,7 +1112,7 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_send_buffer")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(1358);
+        .unwrap_or(0);
     let segment_queue_size = matches
         .get_one::<String>("segment_queue_size")
         .unwrap()
@@ -1113,6 +1120,11 @@ fn main() -> Result<()> {
         .unwrap_or(10);
     let pkt_size = matches
         .get_one::<String>("packet_size")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap_or(1316);
+    let min_pkt_size = matches
+        .get_one::<String>("min_packet_size")
         .unwrap()
         .parse::<i32>()
         .unwrap_or(1316);
@@ -1205,6 +1217,7 @@ fn main() -> Result<()> {
         latency,
         pcr_pid,
         pkt_size,
+        min_pkt_size,
         smoother_buffers,
         max_bytes_threshold,
         udp_queue_size,
