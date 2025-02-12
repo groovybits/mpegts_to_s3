@@ -516,9 +516,7 @@ fn sender_thread(
 
         // Time-based approach to blocking, define a max wait:
         let max_block_ms = 10000; // ms total wait if OS buffer is full
-        let timeout_interval = Duration::from_millis(10000); // 10 seconds
-
-        let frame_time_micros = 20; // micros per 188 byte packet
+        let timeout_interval = Duration::from_millis(30000); // 30 seconds
 
         // Use a VecDeque as a ring buffer to avoid memmove overhead.
         // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
@@ -526,13 +524,16 @@ fn sender_thread(
         let min_packet_size = if use_smoother {
             pkt_size as usize
         } else {
-            pkt_size as usize
+            TS_PACKET_SIZE
         };
         let max_packet_size = if use_smoother {
             pkt_size as usize
         } else {
             pkt_size as usize
         };
+
+        let frame_time_micros = 10; // N micros per 188 byte packet
+        let wait_time_micros = 1000; // 1ms wait time when blocking
 
         let capture_start_time = Instant::now();
 
@@ -631,6 +632,10 @@ fn sender_thread(
                                     total_bytes_dropped
                                 );
 
+                                // calculate how long we should sleep to maintain a constant rate
+                                let sleep_time_micros: u64 =
+                                    (chunk.len() / TS_PACKET_SIZE) as u64 * frame_time_micros;
+
                                 match sock_clone.send(&chunk) {
                                     Ok(bytes_sent) => {
                                         log::debug!(
@@ -652,11 +657,7 @@ fn sender_thread(
                                         }
                                         total_bytes_sent += chunk.len();
                                         if !use_smoother {
-                                            // Slow down the sending rate.
-                                            let sleep_time: u64 = (chunk.len() / TS_PACKET_SIZE)
-                                                as u64
-                                                * frame_time_micros;
-                                            thread::sleep(Duration::from_micros(sleep_time));
+                                            thread::sleep(Duration::from_micros(sleep_time_micros));
                                         }
                                         break;
                                     }
@@ -681,12 +682,7 @@ fn sender_thread(
                                                 "HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes, elapsed {} ms, rate {} bps.",
                                                 chunk.len(), elapsed_ms, sent_bps
                                             );
-                                            //if !use_smoother {
-                                            let sleep_time_micros: u64 =
-                                                (chunk.len() / TS_PACKET_SIZE) as u64
-                                                    * frame_time_micros;
-                                            thread::sleep(Duration::from_micros(sleep_time_micros));
-                                            //}
+                                            thread::sleep(Duration::from_micros(wait_time_micros));
                                         } else {
                                             total_bytes_dropped += chunk.len();
                                             chunk_dropped = true;
