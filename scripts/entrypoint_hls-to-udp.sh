@@ -29,6 +29,8 @@ while [ : ]; do
         -z ${UDP_QUEUE_SIZE} \
         -b ${UDP_SEND_BUFFER} \
         -f "${HLS_TO_UDP_OUTPUT_FILE}" \
+        -m ${MIN_UDP_PACKET_SIZE} \
+        -k ${MAX_UDP_PACKET_SIZE} \
         ${SMOOTHER_ARGS} ${QUIET} \
         ${EXTRA_ARGS} \
             $@

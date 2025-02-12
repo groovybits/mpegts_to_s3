@@ -22,7 +22,7 @@ use pcap::{Capture, PacketCodec};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -505,15 +505,12 @@ struct PlaylistEntry {
 
 struct ManualSegmenter {
     output_dir: String,
-    current_ts_file: Option<BufWriter<fs::File>>,
     segment_index: u64,
     playlist_path: PathBuf,
-    m3u8_initialized: bool,
 
     max_segments_in_index: usize,
     playlist_entries: Vec<PlaylistEntry>,
 
-    diskless_mode: bool,
     diskless_buffer: Arc<Mutex<DisklessBuffer>>,
 
     segment_open_time: Option<Instant>,
@@ -539,13 +536,10 @@ impl ManualSegmenter {
         let playlist_path = Path::new("").join(&playlist_file);
         Self {
             output_dir: output_dir.to_string(),
-            current_ts_file: None,
             segment_index: 0,
             playlist_path,
-            m3u8_initialized: false,
             max_segments_in_index: 0,
             playlist_entries: Vec::new(),
-            diskless_mode: true,
             diskless_buffer: Arc::new(Mutex::new(DisklessBuffer::new(0))),
             segment_open_time: None,
             bytes_this_segment: 0,
@@ -583,11 +577,8 @@ impl ManualSegmenter {
         self
     }
 
-    fn with_diskless_mode(mut self, diskless: bool, ring_size: usize) -> Self {
-        self.diskless_mode = diskless;
-        if diskless {
-            self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
-        }
+    fn with_diskless_ring_size(mut self, ring_size: usize) -> Self {
+        self.diskless_buffer = Arc::new(Mutex::new(DisklessBuffer::new(ring_size)));
         self
     }
 
@@ -615,28 +606,15 @@ impl ManualSegmenter {
             self.segment_open_time = Some(Instant::now());
         }
 
-        if !self.diskless_mode {
-            if self.current_ts_file.is_none() {
-                self.open_new_segment_file()?;
-            }
-            if let Some(file) = self.current_ts_file.as_mut() {
-                file.write_all(data)?;
-                file.flush()?;
-            }
-        } else {
-            self.current_segment_buffer.extend_from_slice(data);
-            if self.diskless_max_bytes > 0
-                && self.current_segment_buffer.len() >= self.diskless_max_bytes
-            {
-                info!(
-                    "[DISKLESS] buffer >= {} bytes, forcing segment close...",
-                    self.diskless_max_bytes
-                );
-                self.close_current_segment_file().await?;
-                if !self.diskless_mode {
-                    self.open_new_segment_file()?;
-                }
-            }
+        self.current_segment_buffer.extend_from_slice(data);
+        if self.diskless_max_bytes > 0
+            && self.current_segment_buffer.len() >= self.diskless_max_bytes
+        {
+            info!(
+                "[DISKLESS] buffer >= {} bytes, forcing segment close...",
+                self.diskless_max_bytes
+            );
+            self.close_current_segment_file().await?;
         }
 
         self.bytes_this_segment += data.len() as u64;
@@ -668,9 +646,6 @@ impl ManualSegmenter {
                    fallback_time_expired
                );
             self.close_current_segment_file().await?;
-            if !self.diskless_mode {
-                self.open_new_segment_file()?;
-            }
         }
 
         Ok(())
@@ -694,134 +669,102 @@ impl ManualSegmenter {
             real_elapsed
         );
 
-        if !self.diskless_mode {
-            if let Some(mut writer) = self.current_ts_file.take() {
-                writer.flush()?;
-                drop(writer);
+        let seg_data_clone = self.current_segment_buffer.clone();
+        self.current_segment_buffer.clear();
+        info!(
+            "[DISKLESS] Finalizing seg#{} in memory, length={}, wall-clock dur={:.3}",
+            self.segment_index + 1,
+            seg_data_clone.len(),
+            real_elapsed
+        );
 
-                let segment_path = self.current_segment_path(self.segment_index + 1);
-                let duration_path = segment_path.with_extension("dur");
-                let full_dur_path = Path::new(&self.output_dir).join(&duration_path);
-                fs::write(full_dur_path, format!("{:.3}", real_elapsed))?;
+        {
+            let mut buf = self.diskless_buffer.lock().await;
+            buf.push_segment(InMemorySegment {
+                data: seg_data_clone.clone(),
+                duration: real_elapsed,
+            });
+        }
 
-                self.playlist_entries.push(PlaylistEntry {
-                    duration: real_elapsed,
-                    path: format!("{}/{}", self.output_dir, segment_path.to_string_lossy()),
-                });
-
-                if self.max_segments_in_index > 0
-                    && self.playlist_entries.len() > self.max_segments_in_index
-                {
-                    let removed = self.playlist_entries.remove(0);
-                    let old_path = Path::new(&removed.path);
-                    if old_path.exists() {
-                        let _ = fs::remove_file(old_path);
-                        let dur_path = old_path.with_extension("dur");
-                        let _ = fs::remove_file(dur_path);
-                    }
-                }
-            }
-        } else {
-            let seg_data_clone = self.current_segment_buffer.clone();
-            self.current_segment_buffer.clear();
+        let mut final_path = format!("mem://segment_{}", self.segment_index + 1);
+        if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
+            let segment_path = self.current_segment_path(self.segment_index + 1);
+            let object_key = format!("{}/{}", self.output_dir, segment_path.to_string_lossy());
             info!(
-                "[DISKLESS] Finalizing seg#{} in memory, length={}, wall-clock dur={:.3}",
-                self.segment_index + 1,
-                seg_data_clone.len(),
-                real_elapsed
+                "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
+                object_key,
+                seg_data_clone.len()
             );
 
-            {
-                let mut buf = self.diskless_buffer.lock().await;
-                buf.push_segment(InMemorySegment {
-                    data: seg_data_clone.clone(),
-                    duration: real_elapsed,
-                });
-            }
-
-            let mut final_path = format!("mem://segment_{}", self.segment_index + 1);
-            if let (Some(ref s3c), Some(ref buck)) = (&self.s3_client, &self.s3_bucket) {
-                let segment_path = self.current_segment_path(self.segment_index + 1);
-                let object_key = format!("{}/{}", self.output_dir, segment_path.to_string_lossy());
-                info!(
-                    "[DISKLESS] Attempt S3 upload of object_key={}, len={}",
-                    object_key,
-                    seg_data_clone.len()
-                );
-
-                match upload_memory_segment_to_s3(s3c, buck, &object_key, &seg_data_clone).await {
-                    Ok(_) => {
-                        debug!("[DISKLESS] S3 upload succeeded. Now build URL...");
-                        if self.generate_unsigned_urls {
-                            if let Some(ref endpoint) = self.s3_endpoint {
-                                final_path = format!("{}/{}/{}", endpoint, buck, object_key);
+            match upload_memory_segment_to_s3(s3c, buck, &object_key, &seg_data_clone).await {
+                Ok(_) => {
+                    debug!("[DISKLESS] S3 upload succeeded. Now build URL...");
+                    if self.generate_unsigned_urls {
+                        if let Some(ref endpoint) = self.s3_endpoint {
+                            final_path = format!("{}/{}/{}", endpoint, buck, object_key);
+                        }
+                    } else {
+                        match self.generate_s3_url(&object_key).await {
+                            Ok(url_str) => {
+                                final_path = url_str;
                             }
-                        } else {
-                            match self.generate_s3_url(&object_key).await {
-                                Ok(url_str) => {
-                                    final_path = url_str;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "[DISKLESS] presign failed: {:?}, fallback to mem:// path",
-                                        e
-                                    );
-                                }
+                            Err(e) => {
+                                error!(
+                                    "[DISKLESS] presign failed: {:?}, fallback to mem:// path",
+                                    e
+                                );
                             }
                         }
                     }
-                    Err(e) => {
-                        error!(
-                            "[DISKLESS] S3 upload of object_key='{}' failed: {:?}",
-                            object_key, e
-                        );
-                    }
                 }
-            }
-
-            self.playlist_entries.push(PlaylistEntry {
-                duration: real_elapsed,
-                path: final_path,
-            });
-
-            if self.max_segments_in_index > 0
-                && self.playlist_entries.len() > self.max_segments_in_index
-            {
-                let _ = self.playlist_entries.remove(0);
+                Err(e) => {
+                    error!(
+                        "[DISKLESS] S3 upload of object_key='{}' failed: {:?}",
+                        object_key, e
+                    );
+                }
             }
         }
 
-        if self.diskless_mode {
-            if let (Some(ref hic_arc), Some(_buck)) = (&self.hourly_index_creator, &self.s3_bucket)
+        self.playlist_entries.push(PlaylistEntry {
+            duration: real_elapsed,
+            path: final_path,
+        });
+
+        if self.max_segments_in_index > 0
+            && self.playlist_entries.len() > self.max_segments_in_index
+        {
+            let _ = self.playlist_entries.remove(0);
+        }
+
+        if let (Some(ref hic_arc), Some(_buck)) = (&self.hourly_index_creator, &self.s3_bucket) {
+            let now = chrono::Local::now();
+            let year = now.format("%Y").to_string();
+            let month = now.format("%m").to_string();
+            let day = now.format("%d").to_string();
+            let hour = now.format("%H").to_string();
+
+            let hour_dir = format!("{}/{}/{}/{}", year, month, day, hour);
+            let object_key = format!(
+                "{}/{}",
+                self.output_dir,
+                self.current_segment_path(self.segment_index + 1)
+                    .to_string_lossy()
+            );
+            let custom_lines = vec![];
+
+            let mut guard = hic_arc.lock().await;
+            if let Err(e) = guard
+                .record_segment(
+                    &hour_dir,
+                    &object_key,
+                    real_elapsed,
+                    custom_lines,
+                    &self.output_dir,
+                )
+                .await
             {
-                let now = chrono::Local::now();
-                let year = now.format("%Y").to_string();
-                let month = now.format("%m").to_string();
-                let day = now.format("%d").to_string();
-                let hour = now.format("%H").to_string();
-
-                let hour_dir = format!("{}/{}/{}/{}", year, month, day, hour);
-                let object_key = format!(
-                    "{}/{}",
-                    self.output_dir,
-                    self.current_segment_path(self.segment_index + 1)
-                        .to_string_lossy()
-                );
-                let custom_lines = vec![];
-
-                let mut guard = hic_arc.lock().await;
-                if let Err(e) = guard
-                    .record_segment(
-                        &hour_dir,
-                        &object_key,
-                        real_elapsed,
-                        custom_lines,
-                        &self.output_dir,
-                    )
-                    .await
-                {
-                    warn!("Failed to record segment in diskless mode: {:?}", e);
-                }
+                warn!("Failed to record segment in diskless mode: {:?}", e);
             }
         }
 
@@ -904,42 +847,6 @@ impl ManualSegmenter {
         }
     }
 
-    fn open_new_segment_file(&mut self) -> std::io::Result<()> {
-        if self.diskless_mode {
-            return Ok(());
-        }
-        let segment_path = self.current_segment_path(self.segment_index);
-        let full_path = Path::new(&self.output_dir).join(&segment_path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let file = fs::File::create(&full_path)?;
-        let writer = BufWriter::new(file);
-
-        self.current_ts_file = Some(writer);
-        if !self.m3u8_initialized {
-            self.init_m3u8()?;
-            self.m3u8_initialized = true;
-        }
-        Ok(())
-    }
-
-    fn init_m3u8(&self) -> std::io::Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.playlist_path)?;
-        let duration_secs = get_segment_duration_ms() as u64 / 1000;
-
-        writeln!(f, "#EXTM3U")?;
-        writeln!(f, "#EXT-X-VERSION:3")?;
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", duration_secs)?;
-        writeln!(f, "#EXT-X-MEDIA-SEQUENCE:0")?;
-        Ok(())
-    }
-
     fn rewrite_m3u8(&self) -> std::io::Result<()> {
         debug!(
             "Rewriting m3u8 with {} entries",
@@ -1008,7 +915,6 @@ impl PacketCodec for BoxCodec {
 }
 
 // ------------- MAIN -------------
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -1104,12 +1010,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("capture_to_disk")
-                .long("capture_to_disk")
-                .help("Capture UDP packets to disk as local segments for debugging.")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
             Arg::new("diskless_ring_size")
                 .long("diskless_ring_size")
                 .help("Number of diskless segments to keep in memory ring buffer.")
@@ -1156,7 +1056,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
     let remove_local = matches.get_flag("remove_local");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
-    let capture_to_disk = matches.get_flag("capture_to_disk");
     let verbose = matches
         .get_one::<String>("verbose")
         .unwrap()
@@ -1316,7 +1215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut manual_segmenter = Some(
         ManualSegmenter::new(output_dir)
             .with_max_segments(hls_keep_segments)
-            .with_diskless_mode(!capture_to_disk, diskless_ring_size)
+            .with_diskless_ring_size(diskless_ring_size)
             .with_s3(
                 Some(s3_client.clone()),
                 Some(bucket.clone()),
@@ -1328,7 +1227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Diskless consumer thread (if needed)
-    let diskless_consumer = if !capture_to_disk {
+    let diskless_consumer = {
         if let Some(_seg_ref) = &manual_segmenter {
             let buffer_ref = _seg_ref.diskless_buffer.clone();
             let shutdown_flag_clone = Arc::clone(&shutdown_flag);
@@ -1352,8 +1251,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             None
         }
-    } else {
-        None
     };
 
     let (pcap_tx, pcap_rx) = std_mpsc::sync_channel::<(Vec<u8>, u64)>(100000);
