@@ -39,23 +39,23 @@ use env_logger;
 
 fn get_segment_duration_ms() -> f64 {
     std::env::var("SEGMENT_DURATION_MS")
-        .unwrap_or_else(|_| "1000.0".to_string())
+        .unwrap_or_else(|_| "2000.0".to_string())
         .parse()
-        .unwrap_or(1000.0)
+        .unwrap_or(2000.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
     std::env::var("MAX_SEGMENT_SIZE_BYTES")
-        .unwrap_or_else(|_| "25000000".to_string())
+        .unwrap_or_else(|_| "5242756".to_string())
         .parse()
-        .unwrap_or(5_000_000)
+        .unwrap_or(5242756)
 }
 
 fn get_file_max_age_seconds() -> u64 {
     std::env::var("FILE_MAX_AGE_SECONDS")
-        .unwrap_or_else(|_| "5".to_string())
+        .unwrap_or_else(|_| "30".to_string())
         .parse()
-        .unwrap_or(5)
+        .unwrap_or(30)
 }
 
 fn get_url_signing_seconds() -> u64 {
@@ -332,9 +332,9 @@ impl HourlyIndexCreator {
         content_type: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log::info!(
-             "UDPtoHLS: [upload_local_file_to_s3()] Uploading hourly index -> s3://{}/{} (content_type={})",
-             self.bucket, object_key, content_type
-         );
+              "UDPtoHLS: [upload_local_file_to_s3()] Uploading hourly index -> s3://{}/{} (content_type={})",
+              self.bucket, object_key, content_type
+          );
         let body_bytes = ByteStream::from_path(local_path).await?;
         self.s3_client
             .put_object()
@@ -661,12 +661,12 @@ impl ManualSegmenter {
 
         if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
             info!(
-                  "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
-                  elapsed_wall,
-                  desired_secs,
-                  enough_bytes_based_on_bitrate,
-                  fallback_time_expired
-              );
+                   "Trigger close segment: using wall-clock. elapsed_wall={:.2}, desired_secs={}, enough_bytes_based_on_bitrate={}, fallback_time_expired={}",
+                   elapsed_wall,
+                   desired_secs,
+                   enough_bytes_based_on_bitrate,
+                   fallback_time_expired
+               );
             self.close_current_segment_file().await?;
             if !self.diskless_mode {
                 self.open_new_segment_file()?;
@@ -1269,9 +1269,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _sock = match join_multicast_on_iface(filter_ip, filter_port, interface) {
         Ok(s) => {
             println!(
-                "UDPtoHLS: Successfully joined multicast group on interface={} filter_ip={} filter_port={}",
-                interface, filter_ip, filter_port
-            );
+                 "UDPtoHLS: Successfully joined multicast group on interface={} filter_ip={} filter_port={}",
+                 interface, filter_ip, filter_port
+             );
             s
         }
         Err(e) => {
@@ -1356,9 +1356,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    let mut pid_tracker = PidTracker::new();
-    let mut leftover_ts = Vec::new();
-
     let (pcap_tx, pcap_rx) = std_mpsc::sync_channel::<(Vec<u8>, u64)>(100000);
 
     let capture_shutdown = Arc::clone(&shutdown_flag);
@@ -1368,66 +1365,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Create a mini–runtime for the capture thread
         let rt = tokio::runtime::Runtime::new().expect("Failed to create capture runtime");
         rt.block_on(async move {
-             let mut stream = cap.stream(BoxCodec).unwrap();
-             let mut stats_timer = Instant::now();
-             let mut stats_last_recv = 0;
-             let mut stats_last_drop = 0;
-             while !capture_shutdown.load(Ordering::SeqCst) {
-                 match stream.next().await {
-                     Some(Ok((data, timestamp))) => {
-                         let packet_data = Vec::from(&*data);
-                         let timestamp_ms = timestamp
-                             .duration_since(UNIX_EPOCH)
-                             .map(|d| d.as_millis() as u64)
-                             .unwrap_or_else(|_| {
-                                 SystemTime::now()
-                                     .duration_since(UNIX_EPOCH)
-                                     .unwrap()
-                                     .as_millis() as u64
-                             });
-                         if stats_timer.elapsed() >= Duration::from_secs(pcap_stats_interval) {
-                             if let Ok(stats) = stream.capture_mut().stats() {
-                                 let dropped = stats.dropped - stats_last_drop;
-                                 let received = stats.received - stats_last_recv;
-                                 if dropped > 0 || stats.if_dropped > 0 {
-                                     log::error!(
-                                         "UDPtoHLS: PCAP drops detected - Received: {}, Dropped: {}, Interface Dropped: {}",
-                                         received, dropped, stats.if_dropped
-                                     );
-                                 }
-                                 stats_last_recv = stats.received;
-                                 stats_last_drop = stats.dropped;
-                             }
-                             stats_timer = Instant::now();
-                         }
-                         if let Err(e) = pcap_tx.send((packet_data, timestamp_ms)) {
-                             log::error!("UDPtoHLS: Pcap Failed to send packet to channel: {:?}", e);
-                             break;
-                         }
-                     }
-                     None => {
-                         tokio::time::sleep(Duration::from_millis(1)).await;
-                     }
-                     Some(Err(e)) => {
-                         if e == pcap::Error::TimeoutExpired {
-                             tokio::time::sleep(Duration::from_millis(1)).await;
-                             continue;
-                         }
-                         log::error!("UDPtoHLS: Pcap error: {:?}", e);
-                         break;
-                     }
-                 }
-             }
-             if let Ok(stats) = stream.capture_mut().stats() {
-                 log::info!(
-                     "UDPtoHLS: Final PCAP stats - Received: {}, Dropped: {}, Interface Dropped: {}",
-                     stats.received,
-                     stats.dropped,
-                     stats.if_dropped
-                 );
-             }
-         });
+              let mut stream = cap.stream(BoxCodec).unwrap();
+              let mut stats_timer = Instant::now();
+              let mut stats_last_recv = 0;
+              let mut stats_last_drop = 0;
+              while !capture_shutdown.load(Ordering::SeqCst) {
+                  match stream.next().await {
+                      Some(Ok((data, timestamp))) => {
+                          let packet_data = Vec::from(&*data);
+                          let timestamp_ms = timestamp
+                              .duration_since(UNIX_EPOCH)
+                              .map(|d| d.as_millis() as u64)
+                              .unwrap_or_else(|_| {
+                                  SystemTime::now()
+                                      .duration_since(UNIX_EPOCH)
+                                      .unwrap()
+                                      .as_millis() as u64
+                              });
+                          if stats_timer.elapsed() >= Duration::from_secs(pcap_stats_interval) {
+                              if let Ok(stats) = stream.capture_mut().stats() {
+                                  let dropped = stats.dropped - stats_last_drop;
+                                  let received = stats.received - stats_last_recv;
+                                  if dropped > 0 || stats.if_dropped > 0 {
+                                      log::error!(
+                                          "UDPtoHLS: PCAP drops detected - Received: {}, Dropped: {}, Interface Dropped: {}",
+                                          received, dropped, stats.if_dropped
+                                      );
+                                  }
+                                  stats_last_recv = stats.received;
+                                  stats_last_drop = stats.dropped;
+                              }
+                              stats_timer = Instant::now();
+                          }
+                          if let Err(e) = pcap_tx.send((packet_data, timestamp_ms)) {
+                              log::error!("UDPtoHLS: Pcap Failed to send packet to channel: {:?}", e);
+                              break;
+                          }
+                      }
+                      None => {
+                          tokio::time::sleep(Duration::from_millis(1)).await;
+                      }
+                      Some(Err(e)) => {
+                          if e == pcap::Error::TimeoutExpired {
+                              tokio::time::sleep(Duration::from_millis(1)).await;
+                              continue;
+                          }
+                          log::error!("UDPtoHLS: Pcap error: {:?}", e);
+                          break;
+                      }
+                  }
+              }
+              if let Ok(stats) = stream.capture_mut().stats() {
+                  log::info!(
+                      "UDPtoHLS: Final PCAP stats - Received: {}, Dropped: {}, Interface Dropped: {}",
+                      stats.received,
+                      stats.dropped,
+                      stats.if_dropped
+                  );
+              }
+          });
     });
+
+    let mut pid_tracker = PidTracker::new();
+    let mut leftover_ts = VecDeque::new();
+    // Use a vector to accumulate TS packets as Arc slices to avoid unnecessary copies.
+    let mut batch_buffer_arcs: Vec<Arc<[u8]>> = Vec::new();
 
     debug!("Starting main processing loop now...");
     loop {
@@ -1450,30 +1452,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         if let Some(ts_data) = extract_mpegts_payload(&packet_data, filter_ip, filter_port) {
-            leftover_ts.extend_from_slice(ts_data);
+            leftover_ts.extend(ts_data.iter().copied());
 
-            while leftover_ts.len() >= (7 * TS_PACKET_SIZE) {
-                for chunk in leftover_ts.chunks((TS_PACKET_SIZE) as usize) {
-                    if leftover_ts[0] != 0x47 {
-                        log::warn!("UDPtoHLS: (ExtractMpegTSpayload) Packet does not start with sync byte 0x47");
+            while leftover_ts.len() >= TS_PACKET_SIZE {
+                let contiguous = leftover_ts.make_contiguous();
+
+                // Ensure the packet starts with sync byte 0x47
+                if contiguous[0] != 0x47 {
+                    if let Some(pos) = contiguous.iter().position(|&x| x == 0x47) {
+                        // Discard bytes until the next sync byte
+                        log::warn!("UDPtoHLS: Invalid TS packet detected, discarding {} bytes of {} bytes total", pos, contiguous.len());
+                        for _ in 0..pos {
+                            leftover_ts.pop_front();
+                        }
+                    } else {
+                        // No sync byte found, clear the buffer
+                        log::error!(
+                            "UDPtoHLS: Invalid TS packet detected, discarding all {} bytes",
+                            contiguous.len()
+                        );
+                        leftover_ts.clear();
+                        break;
                     }
+                    continue;
+                }
 
-                    if let Err(e) =
-                        pid_tracker.process_packet("ExtractMpegTSpayload".to_string(), &chunk)
-                    {
-                        log::error!("UDPtoHLS: (ExtractMpegTSpayload) Continuity error: {:?}", e);
+                if contiguous.len() < TS_PACKET_SIZE {
+                    log::warn!("UDPtoHLS: Incomplete TS packet detected of {} bytes, waiting for more data", contiguous.len());
+                    break;
+                }
+
+                // Create an Arc for the 188-byte TS packet without extra copying
+                let packet_arc: Arc<[u8]> = Arc::from(&contiguous[..TS_PACKET_SIZE]);
+
+                // Process the packet (PID tracking)
+                match pid_tracker
+                    .process_packet("ExtractMpegTSpayload".to_string(), packet_arc.as_ref())
+                {
+                    Ok(()) => {}
+                    Err(0xFFFF) => {
+                        log::warn!("UDPtoHLS: Invalid TS packet detected (pid=0xFFFF), discarding and searching for next sync byte");
+                        leftover_ts.pop_front();
+                        continue;
+                    }
+                    Err(e) => {
+                        log::error!("UDPtoHLS: Continuity error: {:?}", e);
                     }
                 }
 
-                let ts_packet = leftover_ts
-                    .drain(..(7 * TS_PACKET_SIZE))
-                    .collect::<Vec<u8>>();
+                // Accumulate valid packet into the batch buffer
+                batch_buffer_arcs.push(packet_arc);
 
-                if let Some(seg) = manual_segmenter.as_mut() {
-                    if let Err(e) = seg.write_ts(timestamp, &ts_packet).await {
-                        log::error!("UDPtoHLS: Segment write error: {:?}", e);
-                        break;
+                // Remove the processed packet from the leftover buffer
+                for _ in 0..TS_PACKET_SIZE {
+                    leftover_ts.pop_front();
+                }
+
+                // Write in batches of 7 packets
+                if batch_buffer_arcs.len() >= 7 {
+                    let mut concatenated =
+                        Vec::with_capacity(batch_buffer_arcs.len() * TS_PACKET_SIZE);
+                    for arc in &batch_buffer_arcs {
+                        concatenated.extend_from_slice(arc.as_ref());
                     }
+                    if let Some(seg) = manual_segmenter.as_mut() {
+                        if let Err(e) = seg.write_ts(timestamp, &concatenated).await {
+                            log::error!("UDPtoHLS: Segment write error: {:?}", e);
+                            break;
+                        }
+                    }
+                    batch_buffer_arcs.clear();
                 }
             }
         }
