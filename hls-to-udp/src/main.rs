@@ -259,15 +259,26 @@ fn receiver_thread(
                     continue;
                 }
 
-                /* check uri is proper format with uri crate */
-                if Url::parse(uri).is_err() {
-                    log::error!("HLStoUDP: ReceiverThread Bad segment URI: {}", uri);
-                    continue;
-                }
-
                 if seg_history.contains(uri) {
                     continue;
                 }
+
+                /* check uri is proper format with uri crate */
+                if Url::parse(uri).is_err() {
+                    log::error!("HLStoUDP: ReceiverThread Bad format for URI: {}", uri);
+                    continue;
+                }
+
+                /* make sure we have a .ts extension on the uri, split off the ?... parts first */
+                let uri_main = uri.split('?').next().unwrap();
+                if !uri_main.ends_with(".ts") {
+                    log::error!(
+                        "HLStoUDP: ReceiverThread Bad segment, not a .ts file URI: {}",
+                        uri
+                    );
+                    continue;
+                }
+
                 seg_history.insert(uri.to_string());
 
                 // If VOD mode is enabled, filter segments based on the start_time and end_time
