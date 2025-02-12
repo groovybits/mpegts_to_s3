@@ -6,12 +6,6 @@ cleanup() {
     exit 0
 }
 
-if [ "${CAPTURE_TO_DISK}" = "true" ]; then
-    CAPTURE_TO_DISK="--capture_to_disk"
-else
-    CAPTURE_TO_DISK=""
-fi
-
 if [ "${USE_UNSIGNED_URLS}" = "true" ]; then
     UNSIGNED_URL_ARGS="--unsigned_urls"
 fi
@@ -31,7 +25,7 @@ while [ : ]; do
         -b ${MINIO_BUCKET_NAME} \
         -o ${CHANNEL_NAME} \
         --hls_keep_segments ${M3U8_LIVE_SEGMENT_COUNT} \
-        ${CAPTURE_TO_DISK} ${UNSIGNED_URL_ARGS} ${QUIET} $@
+        ${UNSIGNED_URL_ARGS} ${QUIET} $@
 
     sleep 1
 done
