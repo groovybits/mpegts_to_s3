@@ -44,13 +44,17 @@ There is a container at `docker.io/groovybits/mpegts_to_s3:latest` which can be 
 
 ## Quick Start Guide (Local Build)
 
-### Clone and Build the Project
+### Clone and Build the Project 
 ```bash
 git clone https://github.com/groovybits/mpegts_to_s3.git
 cd mpegts_to_s3
 
-# Build the application in release mode
+# Build the udp-to-hls application in release mode
 cargo build --release
+
+# Build the hls-to-udp application in release mode
+cd hls-to-udp
+cargo build --release --features=smoother
 ```
 
 ### Configure and Run the Components
@@ -69,7 +73,7 @@ mkdir hls && cd hls
 ../scripts/http_server.py &
 ```
 
-#### 3. Capture and Segment UDP Stream
+#### 3. Capture and Segment UDP Stream to HLS
 ```bash
 # Capture multicast stream from udp://224.0.0.200:10001 on interface eth0
 # Segments can be saved to ./ts/ directory with 2-second duration and uploaded to S3/MinIO
@@ -81,7 +85,7 @@ SEGMENT_DURATION_SECONDS=2 \
     -o channel01      # Unique Identifier and Output directory for .ts segments
 ```
 
-#### 4. Playback
+#### 4. Playback from HLS to UDP
 - **Direct Playback:**
   1. Use the index.m3u8 for playback of the current live stream:
      ```bash
@@ -102,7 +106,7 @@ SEGMENT_DURATION_SECONDS=2 \
      mpv http://127.0.0.1:9000/ltnhls/2025/01/16/06/hourly_index.m3u8?...(signed_url_params)
      ```
 
-- **Custom Playback with hls-to-udp relay**
+- **Custom Playback with hls-to-udp relay** [hls-to-udp](hls-to-udp/README.md)
   1. Start the hls-to-udp relay
      ```bash
      cd hls-to-udp
@@ -122,6 +126,9 @@ SEGMENT_DURATION_SECONDS=2 \
 - **Dependencies:** Install `libpcap` for packet capture and FFmpeg (optional) for HLS segment generation.
 - **Ports:** Open ports 9000 and 9001 for MinIO and the HTTP server.
 - **SSH Tunneling:** For HTTP access to MinIO, set up SSH forwarding.
+- **LibLTNTSTools (optional):** Use the `smoother` feature flag to enable the Bitrate Smoother.
+
+```bash
 
 ---
 

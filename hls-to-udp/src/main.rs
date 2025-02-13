@@ -138,8 +138,15 @@ fn receiver_thread(
                     let best_playlist = if let Some(variant) = variant {
                         let mut variant_uri = variant.uri.clone();
                         /* check if we have a relative url or not via http: prefix, adjust variant_uri if needed, getting the original m3u8_url's base */
-                        if variant_uri.starts_with("http:") || variant_uri.starts_with("https:") {
-                            // do nothing
+                        if variant_uri.starts_with("http:")
+                            || variant_uri.starts_with("https:")
+                            || variant_uri.starts_with(".")
+                            || variant_uri.starts_with("/")
+                            || variant_uri.starts_with("#")
+                        {
+                            if variant_uri.starts_with("#") {
+                                continue;
+                            }
                         } else {
                             let mut base_uri = base_url.clone();
                             /* get path dirname without end file */
@@ -237,8 +244,15 @@ fn receiver_thread(
                 // bucket, channel, year, month, day, hour, segment_YYYYMMDD-HHMMSS__INDEX.ts
 
                 let mut seg_uri = seg.uri.clone();
-                if seg_uri.starts_with("http:") || seg_uri.starts_with("https:") {
-                    // do nothing
+                if seg_uri.starts_with("http:")
+                    || seg_uri.starts_with("https:")
+                    || seg_uri.starts_with(".")
+                    || seg_uri.starts_with("/")
+                    || seg_uri.starts_with("#")
+                {
+                    if seg_uri.starts_with("#") {
+                        continue;
+                    }
                 } else {
                     let mut base_uri = base_url.clone();
                     /* get path dirname without end file */
@@ -385,7 +399,9 @@ fn receiver_thread(
 
             if vod || media_pl.end_list {
                 log::warn!("HLStoUDP: ReceiverThread ENDLIST found => done downloading.");
-                break;
+                if vod {
+                    break;
+                }
             }
 
             thread::sleep(Duration::from_millis(poll_interval_ms));
@@ -488,7 +504,7 @@ fn sender_thread(
 
         // Time-based approach to blocking, define a max wait:
         let max_block_ms = 10000; // ms total wait if OS buffer is full
-        let timeout_interval = Duration::from_millis(30000); // 30 seconds
+        let timeout_interval = Duration::from_millis(3000); // 3 seconds
 
         // Use a VecDeque as a ring buffer to avoid memmove overhead.
         // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
@@ -501,13 +517,15 @@ fn sender_thread(
 
         let capture_start_time = Instant::now();
 
+        let udp_sender_thread_shutdown_flag = Arc::clone(&shutdown_flag);
+
         let udp_sender_thread = thread::spawn(move || {
             println!("HLStoUDP: UDPThread started (hybrid non-blocking + partial block).");
 
             // Create a PidTracker to track PIDs and Continuity Counter Errors
             let mut pid_tracker = PidTracker::new();
 
-            loop {
+            while !udp_sender_thread_shutdown_flag.load(Ordering::SeqCst) {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
                 match udp_rx.recv_timeout(timeout_interval) {
                     Ok(arc_data) => {
@@ -527,6 +545,7 @@ fn sender_thread(
                             );
                             continue;
                         }
+
                         // Extend our VecDeque with the new data.
                         buffer.extend(data.iter().copied());
 
@@ -702,6 +721,9 @@ fn sender_thread(
         // Create a PidTracker to track PIDs and Continuity Counter Errors
         let mut pid_tracker = PidTracker::new();
 
+        // vecdec buffer to hold UDP packets while we are detecting the stream model PCR PID
+        let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
+
         // Process each downloaded segment from the receiver thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
@@ -732,6 +754,11 @@ fn sender_thread(
                             );
                         }
                     }
+                } else {
+                    log::error!(
+                        "HLStoUDP: SenderThread Failed to open output file: {}",
+                        output_file
+                    );
                 }
 
                 // Feed it into your continuity checker
@@ -766,8 +793,54 @@ fn sender_thread(
                     }
                     index += 1;
                 }
-                drop(seg); // drop the segment data
             }
+
+            // Move the received data into our buffer without copying each byte.
+            // Extend the VecDeque with the data from seg.data.
+            if buffer.len() + seg.data.len() > buffer.capacity() {
+                log::warn!(
+                    "HLStoUDP: SenderThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)",
+                    buffer.len(),
+                    seg.data.len()
+                );
+                continue;
+            }
+            buffer.extend(seg.data);
+
+            // Process full TS packets from the buffer, removing data as it is sent.
+            while (pcr_pid > 0 || !use_smoother) && buffer.len() >= TS_PACKET_SIZE {
+                // Drain exactly TS_PACKET_SIZE bytes from the front.
+                let packet_chunk: Vec<u8> = buffer.drain(0..TS_PACKET_SIZE).collect();
+
+                // Feed the packet chunk into the continuity checker.
+                if let Err(e) =
+                    pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
+                {
+                    if e == 0xFFFF {
+                        log::error!(
+                            "HLStoUDP: (ReceiveDownloadSegment) Bad packet ({} bytes) detected, dropping packet. URI: {}",
+                            packet_chunk.len(),
+                            seg.uri);
+                        continue;
+                    } else {
+                        log::error!(
+                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?} in packet from URI: {}",
+                            e,seg.uri);
+                    }
+                }
+
+                if !use_smoother {
+                    // Send the packet directly to the UDP sender thread wrapped in an Arc.
+                    if let Err(e) = udp_tx.send(Arc::new(packet_chunk)) {
+                        log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
+                    }
+                } else {
+                    // If we have a valid PCR PID, create the PcrSmoother
+                }
+            }
+
+            // If we have not yet determined a valid PCR PID,
+            // keep the data in the buffer for later processing.
         }
 
         // Tell the udp_sender_thread to shut down
@@ -1068,7 +1141,7 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
-    let dl_handle = receiver_thread(
+    let receiver_handle = receiver_thread(
         m3u8_url,
         start_time,
         end_time,
@@ -1079,7 +1152,7 @@ fn main() -> Result<()> {
         shutdown_flag.clone(),
         tx_shutdown.clone(),
     );
-    let _sender_handle = sender_thread(
+    let sender_handle = sender_thread(
         udp_out,
         latency,
         pcr_pid,
@@ -1109,12 +1182,11 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("Main: Waiting for downloader thread to exit...");
-    dl_handle.join().unwrap();
+    log::info!("Main: Waiting for sender thread to exit...");
+    sender_handle.join().unwrap();
 
-    // FIXME: This is causing a deadlock, need to figure out why
-    //log::info!("Main: Waiting for sender thread to exit...");
-    //sender_handle.join().unwrap();
+    println!("Main: Waiting for receiver thread to exit...");
+    receiver_handle.join().unwrap();
 
     println!("HLStoUDP: Main thread exiting.");
     Ok(())
