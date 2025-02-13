@@ -22,7 +22,7 @@ debug = true
 # feature flag for libltntstools-sys and libltntstools
 [features]
 default = []
-libltntstools_enabled = ["libltntstools-sys", "libltntstools"]
+smoother = ["libltntstools-sys", "libltntstools"]
 
 [dependencies]
 anyhow = "1"

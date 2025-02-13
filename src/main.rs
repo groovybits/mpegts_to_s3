@@ -794,32 +794,41 @@ impl ManualSegmenter {
             "Rewriting m3u8 with {} entries",
             self.playlist_entries.len()
         );
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.playlist_path)?;
+        let tmp_path = self.playlist_path.with_file_name(format!(
+            "{}_temp",
+            self.playlist_path.file_name().unwrap().to_string_lossy()
+        ));
 
-        writeln!(f, "#EXTM3U")?;
-        writeln!(f, "#EXT-X-VERSION:3")?;
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
 
-        let max_seg_secs = self
-            .playlist_entries
-            .iter()
-            .map(|e| e.duration.ceil() as u64)
-            .max()
-            .unwrap_or_else(|| get_segment_duration_ms() as u64 / 1000);
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg_secs)?;
+            writeln!(f, "#EXTM3U")?;
+            writeln!(f, "#EXT-X-VERSION:3")?;
 
-        let seq_start = self
-            .segment_index
-            .saturating_sub(self.playlist_entries.len() as u64);
-        writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
+            let max_seg_secs = self
+                .playlist_entries
+                .iter()
+                .map(|e| e.duration.ceil() as u64)
+                .max()
+                .unwrap_or_else(|| get_segment_duration_ms() as u64 / 1000);
+            writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg_secs)?;
 
-        for entry in &self.playlist_entries {
-            writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
-            writeln!(f, "{}", entry.path)?;
+            let seq_start = self
+                .segment_index
+                .saturating_sub(self.playlist_entries.len() as u64);
+            writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
+
+            for entry in &self.playlist_entries {
+                writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
+                writeln!(f, "{}", entry.path)?;
+            }
         }
+
+        fs::rename(&tmp_path, &self.playlist_path)?;
         Ok(())
     }
 

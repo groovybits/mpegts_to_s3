@@ -1,5 +1,7 @@
 .PHONY: all clean setup install build container
 
+CARGO_FEATURES = smoother
+
 all: build
 
 install:
@@ -11,7 +13,7 @@ setup:
 
 build:
 	cargo build --release && \
-		cd hls-to-udp && cargo build --release
+		cd hls-to-udp && cargo build --release --features="$(CARGO_FEATURES)"
 
 clean:
 	cargo clean

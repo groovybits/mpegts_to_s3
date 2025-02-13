@@ -2,7 +2,7 @@
 
 This Rust-based client reads from an HLS M3U8 playlist and rebroadcasts it as MPEG-TS over UDP. It is designed to handle the HLS produced by https://github.com/groovybits/mpegts_to_s3.git and is intended to be used as a relay for replaying that content.
 
-To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [https://github.com/LTNGlobal-opensource/libltntstools](https://github.com/LTNGlobal-opensource/libltntstools) you must build with the `libltntstools_enabled` feature flag set.
+To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [https://github.com/LTNGlobal-opensource/libltntstools](https://github.com/LTNGlobal-opensource/libltntstools) you must build with the `smoother` feature flag set.
 
 ## Features
 
@@ -14,13 +14,13 @@ To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [http
 - Rust (latest stable version)
 - Cargo (Rust package manager)
 - LibPcap
-- LibLTNTSTools (optional) Use the `libltntstools_enabled` feature flag to enable the Bitrate Smoother
+- LibLTNTSTools (optional) Use the `smoother` feature flag to enable the Bitrate Smoother `--features=smoother`
 
 ## Installation
 
 1. Build the project:
     ```sh
-    cargo build --release
+    cargo build --release --features=smoother
     ```
 
 ## Live vs. VOD Mode
@@ -78,7 +78,7 @@ hls-to-udp -u "http://127.0.0.1:9000/hls/channel01/2025/02/05/05/index.m3u8/inde
     - `SEGMENT_QUEUE_SIZE`: Segment queue size (default: `32`)
     - `UDP_QUEUE_SIZE`: UDP queue size (default: `1024`)
     - `UDP_SEND_BUFFER`: Size of the UDP Send buffer (default: `0` - OS default)
-    - `USE_SMOOTHER`: Use the LibLTNTSTools Bitrate Smoother (default: `false`) Requires --features=libltntstools_enabled
+    - `USE_SMOOTHER`: Use the LibLTNTSTools Bitrate Smoother (default: `false`) Requires --features=smoother
     - `HLS_TO_UDP_OUTPUT_FILE`: Output file for debugging (default: ``)
 
 ## Example
