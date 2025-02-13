@@ -14,13 +14,13 @@ use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::{Arg, Command as ClapCommand};
 use ctrlc;
+use env_logger;
 use futures::StreamExt;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pcap::{Capture, PacketCodec};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -30,10 +30,7 @@ use std::sync::{mpsc as std_mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 use udp_to_hls::{PidTracker, TS_PACKET_SIZE};
-
-use env_logger;
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
@@ -49,13 +46,6 @@ fn get_max_segment_size_bytes() -> usize {
         .unwrap_or_else(|_| "5242756".to_string())
         .parse()
         .unwrap_or(5242756)
-}
-
-fn get_file_max_age_seconds() -> u64 {
-    std::env::var("FILE_MAX_AGE_SECONDS")
-        .unwrap_or_else(|_| "30".to_string())
-        .parse()
-        .unwrap_or(30)
 }
 
 fn get_url_signing_seconds() -> u64 {
@@ -119,21 +109,6 @@ fn get_use_estimated_duration() -> bool {
 
 fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
-}
-
-/// Utility: Attempt to get the actual duration from file creation/modification times.
-/// Fallback to environment-based default if we can't measure it.
-fn get_actual_file_duration(path: &Path) -> f64 {
-    if let Ok(metadata) = path.metadata() {
-        if let Ok(created_time) = metadata.created() {
-            if let Ok(modified_time) = metadata.modified() {
-                if let Ok(elapsed) = modified_time.duration_since(created_time) {
-                    return elapsed.as_millis() as f64;
-                }
-            }
-        }
-    }
-    get_segment_duration_ms()
 }
 
 // ------------- HOURLY INDEX CREATOR -------------
@@ -385,39 +360,6 @@ pub fn join_multicast_on_iface(
         multicast_addr, interface_name, local_iface_ip, port
     );
     Ok(sock)
-}
-
-struct FileTracker {
-    uploaded_files: HashSet<String>,
-    max_age: Duration,
-}
-
-impl FileTracker {
-    fn new(max_age_secs: u64) -> Self {
-        FileTracker {
-            uploaded_files: HashSet::new(),
-            max_age: Duration::from_secs(max_age_secs),
-        }
-    }
-
-    fn is_uploaded(&self, path: &str) -> bool {
-        self.uploaded_files.contains(path)
-    }
-
-    fn mark_uploaded(&mut self, path: String) {
-        self.uploaded_files.insert(path);
-    }
-
-    fn is_too_old(&self, path: &Path) -> bool {
-        if let Ok(metadata) = path.metadata() {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(age) = SystemTime::now().duration_since(modified) {
-                    return age > self.max_age;
-                }
-            }
-        }
-        false
-    }
 }
 
 async fn ensure_bucket_exists(
@@ -852,32 +794,41 @@ impl ManualSegmenter {
             "Rewriting m3u8 with {} entries",
             self.playlist_entries.len()
         );
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.playlist_path)?;
+        let tmp_path = self.playlist_path.with_file_name(format!(
+            "{}_temp",
+            self.playlist_path.file_name().unwrap().to_string_lossy()
+        ));
 
-        writeln!(f, "#EXTM3U")?;
-        writeln!(f, "#EXT-X-VERSION:3")?;
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
 
-        let max_seg_secs = self
-            .playlist_entries
-            .iter()
-            .map(|e| e.duration.ceil() as u64)
-            .max()
-            .unwrap_or_else(|| get_segment_duration_ms() as u64 / 1000);
-        writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg_secs)?;
+            writeln!(f, "#EXTM3U")?;
+            writeln!(f, "#EXT-X-VERSION:3")?;
 
-        let seq_start = self
-            .segment_index
-            .saturating_sub(self.playlist_entries.len() as u64);
-        writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
+            let max_seg_secs = self
+                .playlist_entries
+                .iter()
+                .map(|e| e.duration.ceil() as u64)
+                .max()
+                .unwrap_or_else(|| get_segment_duration_ms() as u64 / 1000);
+            writeln!(f, "#EXT-X-TARGETDURATION:{}", max_seg_secs)?;
 
-        for entry in &self.playlist_entries {
-            writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
-            writeln!(f, "{}", entry.path)?;
+            let seq_start = self
+                .segment_index
+                .saturating_sub(self.playlist_entries.len() as u64);
+            writeln!(f, "#EXT-X-MEDIA-SEQUENCE:{}", seq_start)?;
+
+            for entry in &self.playlist_entries {
+                writeln!(f, "#EXTINF:{:.6},", entry.duration)?;
+                writeln!(f, "{}", entry.path)?;
+            }
         }
+
+        fs::rename(&tmp_path, &self.playlist_path)?;
         Ok(())
     }
 
@@ -1054,7 +1005,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let interface = matches.get_one::<String>("interface").unwrap();
     let timeout: i32 = matches.get_one::<String>("timeout").unwrap().parse()?;
     let output_dir = matches.get_one::<String>("output_dir").unwrap();
-    let remove_local = matches.get_flag("remove_local");
     let generate_unsigned_urls = matches.get_flag("unsigned_urls");
     let verbose = matches
         .get_one::<String>("verbose")
@@ -1127,39 +1077,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     let hourly_index_creator = Arc::new(Mutex::new(hourly_index_creator));
 
-    println!("UDPtoHLS: Starting directory watcher on: {}", output_dir);
-    let (watch_tx, watch_rx) = std_mpsc::channel();
-    let watch_dir = output_dir.to_string();
-    let shutdown_flag_wt_clone = Arc::clone(&shutdown_flag);
-    let watch_thread = thread::spawn(move || {
-        if let Err(e) = watch_directory(&watch_dir, watch_tx, shutdown_flag_wt_clone) {
-            log::error!("UDPtoHLS: Directory watcher error: {:?}", e);
-        }
-    });
-
-    let s3_client_clone = s3_client.clone();
-    let bucket_clone = bucket.clone();
-    let output_dir_clone = output_dir.clone();
-    let output_dir_for_task = output_dir.clone();
-
-    let hic_for_task = hourly_index_creator.clone();
-    let shutdown_flag_ut_clone = Arc::clone(&shutdown_flag);
-    let upload_task = tokio::spawn(async move {
-        if let Err(e) = handle_file_events(
-            watch_rx,
-            s3_client_clone,
-            bucket_clone,
-            output_dir_clone,
-            remove_local,
-            hic_for_task,
-            output_dir_for_task,
-            shutdown_flag_ut_clone,
-        )
-        .await
-        {
-            log::error!("UDPtoHLS: File event handler error: {}", e);
-        }
-    });
+    println!("UDPtoHLS: Using channel output path: {}", output_dir);
 
     println!(
         "UDPtoHLS: Attempting to join multicast {}:{} on interface={}",
@@ -1421,6 +1339,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     batch_buffer_arcs.clear();
                 }
             }
+        } else {
+            log::warn!(
+                "UDPtoHLS: Failed to extract MPEG-TS payload: 0x{:?}... {} bytes",
+                hex::encode(&packet_data[..16]),
+                packet_data.len()
+            );
         }
     }
 
@@ -1446,294 +1370,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    log::info!("UDPtoHLS: Waiting for upload task to exit...");
-    match upload_task.await {
-        Ok(_) => log::info!("UDPtoHLS: Upload task exited cleanly."),
-        Err(e) => log::error!("UDPtoHLS: Upload task panicked: {:?}", e),
-    }
-
-    log::info!("UDPtoHLS: Waiting for watch thread to exit...");
-    if let Err(e) = watch_thread.join() {
-        log::error!("UDPtoHLS: Watch thread join error: {:?}", e);
-    }
-
     log::info!("UDPtoHLS: All threads/tasks exited. Shutting down.");
     Ok(())
-}
-
-// ---------------- Directory Watcher ----------------
-
-fn watch_directory(
-    dir_path: &str,
-    tx: std::sync::mpsc::Sender<Event>,
-    shutdown_flag_ut_clone: Arc<AtomicBool>,
-) -> notify::Result<()> {
-    let (notify_tx, notify_rx) = std::sync::mpsc::channel();
-    let mut watcher: RecommendedWatcher = Watcher::new(
-        notify_tx,
-        notify::Config::default().with_compare_contents(false),
-    )?;
-    watcher.watch(Path::new(dir_path), RecursiveMode::Recursive)?;
-
-    loop {
-        if shutdown_flag_ut_clone.load(Ordering::SeqCst) {
-            break;
-        }
-        match notify_rx.recv() {
-            Ok(Ok(event)) => {
-                if tx.send(event).is_err() {
-                    break;
-                }
-            }
-            Ok(Err(e)) => log::error!("Notify error: {:?}", e),
-            Err(_) => break,
-        }
-    }
-    Ok(())
-}
-
-// ---------------- File-Event -> S3-Upload ----------------
-
-async fn handle_file_events(
-    rx: std::sync::mpsc::Receiver<Event>,
-    s3_client: Client,
-    bucket: String,
-    base_dir: String,
-    remove_local: bool,
-    hourly_index_creator: Arc<Mutex<HourlyIndexCreator>>,
-    output_dir: String,
-    shutdown_flag_ut_clone: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tracker = Arc::new(Mutex::new(FileTracker::new(get_file_max_age_seconds())));
-
-    while let Ok(event) = rx.recv() {
-        if shutdown_flag_ut_clone.load(Ordering::SeqCst) {
-            break;
-        }
-        match event.kind {
-            EventKind::Create(_) | EventKind::Modify(_) => {
-                for path in event.paths {
-                    if let Some(ext) = path.extension() {
-                        if (ext == "ts" || ext == "m3u8")
-                            && !path.to_string_lossy().contains("_temp.")
-                        {
-                            let full_path_str = path.to_string_lossy().to_string();
-
-                            {
-                                let tr = tracker.lock().await;
-                                if tr.is_uploaded(&full_path_str) || tr.is_too_old(&path) {
-                                    continue;
-                                }
-                            }
-
-                            if !full_path_str.starts_with("mem://") {
-                                let mut retries = 90;
-                                let mut stable_count = 0;
-                                let mut last_size = 0;
-
-                                while retries > 0
-                                    && stable_count < 3
-                                    && !shutdown_flag_ut_clone.load(Ordering::SeqCst)
-                                {
-                                    if let Ok(metadata) = fs::metadata(&path) {
-                                        let current_size = metadata.len();
-                                        if current_size > 0 {
-                                            if current_size == last_size {
-                                                stable_count += 1;
-                                            } else {
-                                                stable_count = 0;
-                                                last_size = current_size;
-                                            }
-                                        }
-                                    }
-                                    sleep(Duration::from_millis(100)).await;
-                                    retries -= 1;
-                                }
-
-                                if stable_count < 3 {
-                                    error!(
-                                        "UDPtoHLS: File {} did not stabilize, skipping",
-                                        full_path_str
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            let relative_path = match strip_base_dir(&path, &base_dir) {
-                                Ok(rp) => rp,
-                                Err(e) => {
-                                    warn!(
-                                        "UDPtoHLS: Skipping {}: strip_base_dir() error: {}",
-                                        full_path_str, e
-                                    );
-                                    continue;
-                                }
-                            };
-                            let key_str = relative_path.to_string_lossy().to_string();
-                            let hour_dir = relative_path
-                                .parent()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "".to_string());
-
-                            if let Ok(()) = upload_file_to_s3(
-                                &s3_client,
-                                &bucket,
-                                &base_dir,
-                                &path,
-                                remove_local,
-                            )
-                            .await
-                            {
-                                let mut tr = tracker.lock().await;
-                                tr.mark_uploaded(full_path_str.clone());
-                            }
-
-                            let pcr_dur_path = path.with_extension("dur");
-                            let actual_segment_duration_ms = if pcr_dur_path.exists() {
-                                if let Ok(dur_str) = fs::read_to_string(&pcr_dur_path) {
-                                    dur_str
-                                        .parse()
-                                        .unwrap_or_else(|_| get_actual_file_duration(&path))
-                                } else {
-                                    get_actual_file_duration(&path)
-                                }
-                            } else {
-                                get_actual_file_duration(&path)
-                            };
-
-                            let custom_lines = vec![];
-
-                            let mut hic = hourly_index_creator.lock().await;
-                            let _ = hic
-                                .record_segment(
-                                    &hour_dir,
-                                    &key_str,
-                                    actual_segment_duration_ms / 1000.0,
-                                    custom_lines,
-                                    &output_dir,
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-async fn upload_file_to_s3(
-    s3_client: &Client,
-    bucket: &str,
-    base_dir: &str,
-    path: &Path,
-    remove_local: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let relative_path = strip_base_dir(path, base_dir)?;
-    let key_str = relative_path.to_string_lossy().to_string();
-
-    let mime_type = if let Some(ext) = path.extension() {
-        if ext == "m3u8" {
-            "application/vnd.apple.mpegurl"
-        } else {
-            "video/mp2t"
-        }
-    } else {
-        "application/octet-stream"
-    };
-
-    let file_size = fs::metadata(path)?.len();
-    log::info!(
-        "Uploading {} ({} bytes) -> s3://{}/{} as {}",
-        path.display(),
-        file_size,
-        bucket,
-        key_str,
-        mime_type
-    );
-
-    let mut retries = 3;
-    while retries > 0 {
-        let metadata_size = fs::metadata(path)?.len();
-        let file_contents = fs::read(path)?;
-        let read_size = file_contents.len();
-
-        log::debug!(
-            "File checks for {}\n  Metadata size: {}\n  Actual read size: {}",
-            path.display(),
-            metadata_size,
-            read_size
-        );
-
-        let body_stream = ByteStream::from(file_contents);
-
-        log::info!(
-            "Uploading {} (metadata: {} bytes, read: {} bytes) -> s3://{}/{}",
-            path.display(),
-            metadata_size,
-            read_size,
-            bucket,
-            key_str
-        );
-        match s3_client
-            .put_object()
-            .bucket(bucket)
-            .key(&key_str)
-            .body(body_stream)
-            .content_type(mime_type)
-            .content_length(file_size as i64)
-            .send()
-            .await
-        {
-            Ok(_) => {
-                log::info!("UDPtoHLS: Uploaded {} ({} bytes)", key_str, file_size);
-                if remove_local {
-                    if let Err(e) = fs::remove_file(path) {
-                        log::error!(
-                            "UDPtoHLS: Failed removing local file {}: {:?}",
-                            path.display(),
-                            e
-                        );
-                    }
-                    let dur_sidecar = path.with_extension("dur");
-                    if dur_sidecar.exists() {
-                        if let Err(e) = fs::remove_file(&dur_sidecar) {
-                            log::error!(
-                                "UDPtoHLS: Failed removing local sidecar {:?}: {:?}",
-                                dur_sidecar,
-                                e
-                            );
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                retries -= 1;
-                if retries == 0 {
-                    return Err(Box::new(e));
-                }
-                log::error!(
-                    "UDPtoHLS: Upload failed, retrying ({} attempts left): {:?}",
-                    retries,
-                    e
-                );
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn strip_base_dir<'a>(
-    full_path: &'a Path,
-    base_dir: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let base = Path::new(base_dir).canonicalize()?;
-    let full = full_path.canonicalize()?;
-    let relative = full.strip_prefix(base)?;
-    Ok(relative.to_path_buf())
 }
 
 fn extract_mpegts_payload<'a>(

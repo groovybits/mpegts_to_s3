@@ -3,7 +3,7 @@ use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
 use hls_to_udp::{PidTracker, TS_PACKET_SIZE};
-#[cfg(feature = "libltntstools_enabled")]
+#[cfg(feature = "smoother")]
 use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
 use reqwest::blocking::Client;
@@ -140,8 +140,15 @@ fn receiver_thread(
                     let best_playlist = if let Some(variant) = variant {
                         let mut variant_uri = variant.uri.clone();
                         /* check if we have a relative url or not via http: prefix, adjust variant_uri if needed, getting the original m3u8_url's base */
-                        if variant_uri.starts_with("http:") || variant_uri.starts_with("https:") {
-                            // do nothing
+                        if variant_uri.starts_with("http:")
+                            || variant_uri.starts_with("https:")
+                            || variant_uri.starts_with(".")
+                            || variant_uri.starts_with("/")
+                            || variant_uri.starts_with("#")
+                        {
+                            if variant_uri.starts_with("#") {
+                                continue;
+                            }
                         } else {
                             let mut base_uri = base_url.clone();
                             /* get path dirname without end file */
@@ -239,8 +246,15 @@ fn receiver_thread(
                 // bucket, channel, year, month, day, hour, segment_YYYYMMDD-HHMMSS__INDEX.ts
 
                 let mut seg_uri = seg.uri.clone();
-                if seg_uri.starts_with("http:") || seg_uri.starts_with("https:") {
-                    // do nothing
+                if seg_uri.starts_with("http:")
+                    || seg_uri.starts_with("https:")
+                    || seg_uri.starts_with(".")
+                    || seg_uri.starts_with("/")
+                    || seg_uri.starts_with("#")
+                {
+                    if seg_uri.starts_with("#") {
+                        continue;
+                    }
                 } else {
                     let mut base_uri = base_url.clone();
                     /* get path dirname without end file */
@@ -387,7 +401,9 @@ fn receiver_thread(
 
             if vod || media_pl.end_list {
                 log::warn!("HLStoUDP: ReceiverThread ENDLIST found => done downloading.");
-                break;
+                if vod {
+                    break;
+                }
             }
 
             thread::sleep(Duration::from_millis(poll_interval_ms));
@@ -413,9 +429,9 @@ fn sender_thread(
     tx_shutdown: SyncSender<()>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        #[cfg(not(feature = "libltntstools_enabled"))]
+        #[cfg(not(feature = "smoother"))]
         let pcr_pid = pcr_pid_arg;
-        #[cfg(feature = "libltntstools_enabled")]
+        #[cfg(feature = "smoother")]
         let mut pcr_pid = pcr_pid_arg;
         let mut total_bytes_dropped = 0usize;
         let mut total_bytes_sent = 0usize;
@@ -489,7 +505,7 @@ fn sender_thread(
         let (udp_tx, udp_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(udp_queue_size);
 
         // To avoid moved value errors, clone the channel senders for use in the smoother callback.
-        #[cfg(feature = "libltntstools_enabled")]
+        #[cfg(feature = "smoother")]
         let udp_callback_arc = {
             let udp_tx_cloned = udp_tx.clone();
             let tx_shutdown_cloned = tx_shutdown.clone();
@@ -517,7 +533,7 @@ fn sender_thread(
 
         // Time-based approach to blocking, define a max wait:
         let max_block_ms = 10000; // ms total wait if OS buffer is full
-        let timeout_interval = Duration::from_millis(30000); // 30 seconds
+        let timeout_interval = Duration::from_millis(3000); // 3 seconds
 
         // Use a VecDeque as a ring buffer to avoid memmove overhead.
         // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
@@ -530,13 +546,15 @@ fn sender_thread(
 
         let capture_start_time = Instant::now();
 
+        let udp_sender_thread_shutdown_flag = Arc::clone(&shutdown_flag);
+
         let udp_sender_thread = thread::spawn(move || {
             println!("HLStoUDP: UDPThread started (hybrid non-blocking + partial block).");
 
             // Create a PidTracker to track PIDs and Continuity Counter Errors
             let mut pid_tracker = PidTracker::new();
 
-            loop {
+            while !udp_sender_thread_shutdown_flag.load(Ordering::SeqCst) {
                 // We poll for new chunks with a short timeout, so we can check shutdown.
                 match udp_rx.recv_timeout(timeout_interval) {
                     Ok(arc_data) => {
@@ -556,6 +574,7 @@ fn sender_thread(
                             );
                             continue;
                         }
+
                         // Extend our VecDeque with the new data.
                         buffer.extend(data.iter().copied());
 
@@ -729,10 +748,10 @@ fn sender_thread(
         });
 
         // --- If we are auto-detecting PCR, create a channel from the StreamModel callback
-        #[cfg(feature = "libltntstools_enabled")]
+        #[cfg(feature = "smoother")]
         let (pcr_tx, pcr_rx) = mpsc::channel();
 
-        #[cfg(feature = "libltntstools_enabled")]
+        #[cfg(feature = "smoother")]
         let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
             log::warn!("HLStoUDP: StreamModelCallback received PAT.");
             if pat.program_count > 0 {
@@ -763,7 +782,7 @@ fn sender_thread(
         };
 
         // Conditionally create a StreamModel if pcr_pid_arg == 0
-        #[cfg(feature = "libltntstools_enabled")]
+        #[cfg(feature = "smoother")]
         let mut model: Option<StreamModel<_>> = if pcr_pid_arg == 0 && use_smoother {
             Some(StreamModel::new(sm_callback))
         } else {
@@ -771,11 +790,14 @@ fn sender_thread(
         };
 
         // We'll create the smoother once we have a known pcr_pid
-        #[cfg(feature = "libltntstools_enabled")]
+        #[cfg(feature = "smoother")]
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
         // Create a PidTracker to track PIDs and Continuity Counter Errors
         let mut pid_tracker = PidTracker::new();
+
+        // vecdec buffer to hold UDP packets while we are detecting the stream model PCR PID
+        let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
 
         // Process each downloaded segment from the receiver thread
         while let Ok(seg) = rx.recv() {
@@ -791,12 +813,14 @@ fn sender_thread(
                 break;
             }
 
-            // If we haven't locked a pcr_pid yet, feed data to the StreamModel for detection
-            #[cfg(feature = "libltntstools_enabled")]
+            // If we haven't locked a PCR PID yet, feed data to the StreamModel for detection
+            #[cfg(feature = "smoother")]
             if pcr_pid == 0 && use_smoother {
                 if let Some(ref mut m) = model {
+                    // Write the seg.data to the model without copying: note that
+                    // seg.data is later moved into our buffer.
                     let _ = m.write(&seg.data);
-                    // See if a new PID was detected
+                    // Check whether a new PID was detected
                     if let Ok(detected) = pcr_rx.try_recv() {
                         pcr_pid = detected as u16;
                         log::warn!(
@@ -807,100 +831,113 @@ fn sender_thread(
                 }
             }
 
-            // If we have a PCR PID, drop the model
-            #[cfg(feature = "libltntstools_enabled")]
+            // If we have a valid PCR PID, drop the model
+            #[cfg(feature = "smoother")]
             if use_smoother && pcr_pid > 0 && model.is_some() {
                 log::warn!("HLStoUDP: SenderThread Dropping model after PCR PID detected.");
                 model.take(); // drop it
             }
 
-            // Now feed data into the PcrSmoother if we have a valid PID
-            if !use_smoother || pcr_pid > 0 {
-                #[cfg(feature = "libltntstools_enabled")]
-                if use_smoother && smoother.is_none() {
-                    // create the smoother using our cloned callback:
-                    let smoother_callback = {
-                        let cb = udp_callback_arc.clone();
-                        move |v: Vec<u8>| {
-                            (cb)(v);
-                        }
-                    };
-                    smoother = Some(PcrSmoother::new(
-                        pcr_pid,
-                        smoother_buffers,
-                        pkt_size,
-                        latency,
-                        Box::new(smoother_callback),
-                    ));
-                }
-
-                // Write to output file if requested
-                if !output_file.is_empty() {
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&output_file)
-                    {
-                        if let Err(e) = f.write_all(&seg.data) {
-                            log::error!(
-                                "HLStoUDP: SenderThread Failed to write to output file: {}",
-                                e
-                            );
-                        }
+            // Write to output file if requested
+            if !output_file.is_empty() {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output_file)
+                {
+                    if let Err(e) = f.write_all(&seg.data) {
+                        log::error!(
+                            "HLStoUDP: SenderThread Failed to write to output file: {}",
+                            e
+                        );
                     }
+                } else {
+                    log::error!(
+                        "HLStoUDP: SenderThread Failed to open output file: {}",
+                        output_file
+                    );
                 }
-
-                // Feed it into your continuity checker
-                let mut index = 0;
-                for packet_chunk in seg.data.chunks(TS_PACKET_SIZE) {
-                    if let Err(e) = pid_tracker
-                        .process_packet("ReceiveDownloadSegment".to_string(), packet_chunk)
-                    {
-                        if e == 0xFFFF {
-                            log::error!(
-                                "HLStoUDP: (ReceiveDownloadSegment) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment. URI: {}",
-                                packet_chunk.len(),
-                                index,
-                                seg.data.len() / TS_PACKET_SIZE,
-                                seg.data.len(),
-                                seg.uri
-                            );
-                            continue;
-                        } else {
-                            log::error!(
-                                "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?} in segment {} of {} chunks of {} bytes total. URI: {}",
-                                e, index, seg.data.len() / TS_PACKET_SIZE, seg.data.len(), seg.uri
-                            );
-                        }
-                    }
-
-                    if !use_smoother {
-                        // Send directly into channel as UDP packets, wrapping data in an Arc.
-                        if let Err(e) = udp_tx.send(Arc::new(packet_chunk.to_vec())) {
-                            log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
-                        }
-                    } else {
-                        #[cfg(feature = "libltntstools_enabled")]
-                        if let Some(ref mut s) = smoother {
-                            if let Err(e) = s.write(&packet_chunk) {
-                                log::error!("HLStoUDP: SenderThread Smoother write error: {}", e);
-                            }
-                        }
-                    }
-                    index += 1;
-                }
-                drop(seg); // drop the segment data
             }
+
+            // Move the received data into our buffer without copying each byte.
+            // Extend the VecDeque with the data from seg.data.
+            if buffer.len() + seg.data.len() > buffer.capacity() {
+                log::warn!(
+                    "HLStoUDP: SenderThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)",
+                    buffer.len(),
+                    seg.data.len()
+                );
+                continue;
+            }
+            buffer.extend(seg.data);
+
+            // Process full TS packets from the buffer, removing data as it is sent.
+            while (pcr_pid > 0 || !use_smoother) && buffer.len() >= TS_PACKET_SIZE {
+                // Drain exactly TS_PACKET_SIZE bytes from the front.
+                let packet_chunk: Vec<u8> = buffer.drain(0..TS_PACKET_SIZE).collect();
+
+                // Feed the packet chunk into the continuity checker.
+                if let Err(e) =
+                    pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
+                {
+                    if e == 0xFFFF {
+                        log::error!(
+                            "HLStoUDP: (ReceiveDownloadSegment) Bad packet ({} bytes) detected, dropping packet. URI: {}",
+                            packet_chunk.len(),
+                            seg.uri);
+                        continue;
+                    } else {
+                        log::error!(
+                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?} in packet from URI: {}",
+                            e,seg.uri);
+                    }
+                }
+
+                if !use_smoother {
+                    // Send the packet directly to the UDP sender thread wrapped in an Arc.
+                    if let Err(e) = udp_tx.send(Arc::new(packet_chunk)) {
+                        log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
+                    }
+                } else {
+                    // If we have a valid PCR PID, create the PcrSmoother
+                    #[cfg(feature = "smoother")]
+                    if smoother.is_none() {
+                        // create the smoother using our cloned callback:
+                        let smoother_callback = {
+                            let cb = udp_callback_arc.clone();
+                            move |v: Vec<u8>| {
+                                (cb)(v);
+                            }
+                        };
+                        smoother = Some(PcrSmoother::new(
+                            pcr_pid,
+                            smoother_buffers,
+                            max_packet_size as i32,
+                            latency,
+                            Box::new(smoother_callback),
+                        ));
+                    }
+                    #[cfg(feature = "smoother")]
+                    if let Some(ref mut s) = smoother {
+                        if let Err(e) = s.write(&packet_chunk) {
+                            log::error!("HLStoUDP: SenderThread Smoother write error: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // If we have not yet determined a valid PCR PID,
+            // keep the data in the buffer for later processing.
         }
 
         // Cleanup
         if use_smoother {
-            #[cfg(feature = "libltntstools_enabled")]
+            #[cfg(feature = "smoother")]
             if let Some(m) = model.take() {
                 log::warn!("HLStoUDP: SenderThread Dropping unused StreamModel on exit.");
                 drop(m);
             }
-            #[cfg(feature = "libltntstools_enabled")]
+            #[cfg(feature = "smoother")]
             if let Some(s) = smoother.take() {
                 log::warn!("HLStoUDP: SenderThread Dropping smoother on exit.");
                 drop(s);
@@ -1094,9 +1131,9 @@ fn main() -> Result<()> {
         .parse::<u64>()
         .unwrap_or(0);
     let vod = matches.get_flag("vod");
-    #[cfg(not(feature = "libltntstools_enabled"))]
+    #[cfg(not(feature = "smoother"))]
     let mut use_smoother = matches.get_flag("use_smoother");
-    #[cfg(feature = "libltntstools_enabled")]
+    #[cfg(feature = "smoother")]
     let use_smoother = matches.get_flag("use_smoother");
     let max_bytes_threshold = matches
         .get_one::<String>("max_bytes_threshold")
@@ -1185,11 +1222,11 @@ fn main() -> Result<()> {
     }
     println!("HLStoUDP: Logging initialized. Starting main()...");
 
-    #[cfg(feature = "libltntstools_enabled")]
+    #[cfg(feature = "smoother")]
     {
         log::warn!("HLStoUDP: LibLTNTSTools enabled.");
     }
-    #[cfg(not(feature = "libltntstools_enabled"))]
+    #[cfg(not(feature = "smoother"))]
     {
         log::warn!("HLStoUDP: LibLTNTSTools disabled.");
         if use_smoother {
@@ -1201,7 +1238,7 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
-    let dl_handle = receiver_thread(
+    let receiver_handle = receiver_thread(
         m3u8_url,
         start_time,
         end_time,
@@ -1212,7 +1249,7 @@ fn main() -> Result<()> {
         shutdown_flag.clone(),
         tx_shutdown.clone(),
     );
-    let _sender_handle = sender_thread(
+    let sender_handle = sender_thread(
         udp_out,
         latency,
         pcr_pid,
@@ -1242,12 +1279,11 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("Main: Waiting for downloader thread to exit...");
-    dl_handle.join().unwrap();
+    log::info!("Main: Waiting for sender thread to exit...");
+    sender_handle.join().unwrap();
 
-    // FIXME: This is causing a deadlock, need to figure out why
-    //log::info!("Main: Waiting for sender thread to exit...");
-    //sender_handle.join().unwrap();
+    println!("Main: Waiting for receiver thread to exit...");
+    receiver_handle.join().unwrap();
 
     println!("HLStoUDP: Main thread exiting.");
     Ok(())
