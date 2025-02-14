@@ -401,8 +401,8 @@ fn receiver_thread(
 
             if vod || media_pl.end_list {
                 log::warn!("HLStoUDP: ReceiverThread ENDLIST found => done downloading.");
-                if vod {
-                    break;
+                while !shutdown_flag.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(poll_interval_ms));
                 }
             }
 
