@@ -546,7 +546,7 @@ fn sender_thread(
         let min_packet_size = min_pkt_size as usize;
         let max_packet_size = pkt_size as usize;
 
-        let frame_time_micros = 10; // N micros per 188 byte packet
+        let mut frame_time_micros = 10; // N micros per 188 byte packet
         let wait_time_micros = 1000; // 1ms wait time when blocking
 
         let capture_start_time = Instant::now();
@@ -595,6 +595,7 @@ fn sender_thread(
                         // Attempt to send this data to UDP
                         let buffer_start_time = Instant::now();
                         let mut index = 0;
+                        let mut last_packet_send_time = Instant::now();
 
                         while buffer.len() >= min_packet_size {
                             // Determine the packet size to send (up to max_packet_size, aligned on TS_PACKET_SIZE)
@@ -649,9 +650,26 @@ fn sender_thread(
                                     total_bytes_dropped
                                 );
 
+                                /* get current bitrate and adjust frame_time_micros to keep bitrate from bursting */
+                                let elapsed = last_packet_send_time.elapsed();
+                                let elapsed_micros = elapsed.as_micros();
+                                if elapsed_micros > 0 {
+                                    let sent_bps =
+                                        (chunk.len() as u32 * 8 * 1000000) / elapsed_micros as u32;
+                                    log::debug!(
+                                        "HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.",
+                                        chunk.len(),
+                                        elapsed_micros,
+                                        sent_bps
+                                    );
+                                    // Adjust frame_time_micros to keep bitrate from bursting
+                                    frame_time_micros =
+                                        (chunk.len() as u32 * 8 * 1000000) / sent_bps;
+                                }
+
                                 // calculate how long we should sleep to maintain a constant rate
-                                let sleep_time_micros: u64 =
-                                    (chunk.len() / TS_PACKET_SIZE) as u64 * frame_time_micros;
+                                let sleep_time_micros: u64 = (chunk.len() / TS_PACKET_SIZE) as u64
+                                    * frame_time_micros as u64;
 
                                 match sock_clone.send(&chunk) {
                                     Ok(bytes_sent) => {
@@ -673,9 +691,14 @@ fn sender_thread(
                                             continue;
                                         }
                                         total_bytes_sent += chunk.len();
-                                        if !use_smoother {
-                                            thread::sleep(Duration::from_micros(sleep_time_micros));
+                                        /* check last send time and calculate packet time left to wait */
+                                        let elapsed = last_packet_send_time.elapsed();
+                                        if elapsed < Duration::from_micros(sleep_time_micros) {
+                                            let sleep_time =
+                                                Duration::from_micros(sleep_time_micros) - elapsed;
+                                            thread::sleep(sleep_time);
                                         }
+                                        last_packet_send_time = Instant::now();
                                         break;
                                     }
                                     Err(e) => {
