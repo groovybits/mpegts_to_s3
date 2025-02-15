@@ -396,6 +396,11 @@ fn receiver_thread(
                     tx_shutdown.send(()).ok();
                     return;
                 }
+                /* sleep duration of segment */
+                if vod {
+                    thread::sleep(Duration::from_millis((seg.duration * 1000.0) as u64));
+                }
+
                 next_seg_id += 1;
             }
 
