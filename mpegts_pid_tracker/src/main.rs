@@ -47,6 +47,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::io::Read;
+    use mpegts_pid_tracker::PidTracker;
 
     #[test]
     fn test_pid_tracker() {

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
-use hls_to_udp::{PidTracker, TS_PACKET_SIZE};
+use mpegts_pid_tracker::{PidTracker, TS_PACKET_SIZE};
 #[cfg(feature = "smoother")]
 use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};

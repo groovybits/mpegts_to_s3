@@ -16,6 +16,7 @@ pub const PID_NULL: u16 = 0x1FFF;
 ///
 /// ```rust
 /// use std::collections::HashMap;
+/// use mpegts_pid_tracker::PidTracker;
 ///
 /// // Create a new mapping for PID continuity counters.
 /// let mut continuity_map = HashMap::new();
@@ -33,7 +34,7 @@ pub const PID_NULL: u16 = 0x1FFF;
 /// Additional manipulation of the tracker can involve updating or adding new PID values.
 /// This structure serves as a foundation for more advanced packet tracking and processing logic.
 pub struct PidTracker {
-    continuity: HashMap<u16, u8>,
+    pub continuity: HashMap<u16, u8>,
 }
 
 /// Implementation of the `PidTracker` struct.
