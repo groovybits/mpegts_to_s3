@@ -456,6 +456,7 @@ struct ManualSegmenter {
     diskless_buffer: Arc<Mutex<DisklessBuffer>>,
 
     segment_open_time: Option<Instant>,
+    segment_start_time: Option<chrono::DateTime<chrono::Local>>,
     bytes_this_segment: u64,
     last_measured_bitrate: f64,
 
@@ -484,6 +485,7 @@ impl ManualSegmenter {
             playlist_entries: Vec::new(),
             diskless_buffer: Arc::new(Mutex::new(DisklessBuffer::new(0))),
             segment_open_time: None,
+            segment_start_time: None,
             bytes_this_segment: 0,
             last_measured_bitrate: 0.0,
             current_segment_buffer: Vec::new(),
@@ -546,6 +548,7 @@ impl ManualSegmenter {
 
         if self.segment_open_time.is_none() {
             self.segment_open_time = Some(Instant::now());
+            self.segment_start_time = Some(chrono::Local::now());
         }
 
         self.current_segment_buffer.extend_from_slice(data);
@@ -712,6 +715,8 @@ impl ManualSegmenter {
 
         self.segment_index += 1;
 
+        self.segment_start_time = None;
+
         if let Err(e) = self.rewrite_m3u8() {
             warn!("Error rewriting m3u8: {:?}", e);
         }
@@ -833,8 +838,9 @@ impl ManualSegmenter {
     }
 
     fn current_segment_path(&self, index: u64) -> PathBuf {
-        use chrono::Local;
-        let now = Local::now();
+        let now = self
+            .segment_start_time
+            .unwrap_or_else(|| chrono::Local::now());
         let year = now.format("%Y").to_string();
         let month = now.format("%m").to_string();
         let day = now.format("%d").to_string();

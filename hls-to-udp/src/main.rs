@@ -339,7 +339,6 @@ fn receiver_thread(
                                 log::debug!(
                                     "HLStoUDP: VOD mode: finished processing required time range."
                                 );
-                                shutdown_flag.store(true, Ordering::SeqCst);
                             }
                             break;
                         }
@@ -349,7 +348,11 @@ fn receiver_thread(
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
                     Err(e) => {
-                        log::error!("HLStoUDP: ReceiverThread Bad segment URL: {}", e);
+                        log::error!(
+                            "HLStoUDP: ReceiverThread Bad segment URL: {} for url {}",
+                            e,
+                            uri
+                        );
                         continue;
                     }
                 };
@@ -359,25 +362,34 @@ fn receiver_thread(
                     seg_url
                 );
 
-                let seg_bytes = match client.get(seg_url).send() {
+                let seg_bytes = match client.get(seg_url.clone()).send() {
                     Ok(resp) => {
                         if !resp.status().is_success() {
                             log::error!(
-                                "HLStoUDP: ReceiverThread Segment fetch error: {}",
-                                resp.status()
+                                "HLStoUDP: ReceiverThread Segment fetch error: {} for url {}",
+                                resp.status(),
+                                seg_url
                             );
                             continue;
                         }
                         match resp.bytes() {
                             Ok(b) => b.to_vec(),
                             Err(e) => {
-                                log::error!("HLStoUDP: ReceiverThread Segment read err: {}", e);
+                                log::error!(
+                                    "HLStoUDP: ReceiverThread Segment read err: {} for url {}",
+                                    e,
+                                    seg_url
+                                );
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        log::error!("HLStoUDP: ReceiverThread Segment request error: {}", e);
+                        log::error!(
+                            "HLStoUDP: ReceiverThread Segment request error: {} for url {}",
+                            e,
+                            seg_url
+                        );
                         continue;
                     }
                 };
@@ -394,17 +406,23 @@ fn receiver_thread(
                     tx_shutdown.send(()).ok();
                     return;
                 }
+                /* sleep duration of segment */
+                if vod {
+                    thread::sleep(Duration::from_millis((seg.duration * 1000.0) as u64));
+                }
+
                 next_seg_id += 1;
             }
 
-            if vod || media_pl.end_list {
+            if media_pl.end_list {
                 log::warn!("HLStoUDP: ReceiverThread ENDLIST found => done downloading.");
-                if vod {
-                    break;
-                }
+                break;
+            } else if vod {
+                log::warn!("HLStoUDP: ReceiverThread VOD mode: done downloading.");
+                break;
+            } else {
+                thread::sleep(Duration::from_millis(poll_interval_ms));
             }
-
-            thread::sleep(Duration::from_millis(poll_interval_ms));
         }
     })
 }
@@ -512,7 +530,7 @@ fn sender_thread(
         let min_packet_size = min_pkt_size as usize;
         let max_packet_size = pkt_size as usize;
 
-        let frame_time_micros = 10; // N micros per 188 byte packet
+        let mut frame_time_micros = 10; // N micros per 188 byte packet
         let wait_time_micros = 1000; // 1ms wait time when blocking
 
         let capture_start_time = Instant::now();
@@ -561,6 +579,7 @@ fn sender_thread(
                         // Attempt to send this data to UDP
                         let buffer_start_time = Instant::now();
                         let mut index = 0;
+                        let mut last_packet_send_time = Instant::now();
 
                         while buffer.len() >= min_packet_size {
                             // Determine the packet size to send (up to max_packet_size, aligned on TS_PACKET_SIZE)
@@ -615,9 +634,26 @@ fn sender_thread(
                                     total_bytes_dropped
                                 );
 
+                                /* get current bitrate and adjust frame_time_micros to keep bitrate from bursting */
+                                let elapsed = last_packet_send_time.elapsed();
+                                let elapsed_micros = elapsed.as_micros();
+                                if elapsed_micros > 0 {
+                                    let sent_bps =
+                                        (chunk.len() as u32 * 8 * 1000000) / elapsed_micros as u32;
+                                    log::debug!(
+                                        "HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.",
+                                        chunk.len(),
+                                        elapsed_micros,
+                                        sent_bps
+                                    );
+                                    // Adjust frame_time_micros to keep bitrate from bursting
+                                    frame_time_micros =
+                                        (chunk.len() as u32 * 8 * 1000000) / sent_bps;
+                                }
+
                                 // calculate how long we should sleep to maintain a constant rate
-                                let sleep_time_micros: u64 =
-                                    (chunk.len() / TS_PACKET_SIZE) as u64 * frame_time_micros;
+                                let sleep_time_micros: u64 = (chunk.len() / TS_PACKET_SIZE) as u64
+                                    * frame_time_micros as u64;
 
                                 match sock_clone.send(&chunk) {
                                     Ok(bytes_sent) => {
@@ -639,9 +675,14 @@ fn sender_thread(
                                             continue;
                                         }
                                         total_bytes_sent += chunk.len();
-                                        if !use_smoother {
-                                            thread::sleep(Duration::from_micros(sleep_time_micros));
+                                        /* check last send time and calculate packet time left to wait */
+                                        let elapsed = last_packet_send_time.elapsed();
+                                        if elapsed < Duration::from_micros(sleep_time_micros) {
+                                            let sleep_time =
+                                                Duration::from_micros(sleep_time_micros) - elapsed;
+                                            thread::sleep(sleep_time);
                                         }
+                                        last_packet_send_time = Instant::now();
                                         break;
                                     }
                                     Err(e) => {
