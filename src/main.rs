@@ -730,7 +730,7 @@ impl ManualSegmenter {
                     .put_object()
                     .bucket(bucket_name)
                     .key(&s3_key)
-                    .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+                    //.acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
                     .body(ByteStream::from_path(&local_m3u8).await?)
                     .send()
                     .await
