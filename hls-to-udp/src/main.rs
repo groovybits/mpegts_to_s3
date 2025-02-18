@@ -668,7 +668,7 @@ fn sender_thread(
                                 let elapsed_micros = elapsed.as_micros();
                                 if elapsed_micros > 0 {
                                     let sent_bps =
-                                        (chunk.len() as u32 * 8 * 1000000) / elapsed_micros as u32;
+                                        (chunk.len() as u64 * 8 * 1000000) / elapsed_micros as u64;
                                     log::debug!(
                                         "HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.",
                                         chunk.len(),
@@ -676,8 +676,10 @@ fn sender_thread(
                                         sent_bps
                                     );
                                     // Adjust frame_time_micros to keep bitrate from bursting
-                                    frame_time_micros =
-                                        (chunk.len() as u32 * 8 * 1000000) / sent_bps;
+                                    if sent_bps > 0 {
+                                        frame_time_micros =
+                                            (chunk.len() as u64 * 8 * 1000000) / sent_bps;
+                                    }
                                 }
 
                                 // calculate how long we should sleep to maintain a constant rate
