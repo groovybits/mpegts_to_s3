@@ -410,7 +410,7 @@ fn receiver_thread(
                 }
                 /* sleep duration of segment */
                 if vod {
-                    thread::sleep(Duration::from_millis((seg.duration * 1000.0) as u64));
+                    thread::sleep(Duration::from_millis(((seg.duration * 1000.0) * 0.80) as u64));
                 }
 
                 next_seg_id += 1;
@@ -708,7 +708,7 @@ fn sender_thread(
                                         total_bytes_sent += chunk.len();
                                         /* check last send time and calculate packet time left to wait */
                                         let elapsed = last_packet_send_time.elapsed();
-                                        if elapsed < Duration::from_micros(sleep_time_micros) {
+                                        if ! vod && elapsed < Duration::from_micros(sleep_time_micros) {
                                             let sleep_time =
                                                 Duration::from_micros(sleep_time_micros) - elapsed;
                                             thread::sleep(sleep_time);
