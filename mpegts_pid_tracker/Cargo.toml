@@ -11,6 +11,9 @@ homepage = "https://github.com/groovybits/mpegts_to_s3/mpegts_pid_tracker"
 repository = "https://github.com/groovybits/mpegts_to_s3/mpegts_pid_tracker"
 authors = ["groovybits"]
 
+[lib]
+path = "src/lib.rs"
+
 # Build release optimized with debug info
 [profile.release]
 opt-level = 3
