@@ -341,7 +341,6 @@ fn receiver_thread(
                                 log::debug!(
                                     "HLStoUDP: VOD mode: finished processing required time range."
                                 );
-                                //shutdown_flag.store(true, Ordering::SeqCst);
                             }
                             break;
                         }
@@ -351,7 +350,11 @@ fn receiver_thread(
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
                     Err(e) => {
-                        log::error!("HLStoUDP: ReceiverThread Bad segment URL: {} for url {}", e, uri);
+                        log::error!(
+                            "HLStoUDP: ReceiverThread Bad segment URL: {} for url {}",
+                            e,
+                            uri
+                        );
                         continue;
                     }
                 };
@@ -366,20 +369,29 @@ fn receiver_thread(
                         if !resp.status().is_success() {
                             log::error!(
                                 "HLStoUDP: ReceiverThread Segment fetch error: {} for url {}",
-                                resp.status(), seg_url
+                                resp.status(),
+                                seg_url
                             );
                             continue;
                         }
                         match resp.bytes() {
                             Ok(b) => b.to_vec(),
                             Err(e) => {
-                                log::error!("HLStoUDP: ReceiverThread Segment read err: {} for url {}", e, seg_url);
+                                log::error!(
+                                    "HLStoUDP: ReceiverThread Segment read err: {} for url {}",
+                                    e,
+                                    seg_url
+                                );
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        log::error!("HLStoUDP: ReceiverThread Segment request error: {} for url {}", e, seg_url);
+                        log::error!(
+                            "HLStoUDP: ReceiverThread Segment request error: {} for url {}",
+                            e,
+                            seg_url
+                        );
                         continue;
                     }
                 };
@@ -404,14 +416,15 @@ fn receiver_thread(
                 next_seg_id += 1;
             }
 
-            if vod || media_pl.end_list {
+            if media_pl.end_list {
                 log::warn!("HLStoUDP: ReceiverThread ENDLIST found => done downloading.");
-                while !shutdown_flag.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(poll_interval_ms));
-                }
+                break;
+            } else if vod {
+                log::warn!("HLStoUDP: ReceiverThread VOD mode: done downloading.");
+                break;
+            } else {
+                thread::sleep(Duration::from_millis(poll_interval_ms));
             }
-
-            thread::sleep(Duration::from_millis(poll_interval_ms));
         }
     })
 }
