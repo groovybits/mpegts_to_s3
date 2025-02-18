@@ -341,7 +341,7 @@ fn receiver_thread(
                                 log::debug!(
                                     "HLStoUDP: VOD mode: finished processing required time range."
                                 );
-                                shutdown_flag.store(true, Ordering::SeqCst);
+                                //shutdown_flag.store(true, Ordering::SeqCst);
                             }
                             break;
                         }
@@ -351,7 +351,7 @@ fn receiver_thread(
                 let seg_url = match resolve_segment_url(&base_url, uri) {
                     Ok(u) => u,
                     Err(e) => {
-                        log::error!("HLStoUDP: ReceiverThread Bad segment URL: {}", e);
+                        log::error!("HLStoUDP: ReceiverThread Bad segment URL: {} for url {}", e, uri);
                         continue;
                     }
                 };
@@ -361,25 +361,25 @@ fn receiver_thread(
                     seg_url
                 );
 
-                let seg_bytes = match client.get(seg_url).send() {
+                let seg_bytes = match client.get(seg_url.clone()).send() {
                     Ok(resp) => {
                         if !resp.status().is_success() {
                             log::error!(
-                                "HLStoUDP: ReceiverThread Segment fetch error: {}",
-                                resp.status()
+                                "HLStoUDP: ReceiverThread Segment fetch error: {} for url {}",
+                                resp.status(), seg_url
                             );
                             continue;
                         }
                         match resp.bytes() {
                             Ok(b) => b.to_vec(),
                             Err(e) => {
-                                log::error!("HLStoUDP: ReceiverThread Segment read err: {}", e);
+                                log::error!("HLStoUDP: ReceiverThread Segment read err: {} for url {}", e, seg_url);
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        log::error!("HLStoUDP: ReceiverThread Segment request error: {}", e);
+                        log::error!("HLStoUDP: ReceiverThread Segment request error: {} for url {}", e, seg_url);
                         continue;
                     }
                 };
