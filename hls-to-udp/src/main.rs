@@ -67,6 +67,7 @@ fn receiver_thread(
     start_time: u64,
     end_time: u64,
     poll_interval_ms: u64,
+    drop_corrupt_ts: bool,
     hist_capacity: usize,
     vod: bool,
     tx: SyncSender<DownloadedSegment>,
@@ -85,6 +86,8 @@ fn receiver_thread(
         let mut seg_history = SegmentHistory::new(hist_capacity);
         let mut next_seg_id: usize = 1;
         let mut first_poll = if vod { false } else { true };
+
+        let mut pid_tracker = PidTracker::new();
 
         // Main loop
         loop {
@@ -397,6 +400,33 @@ fn receiver_thread(
                     }
                 };
 
+                // if set to drop corrupt TS packets, check the segment for errors
+                if drop_corrupt_ts {
+                    let mut index = 0;
+                    for packet_chunk in seg_bytes.chunks(TS_PACKET_SIZE) {
+                        if let Err(e) =
+                            pid_tracker.process_packet("Receiver".to_string(), packet_chunk)
+                        {
+                            if e == 0xFFFF {
+                                log::error!(
+                                    "HLStoUDP: (Receiver) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.",
+                                    packet_chunk.len(),
+                                    index,
+                                    seg_bytes.len() / TS_PACKET_SIZE,
+                                    seg_bytes.len()
+                                );
+                                break;
+                            } else {
+                                log::error!(
+                                    "HLStoUDP: (Receiver) Error processing TS packet: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                        index += 1;
+                    }
+                }
+
                 let seg_struct = DownloadedSegment {
                     id: next_seg_id,
                     data: seg_bytes,
@@ -443,6 +473,7 @@ fn sender_thread(
     udp_queue_size: usize,
     udp_send_buffer: usize,
     use_smoother: bool,
+    drop_corrupt_ts: bool,
     vod: bool,
     output_file: String,
     rx: mpsc::Receiver<DownloadedSegment>,
@@ -638,26 +669,28 @@ fn sender_thread(
                                 }
                             };
 
-                            // Check each TS packet for continuity errors
-                            for packet_chunk in chunk.as_ref().chunks(TS_PACKET_SIZE) {
-                                if let Err(e) = pid_tracker
-                                    .process_packet("UDPsender".to_string(), packet_chunk)
-                                {
-                                    if e == 0xFFFF {
-                                        log::error!(
+                            if drop_corrupt_ts {
+                                // Check each TS packet for continuity errors
+                                for packet_chunk in chunk.as_ref().chunks(TS_PACKET_SIZE) {
+                                    if let Err(e) = pid_tracker
+                                        .process_packet("UDPsender".to_string(), packet_chunk)
+                                    {
+                                        if e == 0xFFFF {
+                                            log::error!(
                                             "HLStoUDP: (UDPSender) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.",
                                             packet_chunk.len(),
                                             index,
                                             chunk.as_ref().len() / TS_PACKET_SIZE,
                                             chunk.as_ref().len()
                                         );
-                                        index += 1;
-                                        continue;
-                                    } else {
-                                        log::error!(
+                                            index += 1;
+                                            continue;
+                                        } else {
+                                            log::error!(
                                             "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
                                             e
                                         );
+                                        }
                                     }
                                 }
                             }
@@ -1196,11 +1229,18 @@ fn main() -> Result<()> {
                 .help("Suppress all non error output")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("drop_corrupt_ts")
+                .long("drop-corrupt-ts")
+                .help("Drop corrupt TS packets")
+                .action(ArgAction::SetTrue),
+        )
         .get_matches();
 
     log::debug!("HLStoUDP: Command-line arguments parsed: {:?}", matches);
     println!("HLStoUDP: version: {}", get_version());
 
+    let drop_corrupt_ts = matches.get_flag("drop_corrupt_ts");
     let quiet = matches.get_flag("quiet");
     let output_file = matches.get_one::<String>("output_file").unwrap().clone();
     let start_time = matches
@@ -1326,6 +1366,7 @@ fn main() -> Result<()> {
         start_time,
         end_time,
         poll_ms,
+        drop_corrupt_ts.clone(),
         hist_cap,
         vod.clone(),
         tx,
@@ -1343,6 +1384,7 @@ fn main() -> Result<()> {
         udp_queue_size,
         udp_send_buffer,
         use_smoother,
+        drop_corrupt_ts.clone(),
         vod,
         output_file,
         rx,
