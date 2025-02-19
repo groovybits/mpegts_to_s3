@@ -836,19 +836,17 @@ fn sender_thread(
         #[cfg(feature = "smoother")]
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
-        // Create a PidTracker to track PIDs and Continuity Counter Errors
-        let mut pid_tracker = PidTracker::new();
-
         // vecdec buffer to hold UDP packets while we are detecting the stream model PCR PID
         let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
 
         // Process each downloaded segment from the receiver thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
-                "HLStoUDP: SenderThread Segment #{} => {} bytes, {} sec",
+                "HLStoUDP: SenderThread Segment #{} => {} bytes, {} sec, URI: {}",
                 seg.id,
                 seg.data.len(),
-                seg.duration
+                seg.duration,
+                seg.uri
             );
 
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -915,26 +913,9 @@ fn sender_thread(
             buffer.extend(seg.data);
 
             // Process full TS packets from the buffer, removing data as it is sent.
-            while (pcr_pid > 0 || !use_smoother) && buffer.len() >= TS_PACKET_SIZE {
+            while (pcr_pid > 0 || !use_smoother) && buffer.len() >= min_packet_size {
                 // Drain exactly TS_PACKET_SIZE bytes from the front.
-                let packet_chunk: Vec<u8> = buffer.drain(0..TS_PACKET_SIZE).collect();
-
-                // Feed the packet chunk into the continuity checker.
-                if let Err(e) =
-                    pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
-                {
-                    if e == 0xFFFF {
-                        log::error!(
-                            "HLStoUDP: (ReceiveDownloadSegment) Bad packet ({} bytes) detected, dropping packet. URI: {}",
-                            packet_chunk.len(),
-                            seg.uri);
-                        continue;
-                    } else {
-                        log::error!(
-                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?} in packet from URI: {}",
-                            e,seg.uri);
-                    }
-                }
+                let packet_chunk: Vec<u8> = buffer.drain(0..min_packet_size).collect();
 
                 if !use_smoother {
                     // Send the packet directly to the UDP sender thread wrapped in an Arc.
