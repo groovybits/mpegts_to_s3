@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
@@ -554,7 +555,7 @@ fn sender_thread(
         let sock = Arc::new(sock); // Wrap in Arc for thread safety
 
         // --- Channels for the Smoother callback => UDP send thread
-        let (udp_tx, udp_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(udp_queue_size);
+        let (udp_tx, udp_rx) = mpsc::sync_channel::<Bytes>(udp_queue_size);
 
         // To avoid moved value errors, clone the channel senders for use in the smoother callback.
         #[cfg(feature = "smoother")]
@@ -562,13 +563,14 @@ fn sender_thread(
             let udp_tx_cloned = udp_tx.clone();
             let tx_shutdown_cloned = tx_shutdown.clone();
             // Wrap the callback in an Arc so we can clone it later when creating the smoother.
+            // Note: the callback must accept Vec<u8> (as required by PcrSmoother)
             Arc::new(move |v: Vec<u8>| {
                 log::debug!(
                     "HLStoUDP: SmootherCallback received buffer with {} bytes for UDP.",
                     v.len()
                 );
-                // Wrap the Vec<u8> in an Arc before sending.
-                if let Err(e) = udp_tx_cloned.send(Arc::new(v)) {
+                // Convert the Vec<u8> into Bytes (which is zero-copy if the inner data is shared)
+                if let Err(e) = udp_tx_cloned.send(Bytes::from(v)) {
                     log::error!(
                         "HLStoUDP SmootherCallback: Failed to send buffer to UDP thread: {}",
                         e
@@ -928,8 +930,16 @@ fn sender_thread(
         #[cfg(feature = "smoother")]
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
+        // Helper to compute total available bytes in our buffer.
+        fn total_available(buffer: &VecDeque<(Bytes, usize)>) -> usize {
+            buffer.iter().map(|(seg, offset)| seg.len() - offset).sum()
+        }
+
+        // -------------------------------------------------------------------------
         // vecdec buffer to hold UDP packets while we are detecting the stream model PCR PID
-        let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
+        // Instead of a VecDeque<u8>, we now keep a VecDeque of (Bytes, offset)
+        // so that we can later produce zero-copy slices.
+        let mut buffer: VecDeque<(Bytes, usize)> = VecDeque::new();
 
         // Process each downloaded segment from the receiver thread
         while let Ok(seg) = rx.recv() {
@@ -950,8 +960,7 @@ fn sender_thread(
             #[cfg(feature = "smoother")]
             if pcr_pid == 0 && use_smoother {
                 if let Some(ref mut m) = model {
-                    // Write the seg.data to the model without copying: note that
-                    // seg.data is later moved into our buffer.
+                    // Write the seg.data to the model without copying:
                     let _ = m.write(&seg.data);
                     // Check whether a new PID was detected
                     if let Ok(detected) = pcr_rx.try_recv() {
@@ -992,58 +1001,116 @@ fn sender_thread(
                 }
             }
 
-            // Move the received data into our buffer without copying each byte.
-            // Extend the VecDeque with the data from seg.data.
-            if buffer.len() + seg.data.len() > buffer.capacity() {
-                log::warn!(
-                    "HLStoUDP: SenderThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)",
-                    buffer.len(),
-                    seg.data.len()
-                );
-                continue;
-            }
-            buffer.extend(seg.data);
+            // Instead of copying the bytes into a VecDeque<u8>,
+            // we convert seg.data (a Vec<u8>) into a Bytes object and push it into our buffer.
+            // This is zero copy: the underlying allocation is now shared.
+            let bytes_seg = Bytes::from(seg.data);
+            buffer.push_back((bytes_seg, 0));
 
             // Process full TS packets from the buffer, removing data as it is sent.
-            while (pcr_pid > 0 || !use_smoother) && buffer.len() >= min_packet_size {
-                // Drain exactly min_packet_size bytes from the front.
-                let packet_chunk: Vec<u8> = buffer.drain(0..min_packet_size).collect();
+            // We check that there is enough data across our segments.
+            while (pcr_pid > 0 || !use_smoother) && total_available(&buffer) >= min_packet_size {
+                // Check if the next TS packet is contained entirely in the first segment.
+                if let Some((first_seg, ref mut offset)) = buffer.front_mut() {
+                    if first_seg.len() - *offset >= min_packet_size {
+                        // Zero-copy: create a subslice of the Bytes.
+                        let ts_packet = first_seg.slice(*offset..*offset + min_packet_size);
+                        *offset += min_packet_size;
+                        if *offset == first_seg.len() {
+                            buffer.pop_front();
+                        }
 
-                if !use_smoother {
-                    // Send the packet directly to the UDP sender thread wrapped in an Arc.
-                    if let Err(e) = udp_tx.send(Arc::new(packet_chunk)) {
-                        log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
-                    }
-                } else {
-                    // If we have a valid PCR PID, create the PcrSmoother
-                    #[cfg(feature = "smoother")]
-                    if smoother.is_none() {
-                        // create the smoother using our cloned callback:
-                        let smoother_callback = {
-                            let cb = udp_callback_arc.clone();
-                            move |v: Vec<u8>| {
-                                (cb)(v);
+                        if !use_smoother {
+                            // Send the packet directly to the UDP sender thread.
+                            if let Err(e) = udp_tx.send(ts_packet.clone()) {
+                                log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
                             }
-                        };
-                        smoother = Some(PcrSmoother::new(
-                            pcr_pid,
-                            smoother_buffers,
-                            max_packet_size as i32,
-                            latency,
-                            Box::new(smoother_callback),
-                        ));
-                    }
-                    #[cfg(feature = "smoother")]
-                    if let Some(ref mut s) = smoother {
-                        if let Err(e) = s.write(&packet_chunk) {
-                            log::error!("HLStoUDP: SenderThread Smoother write error: {}", e);
+                        } else {
+                            #[cfg(feature = "smoother")]
+                            {
+                                if smoother.is_none() {
+                                    // create the smoother using our cloned callback:
+                                    let smoother_callback = {
+                                        let cb = udp_callback_arc.clone();
+                                        move |v: Vec<u8>| {
+                                            (cb)(v);
+                                        }
+                                    };
+                                    smoother = Some(PcrSmoother::new(
+                                        pcr_pid,
+                                        smoother_buffers,
+                                        max_packet_size as i32,
+                                        latency,
+                                        Box::new(smoother_callback),
+                                    ));
+                                }
+                                if let Some(ref mut s) = smoother {
+                                    if let Err(e) = s.write(ts_packet.as_ref()) {
+                                        log::error!(
+                                            "HLStoUDP: SenderThread Smoother write error: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // The next TS packet spans segments.
+                        // Fall back to copying the required bytes.
+                        let mut temp = Vec::with_capacity(min_packet_size);
+                        let mut remaining = min_packet_size;
+                        while remaining > 0 {
+                            if let Some((seg, ref mut seg_offset)) = buffer.front_mut() {
+                                let available = seg.len() - *seg_offset;
+                                let to_take = available.min(remaining);
+                                temp.extend_from_slice(&seg[*seg_offset..*seg_offset + to_take]);
+                                *seg_offset += to_take;
+                                remaining -= to_take;
+                                if *seg_offset == seg.len() {
+                                    buffer.pop_front();
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        let ts_packet = Bytes::from(temp);
+                        if !use_smoother {
+                            if let Err(e) = udp_tx.send(ts_packet.clone()) {
+                                log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
+                            }
+                        } else {
+                            #[cfg(feature = "smoother")]
+                            {
+                                if smoother.is_none() {
+                                    let smoother_callback = {
+                                        let cb = udp_callback_arc.clone();
+                                        move |v: Vec<u8>| {
+                                            (cb)(v);
+                                        }
+                                    };
+                                    smoother = Some(PcrSmoother::new(
+                                        pcr_pid,
+                                        smoother_buffers,
+                                        max_packet_size as i32,
+                                        latency,
+                                        Box::new(smoother_callback),
+                                    ));
+                                }
+                                if let Some(ref mut s) = smoother {
+                                    if let Err(e) = s.write(ts_packet.as_ref()) {
+                                        log::error!(
+                                            "HLStoUDP: SenderThread Smoother write error: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-
             // If we have not yet determined a valid PCR PID,
-            // keep the data in the buffer for later processing.
+            // we keep the data in the buffer for later processing.
         }
 
         // Cleanup
