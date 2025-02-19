@@ -1,6 +1,6 @@
 [package]
 name = "hls-to-udp"
-version = "1.0.20"
+version = "1.0.21"
 edition = "2021"
 description = "HLS VOD to MPEG-TS UDP Re-cast."
 keywords = ["mpegts", "s3", "hls", "udp"]
@@ -10,9 +10,6 @@ license = "MIT"
 homepage = "https://github.com/groovybits/mpegts_to_s3/hls-to-udp"
 repository = "https://github.com/groovybits/mpegts_to_s3/hls-to-udp"
 authors = ["groovybits"]
-
-[lib]
-path = "src/lib.rs"
 
 # Build release optimized with debug info
 [profile.release]
@@ -29,4 +26,5 @@ reqwest = { version = "0.11", features = ["blocking"] }
 url = "2.2"
 socket2 = "0.5.8"
 ctrlc = "3.4.5"
+mpegts_pid_tracker = "1.0.2"
 

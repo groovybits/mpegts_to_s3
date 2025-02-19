@@ -1,6 +1,6 @@
 [package]
 name = "udp-to-hls"
-version = "1.0.20"
+version = "1.0.21"
 description = "UDP MpegTS to HLS VOD for UDP MpegTS Re-Stream"
 keywords = ["mpegts", "s3", "hls", "udp"]
 categories = ["command-line-utilities"]
@@ -10,9 +10,6 @@ homepage = "https://github.com/groovybits/mpegts_to_s3"
 repository = "https://github.com/groovybits/mpegts_to_s3"
 authors = ["groovybits"]
 edition = "2021"
-
-[lib]
-path = "src/lib.rs"
 
 # Build release optimized with debug info
 [profile.release]
@@ -37,3 +34,4 @@ env_logger = "0.11.6"
 libc = "0.2.169"
 ctrlc = "3.4.5"
 hex = "0.4.3"
+mpegts_pid_tracker = "1.0.2"

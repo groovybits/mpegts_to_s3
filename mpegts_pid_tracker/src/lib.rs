@@ -3,10 +3,69 @@ use std::collections::HashMap;
 pub const TS_PACKET_SIZE: usize = 188;
 pub const PID_NULL: u16 = 0x1FFF;
 
+/// Represents a tracker for MPEG-TS packet identifier (PID) continuity counters.
+///
+/// The `PidTracker` maintains a mapping between PIDs (as `u16`)
+/// and their corresponding continuity counter values (as `u8`).
+/// This is useful for detecting discontinuities or losses in packet streams,
+/// especially in scenarios involving MPEG-TS packet manipulation and analysis.
+///
+/// # Examples
+///
+/// Basic usage with an initial PID-to-continuity mapping:
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// use mpegts_pid_tracker::PidTracker;
+///
+/// // Create a new mapping for PID continuity counters.
+/// let mut continuity_map = HashMap::new();
+/// continuity_map.insert(256, 10);
+///
+/// // Initialize the PID tracker with the given mapping.
+/// let pid_tracker = PidTracker {
+///     continuity: continuity_map,
+/// };
+///
+/// // Validate that the continuity counter for PID 256 is correctly set.
+/// assert_eq!(pid_tracker.continuity.get(&256), Some(&10));
+/// ```
+///
+/// Additional manipulation of the tracker can involve updating or adding new PID values.
+/// This structure serves as a foundation for more advanced packet tracking and processing logic.
 pub struct PidTracker {
-    continuity: HashMap<u16, u8>,
+    pub continuity: HashMap<u16, u8>,
 }
 
+/// Implementation of the `PidTracker` struct.
+/// This structure maintains a mapping between MPEG-TS packet identifiers (PIDs)
+/// and their corresponding continuity counter values.
+/// The continuity counter is a 4-bit field that increments with each packet,
+/// allowing for the detection of missing or out-of-order packets in a stream.
+/// The `PidTracker` structure provides methods for updating and querying the continuity counters
+/// for specific PIDs, as well as processing individual transport stream (TS) packets to update the counters.
+/// The `process_packet` method is used to update the continuity counter for a given PID based on the contents of a TS packet.
+///     - The method checks for the presence of a payload in the packet and respects the continuity “discontinuity_indicator” in the adaptation field if present.
+///    - It only increments or checks the continuity counter if the packet has a payload.
+///   - If a discontinuity is detected, the continuity counter is reset for that PID.
+/// - The method logs an error and returns an error value containing the PID in case of a continuity mismatch.
+///
+/// # Example
+///
+/// ```rust
+/// use mpegts_pid_tracker::PidTracker;
+///
+/// // Create a new PID tracker.
+/// let mut tracker = PidTracker::new();
+///
+/// // Process a TS packet to update the continuity counter for a PID.
+/// let label = String::from("test.ts");
+/// let packet = [0u8; 188];
+/// if let Err(pid) = tracker.process_packet(label, &packet) {
+///    println!("Error with PID: {}", pid);
+/// }
+/// ```
+///
 impl PidTracker {
     /// Create a new PID tracker.
     pub fn new() -> Self {
