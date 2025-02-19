@@ -1,0 +1,29 @@
+[package]
+name = "mpegts_pid_tracker"
+version = "1.0.2"
+edition = "2021"
+description = "MpegTS Pid Tracker for udp-to-hls and hls-to-udp."
+keywords = ["mpegts"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+license = "MIT"
+homepage = "https://github.com/groovybits/mpegts_to_s3/mpegts_pid_tracker"
+repository = "https://github.com/groovybits/mpegts_to_s3/mpegts_pid_tracker"
+authors = ["groovybits"]
+
+[lib]
+path = "src/lib.rs"
+
+# Build release optimized with debug info
+[profile.release]
+opt-level = 3
+debug = true
+
+# feature flag for libltntstools-sys and libltntstools
+[features]
+default = []
+
+[dependencies]
+log = "0.4.25"
+
+[patch.crates-io]

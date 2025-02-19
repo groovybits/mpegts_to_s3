@@ -30,7 +30,7 @@ use std::sync::{mpsc as std_mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use udp_to_hls::{PidTracker, TS_PACKET_SIZE};
+use mpegts_pid_tracker::{PidTracker, TS_PACKET_SIZE};
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
@@ -730,7 +730,7 @@ impl ManualSegmenter {
                     .put_object()
                     .bucket(bucket_name)
                     .key(&s3_key)
-                    .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+                    //.acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
                     .body(ByteStream::from_path(&local_m3u8).await?)
                     .send()
                     .await

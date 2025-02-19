@@ -2,11 +2,12 @@ use anyhow::{anyhow, Result};
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ctrlc;
 use env_logger;
-use hls_to_udp::{PidTracker, TS_PACKET_SIZE};
 #[cfg(feature = "smoother")]
 use libltntstools::{PcrSmoother, StreamModel};
 use m3u8_rs::{parse_playlist_res, Playlist};
+use mpegts_pid_tracker::{PidTracker, TS_PACKET_SIZE};
 use reqwest::blocking::Client;
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::net::UdpSocket;
@@ -410,7 +411,9 @@ fn receiver_thread(
                 }
                 /* sleep duration of segment */
                 if vod {
-                    thread::sleep(Duration::from_millis((seg.duration * 1000.0) as u64));
+                    thread::sleep(Duration::from_millis(
+                        ((seg.duration * 1000.0) * 0.80) as u64,
+                    ));
                 }
 
                 next_seg_id += 1;
@@ -612,18 +615,31 @@ fn sender_thread(
 
                         while buffer.len() >= min_packet_size {
                             // Determine the packet size to send (up to max_packet_size, aligned on TS_PACKET_SIZE)
+                            let available = buffer.len();
                             let mut packet_size = max_packet_size;
-                            if buffer.len() < max_packet_size {
-                                packet_size = buffer.len();
-                                // Align with TS_PACKET_SIZE boundary.
-                                packet_size = packet_size - (packet_size % TS_PACKET_SIZE);
+                            if available < max_packet_size {
+                                packet_size = available - (available % TS_PACKET_SIZE);
                             }
-                            // Drain exactly packet_size bytes from the front of the VecDeque.
-                            let mut chunk: Vec<u8> = buffer.drain(0..packet_size).collect();
-                            let mut chunk_dropped = false;
+                            if packet_size == 0 {
+                                break;
+                            }
+                            // Zero-copy: obtain a slice from the front of the buffer without draining.
+                            let chunk: Cow<[u8]> = {
+                                let (first, second) = buffer.as_slices();
+                                if first.len() >= packet_size {
+                                    Cow::Borrowed(&first[0..packet_size])
+                                } else {
+                                    // Data is wrapped around; this case is expected to be rare.
+                                    // Fall back to creating a temporary buffer.
+                                    let mut temp = Vec::with_capacity(packet_size);
+                                    temp.extend_from_slice(first);
+                                    temp.extend_from_slice(&second[0..(packet_size - first.len())]);
+                                    Cow::Owned(temp)
+                                }
+                            };
 
                             // Check each TS packet for continuity errors
-                            for packet_chunk in chunk.chunks(TS_PACKET_SIZE) {
+                            for packet_chunk in chunk.as_ref().chunks(TS_PACKET_SIZE) {
                                 if let Err(e) = pid_tracker
                                     .process_packet("UDPsender".to_string(), packet_chunk)
                                 {
@@ -632,16 +648,16 @@ fn sender_thread(
                                             "HLStoUDP: (UDPSender) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.",
                                             packet_chunk.len(),
                                             index,
-                                            chunk.len() / TS_PACKET_SIZE,
-                                            chunk.len()
+                                            chunk.as_ref().len() / TS_PACKET_SIZE,
+                                            chunk.as_ref().len()
                                         );
                                         index += 1;
                                         continue;
                                     } else {
                                         log::error!(
-                                        "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
-                                        e
-                                    );
+                                            "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -657,7 +673,7 @@ fn sender_thread(
                                 };
                                 log::debug!(
                                     "HLStoUDP: UDPThread Sending {} bytes buffer at {} bps (sent={} bytes, dropped={} bytes)",
-                                    chunk.len(),
+                                    chunk.as_ref().len(),
                                     sent_bps,
                                     total_bytes_sent,
                                     total_bytes_dropped
@@ -667,46 +683,95 @@ fn sender_thread(
                                 let elapsed = last_packet_send_time.elapsed();
                                 let elapsed_micros = elapsed.as_micros();
                                 if elapsed_micros > 0 {
-                                    let sent_bps =
-                                        (chunk.len() as u32 * 8 * 1000000) / elapsed_micros as u32;
+                                    let sent_bps = (chunk.as_ref().len() as u64 * 8 * 1000000)
+                                        / elapsed_micros as u64;
                                     log::debug!(
                                         "HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.",
-                                        chunk.len(),
+                                        chunk.as_ref().len(),
                                         elapsed_micros,
                                         sent_bps
                                     );
                                     // Adjust frame_time_micros to keep bitrate from bursting
-                                    frame_time_micros =
-                                        (chunk.len() as u32 * 8 * 1000000) / sent_bps;
+                                    if sent_bps > 0 {
+                                        frame_time_micros =
+                                            (chunk.as_ref().len() as u64 * 8 * 1000000) / sent_bps;
+                                    }
                                 }
 
                                 // calculate how long we should sleep to maintain a constant rate
-                                let sleep_time_micros: u64 = (chunk.len() / TS_PACKET_SIZE) as u64
+                                let sleep_time_micros: u64 = (chunk.as_ref().len() / TS_PACKET_SIZE)
+                                    as u64
                                     * frame_time_micros as u64;
 
-                                match sock_clone.send(&chunk) {
+                                match sock_clone.send(chunk.as_ref()) {
                                     Ok(bytes_sent) => {
                                         log::debug!(
                                             "HLStoUDP: UDPThread Packet of {} bytes sent from a chunk of {} bytes at {} bps.",
                                             bytes_sent,
-                                            chunk.len(),
+                                            chunk.as_ref().len(),
                                             sent_bps
                                         );
-                                        if bytes_sent < chunk.len() {
+                                        if bytes_sent < chunk.as_ref().len() {
                                             log::warn!(
                                                 "HLStoUDP: UDPThread Partial send of {} bytes from a chunk of {} bytes at {} bps.",
                                                 bytes_sent,
-                                                chunk.len(),
+                                                chunk.as_ref().len(),
                                                 sent_bps
                                             );
-                                            // Remove the sent bytes and retry sending the remainder.
-                                            chunk = chunk[bytes_sent..].to_vec();
-                                            continue;
+                                            // Adjust the chunk pointer and retry sending the remainder.
+                                            let mut unsent_offset = bytes_sent;
+                                            while unsent_offset < chunk.as_ref().len() {
+                                                match sock_clone
+                                                    .send(&chunk.as_ref()[unsent_offset..])
+                                                {
+                                                    Ok(n) => {
+                                                        unsent_offset += n;
+                                                    }
+                                                    Err(e) => {
+                                                        if e.kind()
+                                                            == std::io::ErrorKind::WouldBlock
+                                                        {
+                                                            thread::sleep(Duration::from_micros(
+                                                                wait_time_micros,
+                                                            ));
+                                                            continue;
+                                                        } else {
+                                                            total_bytes_dropped +=
+                                                                chunk.as_ref().len();
+                                                            log::error!(
+                                                                "HLStoUDP: UDPThread UDP error: {}. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
+                                                                e,
+                                                                chunk.as_ref().len(),
+                                                                total_bytes_sent,
+                                                                total_bytes_dropped,
+                                                                sent_bps
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            total_bytes_sent += chunk.as_ref().len();
+                                            /* check last send time and calculate packet time left to wait */
+                                            let elapsed = last_packet_send_time.elapsed();
+                                            if !vod
+                                                && elapsed
+                                                    < Duration::from_micros(sleep_time_micros)
+                                            {
+                                                let sleep_time =
+                                                    Duration::from_micros(sleep_time_micros)
+                                                        - elapsed;
+                                                thread::sleep(sleep_time);
+                                            }
+                                            last_packet_send_time = Instant::now();
+                                            break;
                                         }
-                                        total_bytes_sent += chunk.len();
+                                        total_bytes_sent += chunk.as_ref().len();
                                         /* check last send time and calculate packet time left to wait */
                                         let elapsed = last_packet_send_time.elapsed();
-                                        if elapsed < Duration::from_micros(sleep_time_micros) {
+                                        if !vod
+                                            && elapsed < Duration::from_micros(sleep_time_micros)
+                                        {
                                             let sleep_time =
                                                 Duration::from_micros(sleep_time_micros) - elapsed;
                                             thread::sleep(sleep_time);
@@ -719,12 +784,11 @@ fn sender_thread(
                                             let elapsed_ms =
                                                 buffer_start_time.elapsed().as_millis();
                                             if elapsed_ms > max_block_ms as u128 {
-                                                total_bytes_dropped += chunk.len();
-                                                chunk_dropped = true;
+                                                total_bytes_dropped += chunk.as_ref().len();
                                                 log::error!(
                                                     "HLStoUDP: UDPThread Socket still full after {} ms. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
                                                     elapsed_ms,
-                                                    chunk.len(),
+                                                    chunk.as_ref().len(),
                                                     total_bytes_sent,
                                                     total_bytes_dropped,
                                                     sent_bps
@@ -733,16 +797,15 @@ fn sender_thread(
                                             }
                                             log::warn!(
                                                 "HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes, elapsed {} ms, rate {} bps.",
-                                                chunk.len(), elapsed_ms, sent_bps
+                                                chunk.as_ref().len(), elapsed_ms, sent_bps
                                             );
                                             thread::sleep(Duration::from_micros(wait_time_micros));
                                         } else {
-                                            total_bytes_dropped += chunk.len();
-                                            chunk_dropped = true;
+                                            total_bytes_dropped += chunk.as_ref().len();
                                             log::error!(
                                                 "HLStoUDP: UDPThread UDP error: {}. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
                                                 e,
-                                                chunk.len(),
+                                                chunk.as_ref().len(),
                                                 total_bytes_sent,
                                                 total_bytes_dropped,
                                                 sent_bps
@@ -752,11 +815,9 @@ fn sender_thread(
                                     }
                                 }
                             }
-                            if chunk_dropped {
-                                log::debug!(
-                                    "HLStoUDP: UDPThread Chunk of size {} bytes dropped due to blocking or error.",
-                                    chunk.len()
-                                );
+                            // Instead of draining via collect (which copies), remove used bytes with pop_front.
+                            for _ in 0..packet_size {
+                                buffer.pop_front();
                             }
                             index += 1;
                         }
@@ -834,19 +895,17 @@ fn sender_thread(
         #[cfg(feature = "smoother")]
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
-        // Create a PidTracker to track PIDs and Continuity Counter Errors
-        let mut pid_tracker = PidTracker::new();
-
         // vecdec buffer to hold UDP packets while we are detecting the stream model PCR PID
         let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
 
         // Process each downloaded segment from the receiver thread
         while let Ok(seg) = rx.recv() {
             log::debug!(
-                "HLStoUDP: SenderThread Segment #{} => {} bytes, {} sec",
+                "HLStoUDP: SenderThread Segment #{} => {} bytes, {} sec, URI: {}",
                 seg.id,
                 seg.data.len(),
-                seg.duration
+                seg.duration,
+                seg.uri
             );
 
             if shutdown_flag.load(Ordering::SeqCst) {
@@ -913,26 +972,9 @@ fn sender_thread(
             buffer.extend(seg.data);
 
             // Process full TS packets from the buffer, removing data as it is sent.
-            while (pcr_pid > 0 || !use_smoother) && buffer.len() >= TS_PACKET_SIZE {
-                // Drain exactly TS_PACKET_SIZE bytes from the front.
-                let packet_chunk: Vec<u8> = buffer.drain(0..TS_PACKET_SIZE).collect();
-
-                // Feed the packet chunk into the continuity checker.
-                if let Err(e) =
-                    pid_tracker.process_packet("ReceiveDownloadSegment".to_string(), &packet_chunk)
-                {
-                    if e == 0xFFFF {
-                        log::error!(
-                            "HLStoUDP: (ReceiveDownloadSegment) Bad packet ({} bytes) detected, dropping packet. URI: {}",
-                            packet_chunk.len(),
-                            seg.uri);
-                        continue;
-                    } else {
-                        log::error!(
-                            "HLStoUDP: (ReceiveDownloadSegment) Continuity error: {:?} in packet from URI: {}",
-                            e,seg.uri);
-                    }
-                }
+            while (pcr_pid > 0 || !use_smoother) && buffer.len() >= min_packet_size {
+                // Drain exactly min_packet_size bytes from the front.
+                let packet_chunk: Vec<u8> = buffer.drain(0..min_packet_size).collect();
 
                 if !use_smoother {
                     // Send the packet directly to the UDP sender thread wrapped in an Arc.

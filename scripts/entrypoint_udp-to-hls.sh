@@ -21,6 +21,7 @@ while [ : ]; do
         -n ${NETWORK_INTERFACE} \
         -i ${SOURCE_IP} \
         -p ${SOURCE_PORT} \
+        -r ${MINIO_REGION_NAME} \
         -e ${MINIO_SERVER_URL} \
         -b ${MINIO_BUCKET_NAME} \
         -o ${CHANNEL_NAME} \
