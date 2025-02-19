@@ -33,7 +33,7 @@ libltntstools-sys = { version = "0.1.0", optional = true, default-features = fal
 libltntstools = { version = "0.1.0", optional = true, default-features = false }
 socket2 = "0.5.8"
 ctrlc = "3.4.5"
-mpegts_pid_tracker = "1.0.1"
+mpegts_pid_tracker = "1.0.2"
 
 [patch.crates-io]
 libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "master" }
