@@ -36,5 +36,5 @@ ctrlc = "3.4.5"
 mpegts_pid_tracker = "1.0.2"
 
 [patch.crates-io]
-libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "master" }
-libltntstools = { git = "https://github.com/groovybits/libltntstools", branch = "master" }
+libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "reduce_cpu_smoothing" }
+libltntstools = { git = "https://github.com/groovybits/libltntstools", branch = "reduce_cpu_smoothing" }
