@@ -11,7 +11,11 @@ if [ "${USE_UNSIGNED_URLS}" = "true" ]; then
 fi
 
 if [ "${QUIET}" = "true" ]; then
-    QUIET="--quiet"
+    ARG_QUIET="--quiet"
+fi
+
+if [ "${DROP_CORRUPT_TS}" = "true" ]; then
+    ARG_DROP_CORRUPT_TS="--drop-corrupt-ts"
 fi
 
 trap cleanup SIGINT SIGTERM
@@ -26,7 +30,7 @@ while [ : ]; do
         -b ${MINIO_BUCKET_NAME} \
         -o ${CHANNEL_NAME} \
         --hls_keep_segments ${M3U8_LIVE_SEGMENT_COUNT} \
-        ${UNSIGNED_URL_ARGS} ${QUIET} $@
+        ${UNSIGNED_URL_ARGS} ${ARG_QUIET} ${ARG_DROP_CORRUPT_TS}
 
     sleep 1
 done
