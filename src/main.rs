@@ -1115,9 +1115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!(
         "UDPtoHLS: Opening PCAP on interface={} with snaplen={}, buffer={}b, timeout={}",
+        interface,
         get_snaplen(),
         get_buffer_size(),
-        interface,
         timeout
     );
 
