@@ -13,7 +13,11 @@ else
 fi
 
 if [ "${QUIET}" = "true" ]; then
-    QUIET="--quiet"
+    ARG_QUIET="--quiet"
+fi
+
+if [ "${DROP_CORRUPT_TS}" = "true" ]; then
+    ARG_DROP_CORRUPT_TS="--drop-corrupt-ts"
 fi
 
 trap cleanup SIGINT SIGTERM
@@ -31,8 +35,6 @@ while [ : ]; do
         -f "${HLS_TO_UDP_OUTPUT_FILE}" \
         -m ${MIN_UDP_PACKET_SIZE} \
         -k ${MAX_UDP_PACKET_SIZE} \
-        ${SMOOTHER_ARGS} ${QUIET} \
-        ${EXTRA_ARGS} \
-            $@
+        ${SMOOTHER_ARGS} ${ARG_QUIET} ${ARG_DROP_CORRUPT_TS}
     sleep 1
 done

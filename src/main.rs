@@ -18,6 +18,7 @@ use env_logger;
 use futures::StreamExt;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, info, warn};
+use mpegts_pid_tracker::{PidTracker, TS_PACKET_SIZE};
 use pcap::{Capture, PacketCodec};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::VecDeque;
@@ -30,7 +31,6 @@ use std::sync::{mpsc as std_mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use mpegts_pid_tracker::{PidTracker, TS_PACKET_SIZE};
 
 // ------------- HELPER STRUCTS & FUNCS -------------
 
@@ -991,12 +991,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .default_value("30")
                 .help("Interval in seconds to print PCAP stats"),
         )
+        .arg(
+            Arg::new("drop_corrupt_ts")
+                .long("drop_corrupt_ts")
+                .help("Drop corrupt TS packets")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     debug!("UDPtoHLS: Command-line arguments parsed: {:?}", matches);
 
     println!("UDPtoHLS: version: {}", get_version());
 
+    let drop_corrupt_ts = matches.get_flag("drop_corrupt_ts");
     let quiet = matches.get_flag("quiet");
     let pcap_stats_interval: u64 = matches
         .get_one::<String>("pcap_stats_interval")
@@ -1108,9 +1115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!(
         "UDPtoHLS: Opening PCAP on interface={} with snaplen={}, buffer={}b, timeout={}",
+        interface,
         get_snaplen(),
         get_buffer_size(),
-        interface,
         timeout
     );
 
@@ -1306,18 +1313,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Create an Arc for the 188-byte TS packet without extra copying
                 let packet_arc: Arc<[u8]> = Arc::from(&contiguous[..TS_PACKET_SIZE]);
 
-                // Process the packet (PID tracking)
-                match pid_tracker
-                    .process_packet("ExtractMpegTSpayload".to_string(), packet_arc.as_ref())
-                {
-                    Ok(()) => {}
-                    Err(0xFFFF) => {
-                        log::warn!("UDPtoHLS: Invalid TS packet detected (pid=0xFFFF), discarding and searching for next sync byte");
-                        leftover_ts.pop_front();
-                        continue;
-                    }
-                    Err(e) => {
-                        log::error!("UDPtoHLS: Continuity error: {:?}", e);
+                if drop_corrupt_ts {
+                    // Process the packet (PID tracking)
+                    match pid_tracker
+                        .process_packet("ExtractMpegTSpayload".to_string(), packet_arc.as_ref())
+                    {
+                        Ok(()) => {}
+                        Err(0xFFFF) => {
+                            log::warn!("UDPtoHLS: Invalid TS packet detected (pid=0xFFFF), discarding and searching for next sync byte");
+                            leftover_ts.pop_front();
+                            continue;
+                        }
+                        Err(e) => {
+                            log::error!("UDPtoHLS: Continuity error: {:?}", e);
+                        }
                     }
                 }
 
