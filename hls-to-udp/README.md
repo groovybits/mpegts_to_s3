@@ -14,6 +14,7 @@ To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [http
 - Rust (latest stable version)
 - Cargo (Rust package manager)
 - LibPcap
+- LibRdKafka development package for your OS
 - LibLTNTSTools (optional) Use the `smoother` feature flag to enable the Bitrate Smoother `--features=smoother`
 
 ## Installation
