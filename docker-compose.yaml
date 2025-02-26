@@ -96,7 +96,6 @@ services:
       - "./hls:/app/hls:rw"
     depends_on:
       - s3minio
-      - udp-to-hls
       - hls-http-server
     restart: unless-stopped
     entrypoint: ["/app/entrypoint_hls-to-udp.sh"]

@@ -2,9 +2,13 @@
 
 cleanup() {
     echo "Caught signal, cleaning up..."
-    kilall hls-to-udp
+    killall hls-to-udp
     exit 0
 }
+
+if [ -f "${CONFIG_FILE}" ]; then
+    source ${CONFIG_FILE}
+fi
 
 if [ "${USE_SMOOTHER}" = "true" ]; then
     SMOOTHER_ARGS="--use-smoother"
