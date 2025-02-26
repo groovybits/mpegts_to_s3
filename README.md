@@ -161,7 +161,7 @@ SEGMENT_DURATION_SECONDS=2 \
   - `FILE_MAX_AGE_SECONDS`: Maximum age of files in seconds to upload (default: `30`)
   - `URL_SIGNING_SECONDS`: Duration of signed URLs in seconds (default: `31104004`)
   - `MINIO_ROOT_USER`: S3 username / access key ID (default: `minioadmin`)
-  - `MINIO_ROOT_PASSWORD`: S3 password / secret access key (default: `ThisIsSecret12345.`)
+  - `MINIO_ROOT_PASSWORD`: S3 password / secret access key (default: `minioadmin`)
   - `PCAP_PACKET_COUNT`: Number of packets to capture at a time (default: `7`)
   - `PCAP_PACKET_SIZE`: Size of mpegts packets to capture (default: `188`)
   - `PCAP_PACKET_HEADER_SIZE`: Size of mpegts packet ip/eth header (default: `42`)

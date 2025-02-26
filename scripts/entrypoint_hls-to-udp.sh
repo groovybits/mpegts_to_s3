@@ -7,7 +7,7 @@ cleanup() {
 }
 
 if [ -f "${CONFIG_FILE}" ]; then
-    source ${CONFIG_FILE}
+    CONFIG_ARGS=". ${CONFIG_FILE}"
 fi
 
 if [ "${USE_SMOOTHER}" = "true" ]; then
@@ -27,6 +27,7 @@ fi
 trap cleanup SIGINT SIGTERM
 
 while [ : ]; do
+    ${CONFIG_ARGS}
     RUST_BACKTRACE=full hls-to-udp \
         -u ${HLS_INPUT_URL} \
         -o ${UDP_OUTPUT_IP}:${UDP_OUTPUT_PORT} \
@@ -39,6 +40,6 @@ while [ : ]; do
         -f "${HLS_TO_UDP_OUTPUT_FILE}" \
         -m ${MIN_UDP_PACKET_SIZE} \
         -k ${MAX_UDP_PACKET_SIZE} \
-        ${SMOOTHER_ARGS} ${ARG_QUIET} ${ARG_DROP_CORRUPT_TS}
+        ${SMOOTHER_ARGS} ${ARG_QUIET} ${ARG_DROP_CORRUPT_TS} $@
     sleep 1
 done
