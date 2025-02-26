@@ -2,9 +2,13 @@
 
 cleanup() {
     echo "Caught signal, cleaning up..."
-    kilall udp-to-hls
+    killall udp-to-hls
     exit 0
 }
+
+if [ -f "${CONFIG_FILE}" ]; then
+    source ${CONFIG_FILE}
+fi
 
 if [ "${USE_UNSIGNED_URLS}" = "true" ]; then
     UNSIGNED_URL_ARGS="--unsigned_urls"
