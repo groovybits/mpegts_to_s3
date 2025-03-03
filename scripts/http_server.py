@@ -110,7 +110,7 @@ class HLSHandler(SimpleHTTPRequestHandler):
         self.end_headers()
 
 def run_server(port=80):
-    server_address = ('', port)
+    server_address = ('0.0.0.0', port)
     httpd = ThreadingHTTPServer(server_address, HLSHandler)
     print(f"Serving HLS content on port {port} (threaded)...")
     try:
