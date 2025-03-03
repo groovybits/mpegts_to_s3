@@ -7,20 +7,25 @@ cleanup() {
 }
 
 if [ -f "${CONFIG_FILE}" ]; then
+    echo "Using config file: ${CONFIG_FILE}"
     CONFIG_ARGS=". ${CONFIG_FILE}"
+    . ${CONFIG_FILE}
 fi
 
 if [ "${USE_SMOOTHER}" = "true" ]; then
+    echo "Using smoother"
     SMOOTHER_ARGS="--use-smoother"
 else
     SMOOTHER_ARGS=""
 fi
 
 if [ "${QUIET}" = "true" ]; then
+    echo "Running in quiet mode"
     ARG_QUIET="--quiet"
 fi
 
 if [ "${DROP_CORRUPT_TS}" = "true" ]; then
+    echo "Dropping corrupt TS packets"
     ARG_DROP_CORRUPT_TS="--drop-corrupt-ts"
 fi
 

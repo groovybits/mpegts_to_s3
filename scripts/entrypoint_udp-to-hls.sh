@@ -7,19 +7,23 @@ cleanup() {
 }
 
 if [ -f "${CONFIG_FILE}" ]; then
-    . ${CONFIG_FILE}
+    echo "Using config file: ${CONFIG_FILE}"
     CONFIG_ARGS=". ${CONFIG_FILE}"
+    . ${CONFIG_FILE}
 fi
 
 if [ "${USE_UNSIGNED_URLS}" = "true" ]; then
+    echo "Using unsigned URLs"
     UNSIGNED_URL_ARGS="--unsigned_urls"
 fi
 
 if [ "${QUIET}" = "true" ]; then
+    echo "Running in quiet mode"
     ARG_QUIET="--quiet"
 fi
 
 if [ "${DROP_CORRUPT_TS}" = "true" ]; then
+    echo "Dropping corrupt TS packets"
     ARG_DROP_CORRUPT_TS="--drop-corrupt-ts"
 fi
 
