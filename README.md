@@ -86,6 +86,9 @@ SEGMENT_DURATION_SECONDS=2 \
 ```
 
 #### 4. Playback from HLS to UDP
+
+See [hls-to-udp](hls-to-udp/README.md) for details on playback and VOD recall of specific date/time start/end points.
+
 - **Direct Playback:**
   1. Use the index.m3u8 for playback of the current live stream:
      ```bash
@@ -154,14 +157,14 @@ SEGMENT_DURATION_SECONDS=2 \
 
 ### Environment Variables:
 
-#### mpegts-to-s3 Environment Variables:
+#### udp-to-hls Environment Variables:
 
   - `CHANNEL_NAME`: Name of the channel (default: `channel01`) used as the subdirectory for HLS ts segments
   - `SEGMENT_DURATION_MS`: Duration of each segment in milliseconds (default: `1000`), (less than 1 second may not work well)
   - `FILE_MAX_AGE_SECONDS`: Maximum age of files in seconds to upload (default: `30`)
   - `URL_SIGNING_SECONDS`: Duration of signed URLs in seconds (default: `31104004`)
   - `MINIO_ROOT_USER`: S3 username / access key ID (default: `minioadmin`)
-  - `MINIO_ROOT_PASSWORD`: S3 password / secret access key (default: `ThisIsSecret12345.`)
+  - `MINIO_ROOT_PASSWORD`: S3 password / secret access key (default: `minioadmin`)
   - `PCAP_PACKET_COUNT`: Number of packets to capture at a time (default: `7`)
   - `PCAP_PACKET_SIZE`: Size of mpegts packets to capture (default: `188`)
   - `PCAP_PACKET_HEADER_SIZE`: Size of mpegts packet ip/eth header (default: `42`)
@@ -172,18 +175,6 @@ SEGMENT_DURATION_SECONDS=2 \
   - `USE_ESTIMATED_DURATION`: Use estimated duration for manual segmentation (default: `false`)
   - `M3U8_LIVE_SEGMENT_COUNT`: Number of segments to keep in the live m3u8 (default: `3`)
   - `USE_UNSIGNED_URLS`: Generate unsigned S3 URLs instead of presigned URLs (default: `false`)
-
-#### hls-to-udp Environment Variables:
-
-  - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:80/channel01.m3u8`)
-  - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
-  - `UDP_OUTPUT_PORT`: hls-to-udp output port for UDP (default: `10000`)
-  - `SMOOTHER_LATENCY`: Bitrate Smoother latency in milliseconds (default: `1000`)
-  - `M3U8_UPDATE_INTERVAL_MS`: Interval to update the m3u8 file in milliseconds (default: `100`)
-  - `HLS_HISTORY_SIZE`: Number of segments to keep in the live m3u8 (default: `1800`)
-  - `SEGMENT_QUEUE_SIZE`: Size of the segment queue (default: `32`)
-  - `UDP_QUEUE_SIZE`: Size of the UDP queue (default: `1024`)
-  - `UDP_SEND_BUFFER`: Size of the UDP Send buffer (default: `0` - OS default)
 
 ---
 

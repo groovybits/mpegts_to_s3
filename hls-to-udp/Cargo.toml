@@ -1,6 +1,6 @@
 [package]
 name = "hls-to-udp"
-version = "1.0.22"
+version = "1.0.23"
 edition = "2021"
 description = "HLS VOD to MPEG-TS UDP Re-cast."
 keywords = ["mpegts", "s3", "hls", "udp"]
@@ -35,6 +35,8 @@ socket2 = "0.5.8"
 ctrlc = "3.4.5"
 mpegts_pid_tracker = "1.0.2"
 bytes = "1.10.0"
+regex = "1.11.1"
+chrono = "0.4.40"
 
 [patch.crates-io]
 libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "reduce_cpu_smoothing" }

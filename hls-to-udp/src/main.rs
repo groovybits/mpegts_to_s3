@@ -20,6 +20,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use url::Url;
 
+use chrono::NaiveDateTime;
+
 #[derive(Debug)]
 struct DownloadedSegment {
     id: usize,
@@ -63,8 +65,16 @@ fn resolve_segment_url(base: &Url, seg_path: &str) -> Result<Url> {
         .map_err(|e| anyhow!("HLStoUDP: ResolveSegmentUrl: Failed URL join: {}", e))
 }
 
+/// Receiver thread accepts an optional vod-index file and full vod-date start/end values.
+/// When in VOD mode with an index, it fetches each hourly m3u8, computes each segment’s
+/// absolute time (by adding the offset extracted from the segment filename to the hour’s start),
+/// merges and sorts them, and then processes only those segments within the provided date/time range.
+/// Otherwise, it works on the normal m3u8 playlist url.
 fn receiver_thread(
     m3u8_url: String,
+    vod_index: Option<String>,
+    vod_date_start: Option<NaiveDateTime>,
+    vod_date_end: Option<NaiveDateTime>,
     start_time: u64,
     end_time: u64,
     poll_interval_ms: u64,
@@ -77,6 +87,228 @@ fn receiver_thread(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let client = Client::new();
+        // --- VOD index mode ---
+        if vod && vod_index.is_some() {
+            let index_file = vod_index.unwrap();
+            let index_data = match std::fs::read_to_string(&index_file) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to read vod index file {}: {}", index_file, e);
+                    return;
+                }
+            };
+
+            // This vector will hold tuples of (absolute_time in ms, segment URI, segment duration)
+            let mut merged_segments: Vec<(u64, String, f64)> = Vec::new();
+
+            for line in index_data.lines() {
+                if let Some(pos) = line.find("=>") {
+                    let label = &line[..pos].trim();
+                    let url_str = line[pos + 2..].trim();
+                    // Expect label to contain a date in the format "channel01/2025/02/26/14"
+                    if let Some(space_pos) = label.find(' ') {
+                        let date_part = label[space_pos + 1..].trim();
+                        let parts: Vec<&str> = date_part.split('/').collect();
+                        if parts.len() >= 4 {
+                            let year = parts[parts.len() - 4];
+                            let month = parts[parts.len() - 3];
+                            let day = parts[parts.len() - 2];
+                            let hour = parts[parts.len() - 1];
+                            let hour_str = format!("{}/{}/{}/{}", year, month, day, hour);
+                            // Use format! instead of + to avoid moving hour_str.
+                            let full_dt_str = format!("{}:00:00", hour_str);
+                            let hour_dt = match NaiveDateTime::parse_from_str(
+                                &full_dt_str,
+                                "%Y/%m/%d/%H:%M:%S",
+                            ) {
+                                Ok(dt) => dt,
+                                Err(e) => {
+                                    log::error!("Error parsing hour date {}: {}", hour_str, e);
+                                    continue;
+                                }
+                            };
+                            let playlist_text = match client.get(url_str).send() {
+                                Ok(r) => {
+                                    if !r.status().is_success() {
+                                        log::error!(
+                                            "Error fetching {}: HTTP {}",
+                                            url_str,
+                                            r.status()
+                                        );
+                                        continue;
+                                    }
+                                    match r.text() {
+                                        Ok(txt) => txt,
+                                        Err(e) => {
+                                            log::error!(
+                                                "Error reading playlist from {}: {}",
+                                                url_str,
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Error requesting {}: {}", url_str, e);
+                                    continue;
+                                }
+                            };
+                            let parsed = parse_playlist_res(playlist_text.as_bytes());
+                            let media_pl = match parsed {
+                                Ok(Playlist::MediaPlaylist(mp)) => mp,
+                                _ => {
+                                    log::error!(
+                                        "Playlist from {} is not a media playlist",
+                                        url_str
+                                    );
+                                    continue;
+                                }
+                            };
+                            // For each segment in the hourly playlist, extract the offset.
+                            for seg in media_pl.segments {
+                                if let Some(filename) = seg.uri.split('/').last() {
+                                    if filename.starts_with("segment_") {
+                                        // Expected format: "segment_YYYYMMDD-HHMMSS__INDEX.ts"
+                                        let content = &filename["segment_".len()..];
+                                        let parts: Vec<&str> = content.split("__").collect();
+                                        if parts.len() >= 1 {
+                                            let datetime_part = parts[0]; // "YYYYMMDD-HHMMSS"
+                                            let dt_parts: Vec<&str> =
+                                                datetime_part.split('-').collect();
+                                            if dt_parts.len() == 2 {
+                                                let time_str = dt_parts[1]; // "HHMMSS"
+                                                if time_str.len() == 6 {
+                                                    let min: u64 = match time_str[2..4].parse() {
+                                                        Ok(m) => m,
+                                                        Err(_) => continue,
+                                                    };
+                                                    let sec: u64 = match time_str[4..6].parse() {
+                                                        Ok(s) => s,
+                                                        Err(_) => continue,
+                                                    };
+                                                    let offset_ms = (min * 60 + sec) * 1000;
+                                                    let abs_time =
+                                                        hour_dt.and_utc().timestamp_millis() as u64
+                                                            + offset_ms;
+                                                    merged_segments.push((
+                                                        abs_time,
+                                                        seg.uri.to_string(),
+                                                        seg.duration.into(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Sort segments by absolute time.
+            merged_segments.sort_by_key(|&(t, _, _)| t);
+            // Filter segments by the provided vod-date start/end times.
+            let start_abs = vod_date_start.map(|dt| dt.and_utc().timestamp_millis() as u64);
+            let end_abs = vod_date_end.map(|dt| dt.and_utc().timestamp_millis() as u64);
+            for (abs_time, seg_uri, seg_duration) in merged_segments {
+                if let Some(s) = start_abs {
+                    if abs_time < s {
+                        continue;
+                    }
+                }
+                if let Some(e) = end_abs {
+                    if abs_time > e {
+                        break;
+                    }
+                }
+                if seg_uri.is_empty() {
+                    log::error!("HLStoUDP: ReceiverThread Empty segment URI, skipping.");
+                    continue;
+                }
+                if !seg_uri.split('?').next().unwrap_or("").ends_with(".ts") {
+                    log::error!(
+                        "HLStoUDP: ReceiverThread Bad segment, not a .ts file URI: {}",
+                        seg_uri
+                    );
+                    continue;
+                }
+                log::info!(
+                    "HLStoUDP: ReceiverThread Downloading segment => {}",
+                    seg_uri
+                );
+                let seg_bytes = match client.get(&seg_uri).send() {
+                    Ok(resp) => {
+                        if !resp.status().is_success() {
+                            log::error!(
+                                "HLStoUDP: ReceiverThread Segment fetch error: {} for url {}",
+                                resp.status(),
+                                seg_uri
+                            );
+                            continue;
+                        }
+                        match resp.bytes() {
+                            Ok(b) => b.to_vec(),
+                            Err(e) => {
+                                log::error!(
+                                    "HLStoUDP: ReceiverThread Segment read err: {} for url {}",
+                                    e,
+                                    seg_uri
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "HLStoUDP: ReceiverThread Segment request error: {} for url {}",
+                            e,
+                            seg_uri
+                        );
+                        continue;
+                    }
+                };
+                if drop_corrupt_ts {
+                    let mut index = 0;
+                    let mut pid_tracker = PidTracker::new();
+                    for packet_chunk in seg_bytes.chunks(TS_PACKET_SIZE) {
+                        if let Err(e) =
+                            pid_tracker.process_packet("Receiver".to_string(), packet_chunk)
+                        {
+                            if e == 0xFFFF {
+                                log::error!("HLStoUDP: (Receiver) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.", packet_chunk.len(), index, seg_bytes.len() / TS_PACKET_SIZE, seg_bytes.len());
+                                break;
+                            } else {
+                                log::error!(
+                                    "HLStoUDP: (Receiver) Error processing TS packet: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                        index += 1;
+                    }
+                }
+                let seg_struct = DownloadedSegment {
+                    id: 0,
+                    data: seg_bytes,
+                    duration: seg_duration,
+                    uri: seg_uri.clone(),
+                };
+                if tx.send(seg_struct).is_err() {
+                    log::error!("HLStoUDP: ReceiverThread Receiver dropped, downloader exiting");
+                    tx_shutdown.send(()).ok();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(
+                    ((seg_duration * 1000.0) * 0.80) as u64,
+                ));
+            }
+            log::warn!(
+                "HLStoUDP: ReceiverThread VOD index mode: finished processing all segments."
+            );
+            return;
+        }
+        // --- Normal mode ---
         let base_url = match Url::parse(&m3u8_url) {
             Ok(u) => u,
             Err(e) => {
@@ -87,10 +319,8 @@ fn receiver_thread(
         let mut seg_history = SegmentHistory::new(hist_capacity);
         let mut next_seg_id: usize = 1;
         let mut first_poll = if vod { false } else { true };
-
         let mut pid_tracker = PidTracker::new();
 
-        // Main loop
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 println!("HLStoUDP: ReceiverThread Shutdown flag set, exiting.");
@@ -127,8 +357,6 @@ fn receiver_thread(
                 Ok(Playlist::MediaPlaylist(mp)) => mp,
                 Ok(Playlist::MasterPlaylist(mp)) => {
                     log::info!("HLStoUDP: ReceiverThread Got Master playlist, parsing...");
-
-                    /* get the variant that has the largest bandwidth */
                     let mut variant = None;
                     let mut best_bandwidth = 0;
                     for v in &mp.variants {
@@ -144,7 +372,6 @@ fn receiver_thread(
                     }
                     let best_playlist = if let Some(variant) = variant {
                         let mut variant_uri = variant.uri.clone();
-                        /* check if we have a relative url or not via http: prefix, adjust variant_uri if needed, getting the original m3u8_url's base */
                         if variant_uri.starts_with("http:")
                             || variant_uri.starts_with("https:")
                             || variant_uri.starts_with(".")
@@ -156,42 +383,29 @@ fn receiver_thread(
                             }
                         } else {
                             let mut base_uri = base_url.clone();
-                            /* get path dirname without end file */
                             let path_parts: Vec<&str> = base_uri.path_segments().unwrap().collect();
                             let path_dirname = path_parts.join("/");
                             base_uri.set_path(path_dirname.as_str());
                             base_uri.set_query(None);
                             base_uri.set_fragment(None);
                             variant_uri = base_uri.join(&variant_uri).unwrap().to_string();
-                        };
+                        }
                         let variant_playlist_text = match client.get(&variant_uri).send() {
                             Ok(r) => {
                                 if !r.status().is_success() {
-                                    log::error!(
-                                        "HLStoUDP: ReceiverThread Variant playlist {} fetch HTTP error: {}",
-                                        variant_uri,
-                                        r.status()
-                                    );
+                                    log::error!("HLStoUDP: ReceiverThread Variant playlist {} fetch HTTP error: {}", variant_uri, r.status());
                                     continue;
                                 }
                                 match r.text() {
                                     Ok(txt) => txt,
                                     Err(e) => {
-                                        log::error!(
-                                            "HLStoUDP: ReceiverThread Variant playlist {} read error: {}",
-                                            variant_uri,
-                                            e
-                                        );
+                                        log::error!("HLStoUDP: ReceiverThread Variant playlist {} read error: {}", variant_uri, e);
                                         continue;
                                     }
                                 }
                             }
                             Err(e) => {
-                                log::error!(
-                                    "HLStoUDP: ReceiverThread Variant playlist {} request error: {}",
-                                    variant_uri,
-                                    e
-                                );
+                                log::error!("HLStoUDP: ReceiverThread Variant playlist {} request error: {}", variant_uri, e);
                                 continue;
                             }
                         };
@@ -203,10 +417,7 @@ fn receiver_thread(
                                 continue;
                             }
                             Err(e) => {
-                                log::error!(
-                                    "HLStoUDP: ReceiverThread Parse error in variant playlist: {:?}, ignoring...",
-                                    e
-                                );
+                                log::error!("HLStoUDP: ReceiverThread Parse error in variant playlist: {:?}, ignoring...", e);
                                 continue;
                             }
                         };
@@ -246,10 +457,6 @@ fn receiver_thread(
                     break;
                 }
 
-                // Format of segments for time calculations
-                // http://127.0.0.1:9000/hls/channel01/2025/02/05/06/segment_20250205-060936__8511.ts
-                // bucket, channel, year, month, day, hour, segment_YYYYMMDD-HHMMSS__INDEX.ts
-
                 let mut seg_uri = seg.uri.clone();
                 if seg_uri.starts_with("http:")
                     || seg_uri.starts_with("https:")
@@ -262,33 +469,26 @@ fn receiver_thread(
                     }
                 } else {
                     let mut base_uri = base_url.clone();
-                    /* get path dirname without end file */
                     let path_parts: Vec<&str> = base_uri.path_segments().unwrap().collect();
                     let path_dirname = path_parts.join("/");
                     base_uri.set_path(path_dirname.as_str());
                     base_uri.set_query(None);
                     base_uri.set_fragment(None);
                     seg_uri = base_uri.join(&seg_uri).unwrap().to_string();
-                };
+                }
                 let uri = &seg_uri;
 
-                /* confirm a valid uri */
                 if uri.is_empty() {
                     log::error!("HLStoUDP: ReceiverThread Empty segment URI, skipping.");
                     continue;
                 }
-
                 if seg_history.contains(uri) {
                     continue;
                 }
-
-                /* check uri is proper format with uri crate */
                 if Url::parse(uri).is_err() {
                     log::error!("HLStoUDP: ReceiverThread Bad format for URI: {}", uri);
                     continue;
                 }
-
-                /* make sure we have a .ts extension on the uri, split off the ?... parts first */
                 let uri_main = uri.split('?').next().unwrap();
                 if !uri_main.ends_with(".ts") {
                     log::error!(
@@ -297,53 +497,44 @@ fn receiver_thread(
                     );
                     continue;
                 }
-
                 seg_history.insert(uri.to_string());
 
-                // If VOD mode is enabled, filter segments based on the start_time and end_time
                 if vod && (start_time > 0 || end_time > 0) {
                     let parse_segment_offset = |uri: &str| -> Option<u64> {
                         let filename = uri.split('/').last()?;
                         if !filename.starts_with("segment_") {
                             return None;
                         }
-                        let content = &filename["segment_".len()..]; // "YYYYMMDD-HHMMSS__INDEX.ts"
+                        let content = &filename["segment_".len()..];
                         let parts: Vec<&str> = content.split("__").collect();
-                        let datetime_part = parts.get(0)?; // "YYYYMMDD-HHMMSS"
+                        let datetime_part = parts.get(0)?;
                         let dt_parts: Vec<&str> = datetime_part.split('-').collect();
                         if dt_parts.len() != 2 {
                             return None;
                         }
-                        let time_str = dt_parts[1]; // "HHMMSS"
+                        let time_str = dt_parts[1];
                         if time_str.len() != 6 {
                             return None;
                         }
-                        // Parse the minute and second fields only, ignoring the hour.
                         let min: u64 = time_str[2..4].parse().ok()?;
                         let sec: u64 = time_str[4..6].parse().ok()?;
-                        // Return the offset in milliseconds from the beginning of the hour.
                         Some((min * 60 + sec) * 1000)
                     };
 
                     if let Some(offset_ms) = parse_segment_offset(uri) {
                         if offset_ms < start_time {
-                            log::debug!(
-                                "HLStoUDP: Skipping segment {}: offset {}ms is before start_time {}ms",
-                                uri,
-                                offset_ms,
-                                start_time
-                            );
+                            log::info!("HLStoUDP: Skipping segment {}: offset {}ms is before start_time {}ms", uri, offset_ms, start_time);
                             continue;
                         }
                         if end_time > 0 && offset_ms > end_time {
-                            log::debug!(
+                            log::info!(
                                 "HLStoUDP: Segment {} offset {}ms exceeds end_time {}ms",
                                 uri,
                                 offset_ms,
                                 end_time
                             );
                             if vod {
-                                log::debug!(
+                                log::info!(
                                     "HLStoUDP: VOD mode: finished processing required time range."
                                 );
                             }
@@ -363,7 +554,7 @@ fn receiver_thread(
                         continue;
                     }
                 };
-                log::debug!(
+                log::info!(
                     "HLStoUDP: ReceiverThread Downloading segment {} => {}",
                     next_seg_id,
                     seg_url
@@ -401,7 +592,6 @@ fn receiver_thread(
                     }
                 };
 
-                // if set to drop corrupt TS packets, check the segment for errors
                 if drop_corrupt_ts {
                     let mut index = 0;
                     for packet_chunk in seg_bytes.chunks(TS_PACKET_SIZE) {
@@ -409,13 +599,7 @@ fn receiver_thread(
                             pid_tracker.process_packet("Receiver".to_string(), packet_chunk)
                         {
                             if e == 0xFFFF {
-                                log::error!(
-                                    "HLStoUDP: (Receiver) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.",
-                                    packet_chunk.len(),
-                                    index,
-                                    seg_bytes.len() / TS_PACKET_SIZE,
-                                    seg_bytes.len()
-                                );
+                                log::error!("HLStoUDP: (Receiver) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.", packet_chunk.len(), index, seg_bytes.len() / TS_PACKET_SIZE, seg_bytes.len());
                                 break;
                             } else {
                                 log::error!(
@@ -435,18 +619,15 @@ fn receiver_thread(
                     uri: uri.to_string(),
                 };
                 if tx.send(seg_struct).is_err() {
-                    // get error information
                     log::error!("HLStoUDP: ReceiverThread Receiver dropped, downloader exiting");
                     tx_shutdown.send(()).ok();
                     return;
                 }
-                /* sleep duration of segment */
                 if vod {
                     thread::sleep(Duration::from_millis(
                         ((seg.duration * 1000.0) * 0.80) as u64,
                     ));
                 }
-
                 next_seg_id += 1;
             }
 
@@ -489,12 +670,11 @@ fn sender_thread(
         let mut total_bytes_dropped = 0usize;
         let mut total_bytes_sent = 0usize;
 
-        log::debug!(
+        log::info!(
             "SenderThread: Starting UDP sender thread with input values vod={} udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, smoother_max_bytes={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
             vod, udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, smoother_max_bytes, udp_queue_size, udp_send_buffer, use_smoother
         );
 
-        // Create raw socket with socket2
         let socket = match socket2::Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::DGRAM,
@@ -507,7 +687,6 @@ fn sender_thread(
             }
         };
 
-        // Configure socket before converting to std::net::UdpSocket
         if udp_send_buffer > 0 {
             log::info!(
                 "HLStoUDP: SenderThread Setting send buffer to {} bytes.",
@@ -520,21 +699,14 @@ fn sender_thread(
             match socket.send_buffer_size() {
                 Ok(actual) => {
                     if actual < desired_send_buffer {
-                        log::warn!(
-                            "HLStoUDP: OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.",
-                            actual / 1024,
-                            desired_send_buffer / 1024
-                        );
+                        log::warn!("HLStoUDP: OS allocated {}KB send buffer (requested {}KB). Consider increasing system limits.", actual / 1024, desired_send_buffer / 1024);
                     }
                 }
                 Err(e) => log::error!("HLStoUDP: SenderThread Couldn't get buffer size: {}", e),
             }
         }
 
-        // Convert to stdlib socket
         let sock: UdpSocket = socket.into();
-
-        // Keep socket in non-blocking mode (hybrid approach: we do small manual blocking when full)
         if let Err(e) = sock.set_nonblocking(true) {
             log::error!(
                 "HLStoUDP: SenderThread Failed to set non-blocking socket: {}",
@@ -542,8 +714,6 @@ fn sender_thread(
             );
             return;
         }
-
-        // Connect the UDP socket
         if let Err(e) = sock.connect(&udp_addr) {
             log::error!(
                 "HLStoUDP: SenderThread: Failed to connect UDP socket: {}",
@@ -551,88 +721,59 @@ fn sender_thread(
             );
             return;
         }
+        let sock = Arc::new(sock);
 
-        let sock = Arc::new(sock); // Wrap in Arc for thread safety
-
-        // --- Channels for the Smoother callback => UDP send thread
         let (udp_tx, udp_rx) = mpsc::sync_channel::<Bytes>(udp_queue_size);
 
-        // To avoid moved value errors, clone the channel senders for use in the smoother callback.
         #[cfg(feature = "smoother")]
         let udp_callback_arc = {
             let udp_tx_cloned = udp_tx.clone();
             let tx_shutdown_cloned = tx_shutdown.clone();
-            // Wrap the callback in an Arc so we can clone it later when creating the smoother.
-            // Note: the callback must accept Vec<u8> (as required by PcrSmoother)
             Arc::new(move |v: Vec<u8>| {
                 log::debug!(
                     "HLStoUDP: SmootherCallback received buffer with {} bytes for UDP.",
                     v.len()
                 );
-                // Convert the Vec<u8> into Bytes (which is zero-copy if the inner data is shared)
                 if let Err(e) = udp_tx_cloned.send(Bytes::from(v)) {
                     log::error!(
                         "HLStoUDP SmootherCallback: Failed to send buffer to UDP thread: {}",
                         e
                     );
-                    // Attempt to shut down gracefully if the channel is disconnected
                     tx_shutdown_cloned.send(()).ok();
                 }
             })
         };
 
-        // --- UDP-sending thread, reading from udp_rx channel
         let sock_clone = Arc::clone(&sock);
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
-        // Time-based approach to blocking, define a max wait:
-        let max_block_ms = 10000; // ms total wait if OS buffer is full
-        let timeout_interval = Duration::from_millis(3000); // 3 seconds
-
-        // Use a VecDeque as a ring buffer to avoid memmove overhead.
-        // We'll buffer the 7 * 188 byte packets till we have a complete packet and up to N MB.
+        let max_block_ms = 10000;
+        let timeout_interval = Duration::from_millis(3000);
         let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
         let min_packet_size = min_pkt_size as usize;
         let max_packet_size = pkt_size as usize;
-
-        let mut frame_time_micros = 10; // N micros per 188 byte packet
-        let wait_time_micros = 1000; // 1ms wait time when blocking
-
+        let mut frame_time_micros = 10;
+        let wait_time_micros = 1000;
         let capture_start_time = Instant::now();
-
         let udp_sender_thread_shutdown_flag = Arc::clone(&shutdown_flag);
 
         let udp_sender_thread = thread::spawn(move || {
             println!("HLStoUDP: UDPThread started (hybrid non-blocking + partial block).");
-
-            // Create a PidTracker to track PIDs and Continuity Counter Errors
             let mut pid_tracker = PidTracker::new();
 
             while !udp_sender_thread_shutdown_flag.load(Ordering::SeqCst) {
-                // We poll for new chunks with a short timeout, so we can check shutdown.
                 match udp_rx.recv_timeout(timeout_interval) {
                     Ok(arc_data) => {
-                        // Use the inner Vec<u8> from the Arc wrapper.
                         let data = arc_data.as_ref();
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
-
-                        // Check if appending data would exceed our buffer capacity.
                         if buffer.len() + data.len() > buffer.capacity() {
-                            log::warn!(
-                                "HLStoUDP: UDPThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)",
-                                buffer.len(),
-                                data.len()
-                            );
+                            log::warn!("HLStoUDP: UDPThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)", buffer.len(), data.len());
                             continue;
                         }
-
-                        // Extend our VecDeque with the new data.
                         buffer.extend(data.iter().copied());
-
-                        // Process only if we have enough data for a full packet
                         if buffer.len() < min_packet_size {
                             log::debug!(
                                 "HLStoUDP: UDPThread Buffer not full yet ({} bytes).",
@@ -640,14 +781,11 @@ fn sender_thread(
                             );
                             continue;
                         }
-
-                        // Attempt to send this data to UDP
                         let buffer_start_time = Instant::now();
                         let mut index = 0;
                         let mut last_packet_send_time = Instant::now();
 
                         while buffer.len() >= min_packet_size {
-                            // Determine the packet size to send (up to max_packet_size, aligned on TS_PACKET_SIZE)
                             let available = buffer.len();
                             let mut packet_size = max_packet_size;
                             if available < max_packet_size {
@@ -656,14 +794,11 @@ fn sender_thread(
                             if packet_size == 0 {
                                 break;
                             }
-                            // Zero-copy: obtain a slice from the front of the buffer without draining.
                             let chunk: Cow<[u8]> = {
                                 let (first, second) = buffer.as_slices();
                                 if first.len() >= packet_size {
                                     Cow::Borrowed(&first[0..packet_size])
                                 } else {
-                                    // Data is wrapped around; this case is expected to be rare.
-                                    // Fall back to creating a temporary buffer.
                                     let mut temp = Vec::with_capacity(packet_size);
                                     temp.extend_from_slice(first);
                                     temp.extend_from_slice(&second[0..(packet_size - first.len())]);
@@ -672,33 +807,22 @@ fn sender_thread(
                             };
 
                             if drop_corrupt_ts {
-                                // Check each TS packet for continuity errors
                                 for packet_chunk in chunk.as_ref().chunks(TS_PACKET_SIZE) {
                                     if let Err(e) = pid_tracker
                                         .process_packet("UDPsender".to_string(), packet_chunk)
                                     {
                                         if e == 0xFFFF {
-                                            log::error!(
-                                            "HLStoUDP: (UDPSender) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.",
-                                            packet_chunk.len(),
-                                            index,
-                                            chunk.as_ref().len() / TS_PACKET_SIZE,
-                                            chunk.as_ref().len()
-                                        );
+                                            log::error!("HLStoUDP: (UDPSender) Bad packet of size {} bytes for {} of {} chunks of {} bytes total is bad, dropping segment.", packet_chunk.len(), index, chunk.as_ref().len() / TS_PACKET_SIZE, chunk.as_ref().len());
                                             index += 1;
                                             continue;
                                         } else {
-                                            log::error!(
-                                            "HLStoUDP: (UDPsender) Error processing TS packet: {:?}",
-                                            e
-                                        );
+                                            log::error!("HLStoUDP: (UDPsender) Error processing TS packet: {:?}", e);
                                         }
                                     }
                                 }
                             }
 
                             loop {
-                                // Calculate sending rate information.
                                 let elapsed_ms = capture_start_time.elapsed().as_millis();
                                 let sent_bytes = total_bytes_sent;
                                 let sent_bps = if elapsed_ms <= 0 {
@@ -706,54 +830,26 @@ fn sender_thread(
                                 } else {
                                     sent_bytes as u32 * 8 / elapsed_ms as u32
                                 };
-                                log::debug!(
-                                    "HLStoUDP: UDPThread Sending {} bytes buffer at {} bps (sent={} bytes, dropped={} bytes)",
-                                    chunk.as_ref().len(),
-                                    sent_bps,
-                                    total_bytes_sent,
-                                    total_bytes_dropped
-                                );
-
-                                /* get current bitrate and adjust frame_time_micros to keep bitrate from bursting */
+                                log::debug!("HLStoUDP: UDPThread Sending {} bytes buffer at {} bps (sent={} bytes, dropped={} bytes)", chunk.as_ref().len(), sent_bps, total_bytes_sent, total_bytes_dropped);
                                 let elapsed = last_packet_send_time.elapsed();
                                 let elapsed_micros = elapsed.as_micros();
                                 if elapsed_micros > 0 {
-                                    let sent_bps = (chunk.as_ref().len() as u64 * 8 * 1000000)
+                                    let sent_bps = (chunk.as_ref().len() as u64 * 8 * 1000)
                                         / elapsed_micros as u64;
-                                    log::debug!(
-                                        "HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.",
-                                        chunk.as_ref().len(),
-                                        elapsed_micros,
-                                        sent_bps
-                                    );
-                                    // Adjust frame_time_micros to keep bitrate from bursting
+                                    log::info!("HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.", chunk.as_ref().len(), elapsed_micros, sent_bps);
                                     if sent_bps > 0 {
                                         frame_time_micros =
-                                            (chunk.as_ref().len() as u64 * 8 * 1000000) / sent_bps;
+                                            (chunk.as_ref().len() as u64 * 8 * 1000) / sent_bps;
                                     }
                                 }
-
-                                // calculate how long we should sleep to maintain a constant rate
                                 let sleep_time_micros: u64 = (chunk.as_ref().len() / TS_PACKET_SIZE)
                                     as u64
                                     * frame_time_micros as u64;
-
                                 match sock_clone.send(chunk.as_ref()) {
                                     Ok(bytes_sent) => {
-                                        log::debug!(
-                                            "HLStoUDP: UDPThread Packet of {} bytes sent from a chunk of {} bytes at {} bps.",
-                                            bytes_sent,
-                                            chunk.as_ref().len(),
-                                            sent_bps
-                                        );
+                                        log::debug!("HLStoUDP: UDPThread Packet of {} bytes sent from a chunk of {} bytes at {} bps.", bytes_sent, chunk.as_ref().len(), sent_bps);
                                         if bytes_sent < chunk.as_ref().len() {
-                                            log::warn!(
-                                                "HLStoUDP: UDPThread Partial send of {} bytes from a chunk of {} bytes at {} bps.",
-                                                bytes_sent,
-                                                chunk.as_ref().len(),
-                                                sent_bps
-                                            );
-                                            // Adjust the chunk pointer and retry sending the remainder.
+                                            log::warn!("HLStoUDP: UDPThread Partial send of {} bytes from a chunk of {} bytes at {} bps.", bytes_sent, chunk.as_ref().len(), sent_bps);
                                             let mut unsent_offset = bytes_sent;
                                             while unsent_offset < chunk.as_ref().len() {
                                                 match sock_clone
@@ -766,6 +862,7 @@ fn sender_thread(
                                                         if e.kind()
                                                             == std::io::ErrorKind::WouldBlock
                                                         {
+                                                            log::warn!("HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes.", chunk.as_ref().len() - unsent_offset);
                                                             thread::sleep(Duration::from_micros(
                                                                 wait_time_micros,
                                                             ));
@@ -773,21 +870,13 @@ fn sender_thread(
                                                         } else {
                                                             total_bytes_dropped +=
                                                                 chunk.as_ref().len();
-                                                            log::error!(
-                                                                "HLStoUDP: UDPThread UDP error: {}. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
-                                                                e,
-                                                                chunk.as_ref().len(),
-                                                                total_bytes_sent,
-                                                                total_bytes_dropped,
-                                                                sent_bps
-                                                            );
+                                                            log::error!("HLStoUDP: UDPThread UDP error: {}. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)", e, chunk.as_ref().len(), total_bytes_sent, total_bytes_dropped, sent_bps);
                                                             break;
                                                         }
                                                     }
                                                 }
                                             }
                                             total_bytes_sent += chunk.as_ref().len();
-                                            /* check last send time and calculate packet time left to wait */
                                             let elapsed = last_packet_send_time.elapsed();
                                             if !vod
                                                 && elapsed
@@ -802,7 +891,6 @@ fn sender_thread(
                                             break;
                                         }
                                         total_bytes_sent += chunk.as_ref().len();
-                                        /* check last send time and calculate packet time left to wait */
                                         let elapsed = last_packet_send_time.elapsed();
                                         if !vod
                                             && elapsed < Duration::from_micros(sleep_time_micros)
@@ -820,51 +908,30 @@ fn sender_thread(
                                                 buffer_start_time.elapsed().as_millis();
                                             if elapsed_ms > max_block_ms as u128 {
                                                 total_bytes_dropped += chunk.as_ref().len();
-                                                log::error!(
-                                                    "HLStoUDP: UDPThread Socket still full after {} ms. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
-                                                    elapsed_ms,
-                                                    chunk.as_ref().len(),
-                                                    total_bytes_sent,
-                                                    total_bytes_dropped,
-                                                    sent_bps
-                                                );
+                                                log::error!("HLStoUDP: UDPThread Socket still full after {} ms. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)", elapsed_ms, chunk.as_ref().len(), total_bytes_sent, total_bytes_dropped, sent_bps);
                                                 break;
                                             }
-                                            log::warn!(
-                                                "HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes, elapsed {} ms, rate {} bps.",
-                                                chunk.as_ref().len(), elapsed_ms, sent_bps
-                                            );
+                                            log::warn!("HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes, elapsed {} ms, rate {} bps.", chunk.as_ref().len(), elapsed_ms, sent_bps);
                                             thread::sleep(Duration::from_micros(wait_time_micros));
                                         } else {
                                             total_bytes_dropped += chunk.as_ref().len();
-                                            log::error!(
-                                                "HLStoUDP: UDPThread UDP error: {}. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)",
-                                                e,
-                                                chunk.as_ref().len(),
-                                                total_bytes_sent,
-                                                total_bytes_dropped,
-                                                sent_bps
-                                            );
+                                            log::error!("HLStoUDP: UDPThread UDP error: {}. Dropping {} byte chunk. (sent={} bytes, dropped={} bytes, rate={} bps)", e, chunk.as_ref().len(), total_bytes_sent, total_bytes_dropped, sent_bps);
                                             break;
                                         }
                                     }
                                 }
                             }
-                            // Instead of draining via collect (which copies), remove used bytes with pop_front.
                             for _ in 0..packet_size {
                                 buffer.pop_front();
                             }
                             index += 1;
                         }
-
-                        // Finally, check for shutdown again
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        // Periodically check shutdown
                         if shutdown_flag_clone.load(Ordering::SeqCst) {
                             log::warn!("HLStoUDP: UDPThread Shutdown flag set, exiting.");
                             break;
@@ -884,7 +951,6 @@ fn sender_thread(
             );
         });
 
-        // --- If we are auto-detecting PCR, create a channel from the StreamModel callback
         #[cfg(feature = "smoother")]
         let (pcr_tx, pcr_rx) = mpsc::channel();
 
@@ -892,7 +958,7 @@ fn sender_thread(
         let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
             log::warn!("HLStoUDP: StreamModelCallback received PAT.");
             if pat.program_count > 0 {
-                log::debug!(
+                log::info!(
                     "HLStoUDP: StreamModelCallback PAT has {} programs.",
                     pat.program_count
                 );
@@ -918,7 +984,6 @@ fn sender_thread(
             }
         };
 
-        // Conditionally create a StreamModel if pcr_pid_arg == 0
         #[cfg(feature = "smoother")]
         let mut model: Option<StreamModel<_>> = if pcr_pid_arg == 0 && use_smoother {
             Some(StreamModel::new(sm_callback))
@@ -926,43 +991,32 @@ fn sender_thread(
             None
         };
 
-        // We'll create the smoother once we have a known pcr_pid
         #[cfg(feature = "smoother")]
         let mut smoother: Option<PcrSmoother<Box<dyn Fn(Vec<u8>) + Send>>> = None;
 
-        // Helper to compute total available bytes in our buffer.
         fn total_available(buffer: &VecDeque<(Bytes, usize)>) -> usize {
             buffer.iter().map(|(seg, offset)| seg.len() - offset).sum()
         }
 
-        // -------------------------------------------------------------------------
-        // vecdec buffer to hold UDP packets while we are detecting the stream model PCR PID
-        // Instead of a VecDeque<u8>, we now keep a VecDeque of (Bytes, offset)
-        // so that we can later produce zero-copy slices.
         let mut buffer: VecDeque<(Bytes, usize)> = VecDeque::new();
 
-        // Process each downloaded segment from the receiver thread
         while let Ok(seg) = rx.recv() {
-            log::debug!(
+            log::info!(
                 "HLStoUDP: SenderThread Segment #{} => {} bytes, {} sec, URI: {}",
                 seg.id,
                 seg.data.len(),
                 seg.duration,
                 seg.uri
             );
-
             if shutdown_flag.load(Ordering::SeqCst) {
                 log::warn!("HLStoUDP: SenderThread Shutdown flag set, exiting.");
                 break;
             }
 
-            // If we haven't locked a PCR PID yet, feed data to the StreamModel for detection
             #[cfg(feature = "smoother")]
             if pcr_pid == 0 && use_smoother {
                 if let Some(ref mut m) = model {
-                    // Write the seg.data to the model without copying:
                     let _ = m.write(&seg.data);
-                    // Check whether a new PID was detected
                     if let Ok(detected) = pcr_rx.try_recv() {
                         pcr_pid = detected as u16;
                         log::warn!(
@@ -972,15 +1026,11 @@ fn sender_thread(
                     }
                 }
             }
-
-            // If we have a valid PCR PID, drop the model
             #[cfg(feature = "smoother")]
             if use_smoother && pcr_pid > 0 && model.is_some() {
                 log::warn!("HLStoUDP: SenderThread Dropping model after PCR PID detected.");
-                model.take(); // drop it
+                model.take();
             }
-
-            // Write to output file if requested
             if !output_file.is_empty() {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
@@ -1000,28 +1050,18 @@ fn sender_thread(
                     );
                 }
             }
-
-            // Instead of copying the bytes into a VecDeque<u8>,
-            // we convert seg.data (a Vec<u8>) into a Bytes object and push it into our buffer.
-            // This is zero copy: the underlying allocation is now shared.
             let bytes_seg = Bytes::from(seg.data);
             buffer.push_back((bytes_seg, 0));
 
-            // Process full TS packets from the buffer, removing data as it is sent.
-            // We check that there is enough data across our segments.
             while (pcr_pid > 0 || !use_smoother) && total_available(&buffer) >= min_packet_size {
-                // Check if the next TS packet is contained entirely in the first segment.
                 if let Some((first_seg, ref mut offset)) = buffer.front_mut() {
                     if first_seg.len() - *offset >= min_packet_size {
-                        // Zero-copy: create a subslice of the Bytes.
                         let ts_packet = first_seg.slice(*offset..*offset + min_packet_size);
                         *offset += min_packet_size;
                         if *offset == first_seg.len() {
                             buffer.pop_front();
                         }
-
                         if !use_smoother {
-                            // Send the packet directly to the UDP sender thread.
                             if let Err(e) = udp_tx.send(ts_packet.clone()) {
                                 log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
                             }
@@ -1029,7 +1069,6 @@ fn sender_thread(
                             #[cfg(feature = "smoother")]
                             {
                                 if smoother.is_none() {
-                                    // create the smoother using our cloned callback:
                                     let smoother_callback = {
                                         let cb = udp_callback_arc.clone();
                                         move |v: Vec<u8>| {
@@ -1055,8 +1094,6 @@ fn sender_thread(
                             }
                         }
                     } else {
-                        // The next TS packet spans segments.
-                        // Fall back to copying the required bytes.
                         let mut temp = Vec::with_capacity(min_packet_size);
                         let mut remaining = min_packet_size;
                         while remaining > 0 {
@@ -1109,11 +1146,8 @@ fn sender_thread(
                     }
                 }
             }
-            // If we have not yet determined a valid PCR PID,
-            // we keep the data in the buffer for later processing.
         }
 
-        // Cleanup
         if use_smoother {
             #[cfg(feature = "smoother")]
             if let Some(m) = model.take() {
@@ -1127,14 +1161,10 @@ fn sender_thread(
             }
         }
 
-        // Tell the udp_sender_thread to shut down
         log::warn!("HLStoUDP: SenderThread sending shutdown signal to smoother thread.");
         let _ = tx_shutdown.send(());
-
-        // Wait for the smoother thread to exit
         log::info!("HLStoUDP: SenderThread waiting for smoother thread to exit...");
         let _ = udp_sender_thread.join();
-
         println!("HLStoUDP: SenderThread exiting.");
     })
 }
@@ -1159,6 +1189,7 @@ fn main() -> Result<()> {
         }
     })
     .expect("Error setting Ctrl-C handler");
+
     let matches = ClapCommand::new("hls-udp-streamer")
         .version(get_version())
         .about("HLS to UDP relay using LibLTNTSTools StreamModel and Smoother")
@@ -1166,7 +1197,30 @@ fn main() -> Result<()> {
             Arg::new("m3u8_url")
                 .short('u')
                 .long("m3u8-url")
-                .required(true)
+                .help("URL to M3U8 playlist, must use either -u (this option --m3u8-url) or -i option (--vod-index) for input (required)")
+                .required_unless_present("vod_index")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("vod_index")
+                .short('i')
+                .long("vod-index")
+                .help("Local file with index of VOD hour m3u8 playlists produced by udp-to-hls (hourly_urls.log), use -s and -e for start and end times (required)")
+                .required_unless_present("m3u8_url")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("vod_date_starttime")
+                .short('s')
+                .long("vod-date-starttime")
+                .help("VOD start date/time in 'YYYY/MM/DD HH:MM:SS' format (uses the vod-index file for VOD mode)")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("vod_date_endtime")
+                .short('e')
+                .long("vod-date-endtime")
+                .help("VOD end date/time in 'YYYY/MM/DD HH:MM:SS' format (uses the vod-index file for VOD mode)")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1174,6 +1228,40 @@ fn main() -> Result<()> {
                 .short('o')
                 .long("udp-output")
                 .required(true)
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("use_smoother")
+                .short('r')
+                .long("use-smoother")
+                .action(ArgAction::SetTrue)
+                .help("Use the PcrSmoother for rate control (default: false)"),
+        )
+        .arg(
+            Arg::new("vod")
+                .short('d')
+                .long("vod")
+                .action(ArgAction::SetTrue)
+                .help("Use VOD mode (default: false)"),
+        )
+        .arg(
+            Arg::new("start_time")
+                .long("m3u8-start-time-ms")
+                .help("Start time offset in milliseconds from start of m3u8 playlist for single URL/M3U8 VOD mode (default: 0)")
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("end_time")
+                .long("m3u8-end-time-ms")
+                .help("End time offset in milliseconds from start of m3u8 playlist for single URL/M3U8 VOD mode (default: 0 - end of playlist)")
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("output_file")
+                .short('f')
+                .long("output-file")
+                .help("Output file for debugging")
+                .default_value("")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1185,7 +1273,6 @@ fn main() -> Result<()> {
         )
         .arg(
             Arg::new("history_size")
-                .short('s')
                 .long("history-size")
                 .default_value("999999")
                 .action(ArgAction::Set),
@@ -1257,38 +1344,6 @@ fn main() -> Result<()> {
                 .long("max-bytes-threshold")
                 .help("Maximum bytes in smoother queue before reset")
                 .default_value("500_000_000"),
-        )
-        .arg(
-            Arg::new("use_smoother")
-                .long("use-smoother")
-                .action(ArgAction::SetTrue)
-                .help("Use the PcrSmoother for rate control (default: false)"),
-        )
-        .arg(
-            Arg::new("vod")
-                .long("vod")
-                .action(ArgAction::SetTrue)
-                .help("Use VOD mode (default: false)"),
-        )
-        .arg(
-            Arg::new("start_time")
-                .long("start-time")
-                .help("Start time offset in milliseconds from start of m3u8 playlist for VOD mode (default: 0)")
-                .default_value("0"),
-        )
-        .arg(
-            Arg::new("end_time")
-                .long("end-time")
-                .help("End time offset in milliseconds from start of m3u8 playlist for VOD mode (default: 0 - end of playlist)")
-                .default_value("0"),
-        )
-        .arg(
-            Arg::new("output_file")
-                .short('f')
-                .long("output-file")
-                .help("Output file for debugging")
-                .default_value("")
-                .action(ArgAction::Set),
         )
         .arg(
             Arg::new("quiet")
@@ -1371,7 +1426,10 @@ fn main() -> Result<()> {
     } else {
         pcr_pid_str.parse::<u16>().unwrap_or(0x00)
     };
-    let m3u8_url = matches.get_one::<String>("m3u8_url").unwrap().clone();
+    let m3u8_url = matches
+        .get_one::<String>("m3u8_url")
+        .unwrap_or(&"".to_string())
+        .clone();
     let udp_out = matches.get_one::<String>("udp_output").unwrap().clone();
     let poll_ms = matches
         .get_one::<String>("poll_ms")
@@ -1388,6 +1446,7 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<u8>()
         .unwrap_or(0);
+
     if quiet {
         env_logger::Builder::new()
             .filter_level(log::LevelFilter::Warn)
@@ -1426,10 +1485,29 @@ fn main() -> Result<()> {
         }
     }
 
+    let vod_index = matches.get_one::<String>("vod_index").cloned();
+    let vod_date_start = matches
+        .get_one::<String>("vod_date_starttime")
+        .cloned()
+        .map(|s| {
+            NaiveDateTime::parse_from_str(&s, "%Y/%m/%d %H:%M:%S")
+                .expect("Invalid vod-date-starttime format")
+        });
+    let vod_date_end = matches
+        .get_one::<String>("vod_date_endtime")
+        .cloned()
+        .map(|s| {
+            NaiveDateTime::parse_from_str(&s, "%Y/%m/%d %H:%M:%S")
+                .expect("Invalid vod-date-endtime format")
+        });
+
     let (tx, rx) = mpsc::sync_channel(segment_queue_size);
     let (tx_shutdown, rx_shutdown) = mpsc::sync_channel(1000);
     let receiver_handle = receiver_thread(
         m3u8_url,
+        vod_index,
+        vod_date_start,
+        vod_date_end,
         start_time,
         end_time,
         poll_ms,
