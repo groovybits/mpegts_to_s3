@@ -32,7 +32,9 @@ To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [http
 
 You need to set the `--vod` flag to enable VOD mode. The `--start-time` and `--end-time` flags are used to specify the start and end times in milliseconds for a single M3U8 Hour file. For multiple hours using `--vod-date-starttime` and `--vod-date-endtime` flags with formatted Date/Time values like "2025/02/26 22:50:00" used.
 
-### Format example of the hourly index file `hourly_urls.log` that udp-to-hls creates and can be used for the `--vod-index` <index_file> arg.
+### Format example of the hourly index file `hourly_urls.log`
+
+- The index file that udp-to-hls creates and can be used for the `--vod-index` <index_file> arg of hls-to-udp.
 
 Date/Time Range for Channel01 on 2025/03/04 from the 08:00 to 09:00 hourly M3U8 playlists:
 ```
