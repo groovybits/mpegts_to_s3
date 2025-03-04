@@ -60,7 +60,7 @@ fn get_s3_username() -> String {
 }
 
 fn get_s3_password() -> String {
-    std::env::var("MINIO_ROOT_PASSWORD").unwrap_or_else(|_| "ThisIsSecret12345.".to_string())
+    std::env::var("MINIO_ROOT_PASSWORD").unwrap_or_else(|_| "minioadmin".to_string())
 }
 
 fn get_pcap_packet_count() -> usize {
