@@ -862,6 +862,7 @@ fn sender_thread(
                                                         if e.kind()
                                                             == std::io::ErrorKind::WouldBlock
                                                         {
+                                                            log::warn!("HLStoUDP: UDPThread Socket full, waiting for buffer space for {} bytes.", chunk.as_ref().len() - unsent_offset);
                                                             thread::sleep(Duration::from_micros(
                                                                 wait_time_micros,
                                                             ));
