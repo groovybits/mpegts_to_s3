@@ -38,7 +38,7 @@ while [ : ]; do
         -o ${UDP_OUTPUT_IP}:${UDP_OUTPUT_PORT} \
         -l ${SMOOTHER_LATENCY} \
         -p ${M3U8_UPDATE_INTERVAL_MS} \
-        -s ${HLS_HISTORY_SIZE} \
+        --history-size ${HLS_HISTORY_SIZE} \
         -q ${SEGMENT_QUEUE_SIZE} \
         -z ${UDP_QUEUE_SIZE} \
         -b ${UDP_SEND_BUFFER} \
