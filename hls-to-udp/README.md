@@ -32,7 +32,15 @@ To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [http
 
 You need to set the `--vod` flag to enable VOD mode. The `--start-time` and `--end-time` flags are used to specify the start and end times in milliseconds for a single M3U8 Hour file. For multiple hours using `--vod-date-starttime` and `--vod-date-endtime` flags with formatted Date/Time values like "2025/02/26 22:50:00" used.
 
-### Examples
+### Format example of the hourly index file `hourly_urls.log` that udp-to-hls creates and can be used for the `--vod-index` <index_file> arg.
+
+Date/Time Range for Channel01 on 2025/03/04 from the 08:00 to 09:00 hourly M3U8 playlists:
+```
+Hour channel01/2025/03/04/08 => http://192.168.50.55:9000/hls/channel01/2025/03/04/08/index.m3u8
+Hour channel01/2025/03/04/09 => http://192.168.50.55:9000/hls/channel01/2025/03/04/09/index.m3u8
+```
+
+### hls-to-udp Usage Examples
 
 Template of running the client with the M3U8 URL and UDP address:
 ```sh
@@ -64,7 +72,7 @@ VOD Multiple hour span using the index created by udp-to-hls to get the hour m3u
             --vod
 ```
 
-## Usage
+## Help on command line usage (container and endpoint scripts take care of configuration usually)
 
 | Option(s)                                       | Description                                                                                                                      | Default                |
 |-------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|------------------------|
@@ -95,7 +103,7 @@ VOD Multiple hour span using the index created by udp-to-hls to get the hour m3u
 | -h, --help                                      | Print help information                                                                                                             | —                      |
 | -V, --version                                   | Print version information                                                                                                          | —                      |
 
-## Environment Variables
+## Optional Environment Variables for the container
 
     - `HLS_INPUT_URL`: hls-to-udp input URL (default: `http://127.0.0.1:3001/channel01.m3u8`)
     - `UDP_OUTPUT_IP`: hls-to-udp output IP for UDP (default: `224.0.0.200`)
