@@ -83,7 +83,7 @@ VOD Multiple hour span using the index created by udp-to-hls to get the hour m3u
 | -s, --vod-date-starttime <vod_date_starttime>    | VOD start date/time in 'YYYY/MM/DD HH:MM:SS' format (used with vod-index for VOD mode)                                             | —                      |
 | -e, --vod-date-endtime <vod_date_endtime>        | VOD end date/time in 'YYYY/MM/DD HH:MM:SS' format (used with vod-index for VOD mode)                                               | —                      |
 | -o, --udp-output <udp_output>                    | UDP output address                                                                                                               | —                      |
-| --use-smoother                                  | Use the PcrSmoother for rate control                                                                                             | false                  |
+| -r, --use-smoother                                | Use the PcrSmoother for rate control                                                                                             | false                  |
 | -d, --vod                                      | Enable VOD mode                                                                                                                  | false                  |
 | --m3u8-start-time-ms <start_time>                | Start time offset in milliseconds from start of M3U8 playlist for single URL/M3U8 VOD mode                                          | 0                      |
 | --m3u8-end-time-ms <end_time>                    | End time offset in milliseconds from start of M3U8 playlist for single URL/M3U8 VOD mode                                            | 0 (end of playlist)    |

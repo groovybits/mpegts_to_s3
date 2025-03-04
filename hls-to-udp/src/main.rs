@@ -233,7 +233,7 @@ fn receiver_thread(
                     );
                     continue;
                 }
-                log::debug!(
+                log::info!(
                     "HLStoUDP: ReceiverThread Downloading segment => {}",
                     seg_uri
                 );
@@ -523,18 +523,18 @@ fn receiver_thread(
 
                     if let Some(offset_ms) = parse_segment_offset(uri) {
                         if offset_ms < start_time {
-                            log::debug!("HLStoUDP: Skipping segment {}: offset {}ms is before start_time {}ms", uri, offset_ms, start_time);
+                            log::info!("HLStoUDP: Skipping segment {}: offset {}ms is before start_time {}ms", uri, offset_ms, start_time);
                             continue;
                         }
                         if end_time > 0 && offset_ms > end_time {
-                            log::debug!(
+                            log::info!(
                                 "HLStoUDP: Segment {} offset {}ms exceeds end_time {}ms",
                                 uri,
                                 offset_ms,
                                 end_time
                             );
                             if vod {
-                                log::debug!(
+                                log::info!(
                                     "HLStoUDP: VOD mode: finished processing required time range."
                                 );
                             }
@@ -554,7 +554,7 @@ fn receiver_thread(
                         continue;
                     }
                 };
-                log::debug!(
+                log::info!(
                     "HLStoUDP: ReceiverThread Downloading segment {} => {}",
                     next_seg_id,
                     seg_url
@@ -670,7 +670,7 @@ fn sender_thread(
         let mut total_bytes_dropped = 0usize;
         let mut total_bytes_sent = 0usize;
 
-        log::debug!(
+        log::info!(
             "SenderThread: Starting UDP sender thread with input values vod={} udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, smoother_max_bytes={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
             vod, udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, smoother_max_bytes, udp_queue_size, udp_send_buffer, use_smoother
         );
@@ -836,7 +836,7 @@ fn sender_thread(
                                 if elapsed_micros > 0 {
                                     let sent_bps = (chunk.as_ref().len() as u64 * 8 * 1000000)
                                         / elapsed_micros as u64;
-                                    log::debug!("HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.", chunk.as_ref().len(), elapsed_micros, sent_bps);
+                                    log::info!("HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.", chunk.as_ref().len(), elapsed_micros, sent_bps);
                                     if sent_bps > 0 {
                                         frame_time_micros =
                                             (chunk.as_ref().len() as u64 * 8 * 1000000) / sent_bps;
@@ -957,7 +957,7 @@ fn sender_thread(
         let sm_callback = move |pat: &mut libltntstools_sys::pat_s| {
             log::warn!("HLStoUDP: StreamModelCallback received PAT.");
             if pat.program_count > 0 {
-                log::debug!(
+                log::info!(
                     "HLStoUDP: StreamModelCallback PAT has {} programs.",
                     pat.program_count
                 );
@@ -1000,7 +1000,7 @@ fn sender_thread(
         let mut buffer: VecDeque<(Bytes, usize)> = VecDeque::new();
 
         while let Ok(seg) = rx.recv() {
-            log::debug!(
+            log::info!(
                 "HLStoUDP: SenderThread Segment #{} => {} bytes, {} sec, URI: {}",
                 seg.id,
                 seg.data.len(),
@@ -1231,6 +1231,7 @@ fn main() -> Result<()> {
         )
         .arg(
             Arg::new("use_smoother")
+                .short('r')
                 .long("use-smoother")
                 .action(ArgAction::SetTrue)
                 .help("Use the PcrSmoother for rate control (default: false)"),
