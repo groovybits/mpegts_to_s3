@@ -27,7 +27,7 @@ clap = "4"
 env_logger = "0.11.6"
 log = "0.4.25"
 m3u8-rs = "6"
-reqwest = { version = "0.11", features = ["blocking"] }
+reqwest = { version = "0.12.12", features = ["blocking"] }
 url = "2.2"
 libltntstools-sys = { version = "0.1.0", optional = true, default-features = false }
 libltntstools = { version = "0.1.0", optional = true, default-features = false }
