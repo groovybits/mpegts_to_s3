@@ -785,7 +785,7 @@ const activeTimers = {
 // ----------------------------------------------------
 // Express Setup
 // ----------------------------------------------------
-const app = express(); 
+const app = express();
 app.use(express.json());
 
 // Serve the Swagger UI at /api-docs
@@ -833,20 +833,20 @@ managerRouter.post('/recordings', (req, res) => {
           destinationProfile
         })
       })
-      .then(agentResp => agentResp.json().catch(() => ({})))
-      .then(agentData => {
-        // We can optionally store agentData.pid into our DB if we want
-        // but for now, we just return the Manager's response
-        return res.status(201).json({ recordingId });
-      })
-      .catch(err2 => {
-        console.error('Error calling Agent endpoint:', err2);
-        // We already inserted the DB record, so decide how to handle:
-        return res.status(201).json({
-          recordingId,
-          warning: 'Recorded in Manager DB, but Agent spawn failed. Check logs.'
+        .then(agentResp => agentResp.json().catch(() => ({})))
+        .then(agentData => {
+          // We can optionally store agentData.pid into our DB if we want
+          // but for now, we just return the Manager's response
+          return res.status(201).json({ recordingId });
+        })
+        .catch(err2 => {
+          console.error('Error calling Agent endpoint:', err2);
+          // We already inserted the DB record, so decide how to handle:
+          return res.status(201).json({
+            recordingId,
+            warning: 'Recorded in Manager DB, but Agent spawn failed. Check logs.'
+          });
         });
-      });
     }
   );
 });
@@ -879,7 +879,7 @@ managerRouter.delete('/recordings/:recordingId', (req, res) => {
       if (row.processPid) {
         try {
           process.kill(row.processPid, 'SIGTERM');
-        } catch {}
+        } catch { }
       }
       return res.sendStatus(204);
     });
@@ -1005,7 +1005,7 @@ managerRouter.delete('/playbacks/:playbackId', (req, res) => {
       if (row.processPid) {
         try {
           process.kill(row.processPid, 'SIGTERM');
-        } catch {}
+        } catch { }
       }
       res.sendStatus(204);
     });
@@ -1168,7 +1168,7 @@ agentRouter.post('/jobs/recordings', (req, res) => {
     [jobId, sourceUrl, duration, destinationProfile, 'running', pid, now.toISOString()],
     err => {
       if (err) {
-        try { process.kill(pid, 'SIGTERM'); } catch {}
+        try { process.kill(pid, 'SIGTERM'); } catch { }
         return res.status(500).json({ error: err.message });
       }
 
@@ -1177,7 +1177,7 @@ agentRouter.post('/jobs/recordings', (req, res) => {
         const timer = setTimeout(() => {
           console.log(`Auto-stopping recording jobId=${jobId} after duration`);
           // Stop the process
-          try { process.kill(pid, 'SIGTERM'); } catch {}
+          try { process.kill(pid, 'SIGTERM'); } catch { }
           db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
           activeTimers.recordings.delete(jobId);
         }, (duration + 1) * 1000);
@@ -1201,7 +1201,7 @@ agentRouter.delete('/recordings/:jobId', (req, res) => {
     if (row.processPid) {
       try {
         process.kill(row.processPid, 'SIGTERM');
-      } catch {}
+      } catch { }
     }
     db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
     // Clear any setTimeout
@@ -1234,7 +1234,7 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
     [jobId, sourceProfile, destinationUrl, duration, 'running', pid, now.toISOString()],
     err => {
       if (err) {
-        try { process.kill(pid, 'SIGTERM'); } catch {}
+        try { process.kill(pid, 'SIGTERM'); } catch { }
         return res.status(500).json({ error: err.message });
       }
 
@@ -1242,7 +1242,7 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
       if (duration && duration > 0) {
         const timer = setTimeout(() => {
           console.log(`Auto-stopping playback jobId=${jobId} after duration`);
-          try { process.kill(pid, 'SIGTERM'); } catch {}
+          try { process.kill(pid, 'SIGTERM'); } catch { }
           db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
           activeTimers.playbacks.delete(jobId);
         }, duration * 1000);
@@ -1266,7 +1266,7 @@ agentRouter.delete('/playbacks/:jobId', (req, res) => {
     if (row.processPid) {
       try {
         process.kill(row.processPid, 'SIGTERM');
-      } catch {}
+      } catch { }
     }
     db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
     // clear any setTimeout
