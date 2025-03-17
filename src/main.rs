@@ -997,12 +997,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .help("Drop corrupt TS packets")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("duration")
+                .long("duration")
+                .default_value("0")
+                .help("Duration of recording in seconds (0=unlimited)"),
+        )
         .get_matches();
 
     debug!("UDPtoHLS: Command-line arguments parsed: {:?}", matches);
 
     println!("UDPtoHLS: version: {}", get_version());
 
+    let duration: u64 = matches.get_one::<String>("duration").unwrap().parse()?;
     let drop_corrupt_ts = matches.get_flag("drop_corrupt_ts");
     let quiet = matches.get_flag("quiet");
     let pcap_stats_interval: u64 = matches
@@ -1259,10 +1266,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Use a vector to accumulate TS packets as Arc slices to avoid unnecessary copies.
     let mut batch_buffer_arcs: Vec<Arc<[u8]>> = Vec::new();
 
+    /* store start time to compare for duration calculations */
+    let start_time = Instant::now();
+
     debug!("Starting main processing loop now...");
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             println!("UDPtoHLS: Shutdown flag set, exiting main loop");
+            break;
+        }
+
+        if duration > 0 && Instant::now().duration_since(start_time) >= Duration::from_secs(duration) {
+            println!("UDPtoHLS: Duration limit reached, exiting main loop");
             break;
         }
 
