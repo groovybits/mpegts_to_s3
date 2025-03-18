@@ -1242,10 +1242,10 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
 
     // Attach listeners for stdout and stderr for each spawned process
     child.stdout.on('data', data => {
-      console.log(`hls-to-udp stdout: ${data.toString().strip()}`);
+      console.log(`hls-to-udp stdout: ${data.toString().trim()}`);
     });
     child.stderr.on('data', data => {
-      console.error(`hls-to-udp stderr: ${data.toString().strip()}`);
+      console.error(`hls-to-udp stderr: ${data.toString().trim()}`);
     });
 
     childArray.push(child);
