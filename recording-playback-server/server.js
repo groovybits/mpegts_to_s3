@@ -1103,6 +1103,16 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
   const child = spawn('../bin/udp-to-hls', args, {
     stdio: ['ignore', 'pipe', 'pipe']
   });
+
+  // Attach listeners for stdout and stderr
+  child.stdout.on('data', data => {
+    // strip the extra newlines
+    console.log(`udp-to-hls stdout: ${data.toString().trim()}`);
+  });
+  child.stderr.on('data', data => {
+    console.error(`udp-to-hls stderr: ${data.toString().trim()}`);
+  });
+
   return child;
 }
 
@@ -1228,6 +1238,16 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
     const child = spawn('../bin/hls-to-udp', baseArgs, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
+
+
+    // Attach listeners for stdout and stderr for each spawned process
+    child.stdout.on('data', data => {
+      console.log(`hls-to-udp stdout: ${data.toString().strip()}`);
+    });
+    child.stderr.on('data', data => {
+      console.error(`hls-to-udp stderr: ${data.toString().strip()}`);
+    });
+
     childArray.push(child);
   }
   console.log('vodPlaylist: Launched ', childArray.length, ' hls-to-udp processes');
