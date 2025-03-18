@@ -7,6 +7,8 @@ const { v4: uuidv4 } = require('uuid');
 const sqlite3 = require('sqlite3').verbose();
 const { spawn } = require('child_process');
 
+const fs = require('fs');
+
 // For Swagger
 const swaggerUi = require('swagger-ui-express');
 const yaml = require('js-yaml');
@@ -1089,9 +1091,10 @@ function spawnUdpToHls(jobId, sourceUrl, duration) {
  * Returns: childProcess
  */
 function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime) {
-  // If you want to treat 'sourceProfile' as a direct M3U8:
-  // e.g. "http://127.0.0.1:9000/hls/2025/03/04/09/index.m3u8"
-  // Or if vodStartTime/vodEndTime are provided, we do multi-hour with ../hourly_urls.log
+  if (!jobId) {
+    console.log('Invalid jobId:', jobId);
+    return Array();
+  }
 
   // We parse the 'destinationUrl' to get IP:port
   // e.g. "udp://239.1.1.1:5000" or "udp://224.0.0.200:10001"
@@ -1104,30 +1107,109 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
   const baseArgs = [];
   let isVod = false;
 
-  // If we have a start/end time, assume we want multi-hour VOD mode
-  if (vodStartTime && vodEndTime) {
-    isVod = true;
+  // parse ./hourly_urls.log for the vodStartTime/vodEndTime range and make an array of playlists to play
+  let vodPlaylists = [];
+  if (vodStartTime && vodEndTime && (vodStartTime != "" || vodEndTime != "")) {
+    /* confirm the vodEndTime is greater than vodStartTime and they are in the right date/time format */
+    /* convert the date/time strings to date objects */
+    /* confirm they are the right format */
+    if (new Date(vodEndTime) <= new Date(vodStartTime)) {
+      console.log('Invalid vodEndTime, vodEndTime:', vodEndTime, ' <= vodStartTime:', vodStartTime);
+      return Array();
+    }
+    if (!new Date(vodStartTime).toISOString().includes(vodStartTime)) {
+      console.log('Invalid vodStartTime, vodStartTime:', vodStartTime);
+      return Array();
+    }
+    if (!new Date(vodEndTime).toISOString().includes(vodEndTime)) {
+      console.log('Invalid vodEndTime, vodEndTime:', vodEndTime);
+      return Array();
+    }
+    // open the ./hourly_urls.log file and read the lines
+    const lines = fs.readFileSync('./hourly_urls.log', 'utf-8').split('\n');
+    for (const line of lines) {
+      if (!line) continue;
+      /* check if starts with Hour */
+      if (!line.startsWith('Hour')) continue;
+
+      //console.log('hls playback hour log line:', line);
+
+      /* parse format as `Hour test69/2025/03/17/13 => http://127.0.0.1:9000/hls/test69/2025/03/17/13/index.m3u8?auth_string_key`above */
+      const [hour, url] = line.split(' => ');
+      if (!hour || !url) {
+        console.log('Invalid hour, url line:', line);
+        continue
+      }
+      const [jobId_prefix, year, month, day, hourStr] = hour.split('/');
+      const [_, newJobId] = jobId_prefix.split(' ');
+      if (!hourStr) {
+        console.log('Invalid date, hourStr:', date, hourStr);
+        continue;
+      }
+      if (newJobId !== jobId) {
+        //console.debug('Not the requested jobId, skipping: ', jobId, ' != ', newJobId);
+        continue;
+      }
+      /* check if the hour is within the range */
+      const hourDate = new Date(`${year}-${month}-${day}T${hourStr}:00:00Z`);
+      if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
+        console.log('Using hls playback url:', url);
+        vodPlaylists.push(url);
+      }
+    }
+  } else {
+    // If no times are given, just get all the urls from the playlist file
+    const lines = fs.readFileSync('./hourly_urls.log', 'utf-8').split('\n');
+    for (const line of lines) {
+      if (!line) continue;
+      if (line.startsWith('Hour')) {
+        const [hour, url] = line.split(' => ');
+        if (!hour || !url) {
+          console.log('Invalid hour, url line:', line);
+          continue;
+        }
+        /* Confirm we have the right jobId */
+        const [jobId_prefix, year, month, day, hourStr] = hour.split('/');
+        const [_, newJobId] = jobId_prefix.split(' ');
+        if (!hourStr) {
+          console.log('Invalid date, hourStr:', date, hourStr);
+          continue;
+        }
+        if (newJobId !== jobId) {
+          //console.debug('Not the requested jobId, skipping: ', jobId, ' != ', newJobId);
+          continue;
+        }
+        if (url) {
+          vodPlaylists.push(url);
+          console.log('using hls playback url:', url);
+        }
+      }
+    }
+  }
+
+  /* array of child pids to return */
+  let childArray = [];
+
+  /* go through each playlist and feed it to the hls-to-udp */
+  for (const vodPlaylist of vodPlaylists) {
+    // If we have a start/end time, assume we want multi-hour VOD mode
     baseArgs.push('--vod');
     baseArgs.push('--use-smoother');
     baseArgs.push('-v', '2');
-    baseArgs.push('--vod-index', './hourly_urls.log');
-    baseArgs.push('--vod-date-starttime', vodStartTime);
-    baseArgs.push('--vod-date-endtime', vodEndTime);
-    // We rely on the index file to find the correct hours.
-  } else {
-    // If no times are given, treat `sourceProfile` as a direct M3U8
-    baseArgs.push('-u', sourceProfile);
+    baseArgs.push('-u', `${vodPlaylist}`);
+
+    // Output
+    baseArgs.push('-o', `${ip}:${port}`);
+
+    console.log(`Spawning hls-to-udp => ../bin/hls-to-udp ${baseArgs.join(' ')}`);
+    /* fill childArray per spawn */
+    const child = spawn('../bin/hls-to-udp', baseArgs, {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    childArray.push(child);
   }
 
-  // Output
-  baseArgs.push('-o', `${ip}:${port}`);
-
-  console.log(`Spawning hls-to-udp => ../bin/hls-to-udp ${baseArgs.join(' ')}`);
-  const child = spawn('../bin/hls-to-udp', baseArgs, {
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-
-  return child;
+  return childArray;
 }
 
 // GET status
@@ -1219,42 +1301,69 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
   if (!jobId || !destinationUrl) {
     return res.status(400).json({ error: 'Missing jobId or destinationUrl' });
   }
-  let child;
+  let childArray;
   try {
-    child = spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime);
+    childArray = spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
-  const pid = child.pid;
+  if (!childArray) {
+    return res.status(400).json({ error: 'Invalid spawn' });
+  }
+  /* check if empty */
+  if (childArray.length == 0) {
+    return res.status(400).json({ error: 'Invalid spawn' });
+  }
   const now = new Date();
 
-  db.run(
-    `INSERT INTO agent_playbacks (jobId, sourceProfile, destinationUrl, duration, status, processPid, startTime)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [jobId, sourceProfile, destinationUrl, duration, 'running', pid, now.toISOString()],
-    err => {
-      if (err) {
-        try { process.kill(pid, 'SIGTERM'); } catch { }
-        return res.status(500).json({ error: err.message });
-      }
+  // Insert each child of the array into the DB
+  for (const child of childArray) {
+    const pid = child.pid;
 
-      // If duration > 0, auto-stop
-      if (duration && duration > 0) {
-        const timer = setTimeout(() => {
-          console.log(`Auto-stopping playback jobId=${jobId} after duration`);
+    db.run(
+      `INSERT INTO agent_playbacks (jobId, sourceProfile, destinationUrl, duration, status, processPid, startTime)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [jobId, sourceProfile, destinationUrl, duration, 'running', pid, now.toISOString()],
+      err => {
+        if (err) {
           try { process.kill(pid, 'SIGTERM'); } catch { }
-          db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
-          activeTimers.playbacks.delete(jobId);
-        }, duration * 1000);
-        activeTimers.playbacks.set(jobId, timer);
-      }
+          return res.status(500).json({ error: err.message });
+        }
 
-      child.on('close', code => {
-        console.log(`Playback jobId=${jobId} ended with code=${code}`);
-      });
-      res.status(201).json({ message: 'Playback job accepted', pid });
-    }
-  );
+        // If duration > 0, auto-stop
+        if (duration && duration > 0) {
+          const timer = setTimeout(() => {
+            console.log(`Auto-stopping playback jobId=${jobId} after duration`);
+            try { process.kill(pid, 'SIGTERM'); } catch { }
+            db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
+            activeTimers.playbacks.delete(jobId);
+          }, duration * 1000);
+          activeTimers.playbacks.set(jobId, timer);
+        } else {
+          /* get the duration from the db */
+          db.get(`SELECT duration FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
+            if (err) return res.status(500).json({ error: err.message });
+            if (!row) return res.status(404).json({ message: 'Not found' });
+            const duration = row.duration;
+            if (duration && duration > 0) {
+              const timer = setTimeout(() => {
+                console.log(`Auto-stopping playback jobId=${jobId} after duration`);
+                try { process.kill(pid, 'SIGTERM'); } catch { }
+                db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
+                activeTimers.playbacks.delete(jobId);
+              }, duration * 1000);
+              activeTimers.playbacks.set(jobId, timer);
+            }
+          });
+        }
+
+        child.on('close', code => {
+          console.log(`Playback jobId=${jobId} ended with code=${code}`);
+        });
+        res.status(201).json({ message: 'Playback job accepted', pid });
+      }
+    );
+  }
 });
 
 // Stop a playback job
