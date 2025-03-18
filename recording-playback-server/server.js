@@ -1143,7 +1143,7 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
       const [jobId_prefix, year, month, day, hourStr] = hour.split('/');
       const [_, newJobId] = jobId_prefix.split(' ');
       if (!hourStr) {
-        console.log('Invalid date, hourStr:', date, hourStr);
+        console.log('Invalid date, hourStr:', hourStr);
         continue;
       }
       if (newJobId !== jobId) {
@@ -1193,6 +1193,7 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
   /* go through each playlist and feed it to the hls-to-udp */
   for (const vodPlaylist of vodPlaylists) {
     // If we have a start/end time, assume we want multi-hour VOD mode
+    let baseArgs = [];
     baseArgs.push('--vod');
     baseArgs.push('--use-smoother');
     baseArgs.push('-v', '2');
@@ -1315,10 +1316,13 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
     return res.status(400).json({ error: 'Invalid spawn' });
   }
   const now = new Date();
+  let completedInserts = 0;
+  const pids = [];
 
   // Insert each child of the array into the DB
   for (const child of childArray) {
     const pid = child.pid;
+    pids.push(pid);
 
     db.run(
       `INSERT INTO agent_playbacks (jobId, sourceProfile, destinationUrl, duration, status, processPid, startTime)
@@ -1356,11 +1360,15 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
             }
           });
         }
-
-        child.on('close', code => {
-          console.log(`Playback jobId=${jobId} ended with code=${code}`);
-        });
-        res.status(201).json({ message: 'Playback job accepted', pid });
+        completedInserts++;
+        // Once we've inserted them all, we can respond
+        if (completedInserts === childArray.length) {
+          res.status(201).json({
+            message: 'Playback job accepted',
+            childCount: childArray.length,
+            pids
+          });
+        }
       }
     );
   }
