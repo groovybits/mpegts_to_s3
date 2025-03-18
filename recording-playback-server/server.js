@@ -104,7 +104,8 @@ db.serialize(() => {
   `);
   db.run(`
     CREATE TABLE IF NOT EXISTS agent_playbacks (
-      jobId TEXT PRIMARY KEY,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      jobId TEXT,
       sourceProfile TEXT,
       destinationUrl TEXT,
       duration INTEGER,
@@ -442,57 +443,45 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
 
 /**
  * Helper to spawn hls-to-udp in VOD or live mode
- * Returns: childProcess
+ * If multiple playlists exist, it waits for only the first process to finish before returning.
+ * Returns: Promise resolving to an array of spawned child processes.
  */
-function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime) {
+async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime) {
   if (!jobId) {
     console.log('Invalid jobId:', jobId);
-    return Array();
+    return [];
   }
 
-  // We parse the 'destinationUrl' to get IP:port
-  // e.g. "udp://239.1.1.1:5000" or "udp://224.0.0.200:10001"
+  // Parse the destinationUrl to get IP and port
   const parsedDest = parseUdpUrl(destinationUrl);
   if (!parsedDest) {
     throw new Error(`Invalid or non-UDP destinationUrl: ${destinationUrl}`);
   }
   const { ip, port } = parsedDest;
 
-  const baseArgs = [];
-  let isVod = false;
-
-  // parse ./hourly_urls.log for the vodStartTime/vodEndTime range and make an array of playlists to play
+  // Build the vodPlaylists array by reading the ./hourly_urls.log file
   let vodPlaylists = [];
-  if (vodStartTime && vodEndTime && (vodStartTime != "" || vodEndTime != "")) {
-    /* confirm the vodEndTime is greater than vodStartTime and they are in the right date/time format */
-    /* convert the date/time strings to date objects */
-    /* confirm they are the right format */
+  if (vodStartTime && vodEndTime && (vodStartTime !== "" || vodEndTime !== "")) {
     if (new Date(vodEndTime) <= new Date(vodStartTime)) {
       console.log('Invalid vodEndTime, vodEndTime:', vodEndTime, ' <= vodStartTime:', vodStartTime);
-      return Array();
+      return [];
     }
     if (!new Date(vodStartTime).toISOString().includes(vodStartTime)) {
       console.log('Invalid vodStartTime, vodStartTime:', vodStartTime);
-      return Array();
+      return [];
     }
     if (!new Date(vodEndTime).toISOString().includes(vodEndTime)) {
       console.log('Invalid vodEndTime, vodEndTime:', vodEndTime);
-      return Array();
+      return [];
     }
-    // open the ./hourly_urls.log file and read the lines
     const lines = fs.readFileSync('./hourly_urls.log', 'utf-8').split('\n');
     for (const line of lines) {
       if (!line) continue;
-      /* check if starts with Hour */
       if (!line.startsWith('Hour')) continue;
-
-      //console.log('hls playback hour log line:', line);
-
-      /* parse format as `Hour test69/2025/03/17/13 => http://127.0.0.1:9000/hls/test69/2025/03/17/13/index.m3u8?auth_string_key`above */
       const [hour, url] = line.split(' => ');
       if (!hour || !url) {
         console.log('Invalid hour, url line:', line);
-        continue
+        continue;
       }
       const [jobId_prefix, year, month, day, hourStr] = hour.split('/');
       const [_, newJobId] = jobId_prefix.split(' ');
@@ -500,11 +489,7 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
         console.log('Invalid date, hourStr:', hourStr);
         continue;
       }
-      if (newJobId !== jobId) {
-        //console.debug('Not the requested jobId, skipping: ', jobId, ' != ', newJobId);
-        continue;
-      }
-      /* check if the hour is within the range */
+      if (newJobId !== jobId) continue;
       const hourDate = new Date(`${year}-${month}-${day}T${hourStr}:00:00Z`);
       if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
         console.log('Using hls playback url:', url);
@@ -512,7 +497,7 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
       }
     }
   } else {
-    // If no times are given, just get all the urls from the playlist file
+    // No start/end times; get all URLs matching the jobId from the playlist file.
     const lines = fs.readFileSync('./hourly_urls.log', 'utf-8').split('\n');
     for (const line of lines) {
       if (!line) continue;
@@ -522,49 +507,39 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
           console.log('Invalid hour, url line:', line);
           continue;
         }
-        /* Confirm we have the right jobId */
         const [jobId_prefix, year, month, day, hourStr] = hour.split('/');
         const [_, newJobId] = jobId_prefix.split(' ');
         if (!hourStr) {
-          console.log('Invalid date, hourStr:', date, hourStr);
+          console.log('Invalid date, hourStr:', hourStr);
           continue;
         }
-        if (newJobId !== jobId) {
-          //console.debug('Not the requested jobId, skipping: ', jobId, ' != ', newJobId);
-          continue;
-        }
+        if (newJobId !== jobId) continue;
         if (url) {
           vodPlaylists.push(url);
-          console.log('using hls playback url:', url);
+          console.log('Using hls playback url:', url);
         }
       }
     }
   }
 
-  /* array of child pids to return */
   let childArray = [];
-
-  /* go through each playlist and feed it to the hls-to-udp */
-  for (const vodPlaylist of vodPlaylists) {
-    // If we have a start/end time, assume we want multi-hour VOD mode
+  // Spawn each hls-to-udp process.
+  // Wait only for the first one if there is more than one playlist.
+  for (let i = 0; i < vodPlaylists.length; i++) {
     let baseArgs = [];
     baseArgs.push('--vod');
-    //baseArgs.push('-i', './hourly_urls.log');
     baseArgs.push('--use-smoother');
     baseArgs.push('-v', '1');
-    baseArgs.push('-u', `${vodPlaylist}`);
-
-    // Output
+    baseArgs.push('-u', `${vodPlaylists[i]}`);
     baseArgs.push('-o', `${ip}:${port}`);
 
     console.log(`Spawning hls-to-udp => ../bin/hls-to-udp ${baseArgs.join(' ')}`);
-    /* fill childArray per spawn */
     const child = spawn('../bin/hls-to-udp', baseArgs, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
+    childArray.push(child);
 
-
-    // Attach listeners for stdout and stderr for each spawned process
+    // Attach listeners for stdout and stderr
     child.stdout.on('data', data => {
       console.log(`hls-to-udp stdout: ${data.toString().trim()}`);
     });
@@ -572,10 +547,20 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
       console.error(`hls-to-udp stderr: ${data.toString().trim()}`);
     });
 
-    childArray.push(child);
+    // Only wait for the first process if there is more than one playlist
+    if (i === 0 && vodPlaylists.length > 1) {
+      await new Promise((resolve, reject) => {
+        child.on('close', code => {
+          console.log(`First hls-to-udp process ended with code=${code}`);
+          resolve();
+        });
+        child.on('error', err => {
+          reject(err);
+        });
+      });
+    }
   }
-  console.log('vodPlaylist: Launched ', childArray.length, ' hls-to-udp processes');
-
+  console.log('vodPlaylist: Launched', childArray.length, 'hls-to-udp processes (first one waited for)');
   return childArray;
 }
 
@@ -663,18 +648,18 @@ agentRouter.delete('/recordings/:jobId', (req, res) => {
 });
 
 // Start a playback job
-agentRouter.post('/jobs/playbacks', (req, res) => {
+agentRouter.post('/jobs/playbacks', async (req, res) => {
   const { jobId, sourceProfile, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
   if (!jobId || !destinationUrl) {
     return res.status(400).json({ error: 'Missing jobId or destinationUrl' });
   }
   let childArray;
   try {
-    childArray = spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime);
+    childArray = await spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
-  if (!childArray) {
+  if (!childArray || childArray.length === 0) {
     return res.status(400).json({ error: 'Invalid spawn' });
   }
   /* check if empty */
@@ -690,6 +675,50 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
     const pid = child.pid;
     pids.push(pid);
 
+    // Check if the jobId is already playing back. Silently proceed if not found.
+    db.get(`SELECT * FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
+      if (err) {
+        // see if the jobid is not int the db, if so then just let us process and don't return
+        console.error('Error checking for existing playback:', err);
+        try { process.kill(pid, 'SIGTERM'); }
+        catch { }
+        return res.status(500).json({ error: err.message });
+      }
+      if (row) {
+        if (row.status === 'running') {
+          // confirm the pid really exists and is still running, if so then return
+          try {
+            console.warn('Playback job marked already running: jobId=', jobId, 'pid=', row.processPid, ' checking if still running');
+            // check if pid is running still
+            process.kill(row.processPid, 0);
+            // kill the process
+            console.warn('Killing existing playback:', row.processPid);
+            try {
+              process.kill(row.processPid, 'SIGTERM');
+            } catch (err) {
+              console.log('Error killing existing playback:', err);
+            }
+            db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
+            console.warn('Deleted existing playback:', jobId);
+          } catch {
+            // if the process is not running, then delete the row and proceed
+            console.log('Playback job already running but not found: jobId=', jobId);
+            db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
+          }
+        } else {
+          db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId], (deleteErr) => {
+            if (deleteErr) {
+              console.error('Error deleting existing playback:', deleteErr);
+              try { process.kill(pid, 'SIGTERM'); }
+              catch { }
+              return res.status(500).json({ error: deleteErr.message });
+            }
+            // Deletion successful; proceed silently.
+          });
+        }
+      }
+    });
+
     db.run(
       `INSERT INTO agent_playbacks (jobId, sourceProfile, destinationUrl, duration, status, processPid, startTime)
       VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -697,7 +726,7 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
       err => {
         if (err) {
           try { process.kill(pid, 'SIGTERM'); } catch { }
-          return res.status(500).json({ error: err.message });
+          console.error('Error inserting playback:', err);
         }
 
         // If duration > 0, auto-stop
@@ -707,29 +736,32 @@ agentRouter.post('/jobs/playbacks', (req, res) => {
             try { process.kill(pid, 'SIGTERM'); } catch { }
             db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
             activeTimers.playbacks.delete(jobId);
-          }, duration * 1000);
+          }, (duration) * 1000);
           activeTimers.playbacks.set(jobId, timer);
         } else {
           /* get the duration from the db */
           db.get(`SELECT duration FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
             if (err) return res.status(500).json({ error: err.message });
             if (!row) return res.status(404).json({ message: 'Not found' });
-            const duration = row.duration;
-            if (duration && duration > 0) {
+            const durationFull = row.duration;
+            if (durationFull && durationFull > 0) {
               const timer = setTimeout(() => {
-                console.log(`Auto-stopping playback jobId=${jobId} after duration`);
+                console.log(`Auto-stopping playback jobId=${jobId} after duration ${durationFull}`);
                 try { process.kill(pid, 'SIGTERM'); } catch { }
                 db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
                 activeTimers.playbacks.delete(jobId);
-              }, duration * 1000);
+              }, (durationFull + 10) * 1000);
               activeTimers.playbacks.set(jobId, timer);
+            } else {
+              console.log('No duration found in db for jobId:', jobId);
+              // just play it forever, no cleanup setup
             }
           });
         }
         completedInserts++;
         // Once we've inserted them all, we can respond
         if (completedInserts === childArray.length) {
-          res.status(201).json({
+          return res.status(201).json({
             message: 'Playback job accepted',
             childCount: childArray.length,
             pids
