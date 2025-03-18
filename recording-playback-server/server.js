@@ -769,8 +769,14 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
         } else {
           /* get the duration from the db */
           db.get(`SELECT duration FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
-            if (err) return res.status(500).json({ error: err.message });
-            if (!row) return res.status(404).json({ message: 'Not found' });
+            if (err) {
+              console.error('Error getting duration from db:', err);
+              return;
+            }
+            if (!row) {
+              console.error('No duration found in db for jobId:', jobId);
+              return;
+            }
             const durationFull = row.duration;
             if (durationFull && durationFull > 0) {
               const timer = setTimeout(() => {
