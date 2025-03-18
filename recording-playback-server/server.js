@@ -15,7 +15,7 @@ const yaml = require('js-yaml');
 
 // Server URL Base
 const PORT = 3000;
-const serverUrl = 'http://localhost' + ':' + PORT;
+const serverUrl = 'http://127.0.0.1' + ':' + PORT;
 const s3endPoint = 'http://192.168.50.55:9000';
 
 // ----------------------------------------------------
@@ -164,9 +164,8 @@ managerRouter.post('/recordings', (req, res) => {
         return res.status(500).json({ error: err.message });
       }
 
-      console.log('About to call Agent with fetch, recordingId=', recordingId);
-
-      let fetchUrl = "http://" + serverUrl + "/v1/agent/jobs/recordings";
+      let fetchUrl = serverUrl + "/v1/agent/jobs/recordings";
+      console.log('About to call Agent with fetch, recordingId=', recordingId, ' Url=', sourceUrl, ' Duration=', duration, ' DestinationProfile=', destinationProfile, ' FetchUrl=', fetchUrl);
 
       fetch(fetchUrl, {
         method: 'POST',
@@ -319,9 +318,36 @@ managerRouter.post('/playbacks', (req, res) => {
     ],
     err => {
       if (err) return res.status(500).json({ error: err.message });
-      res.status(201).json({ playbackId });
+      //res.status(201).json({ playbackId });
     }
   );
+  // Call the agent to start the playback
+  let fetchUrl = serverUrl + "/v1/agent/jobs/playbacks";
+  console.log('About to call Agent with fetch, playbackId=', playbackId, ' SourceProfile=', sourceProfile, ' DestinationUrl=', destinationUrl, ' Duration=', duration, ' FetchUrl=', fetchUrl);
+  fetch(fetchUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jobId: playbackId,
+      sourceProfile,
+      destinationUrl,
+      duration
+    })
+  })
+    .then(agentResp => agentResp.json().catch(() => ({})))
+    .then(agentData => {
+      // We can optionally store agentData.pid into our DB if we want
+      // but for now, we just return the Manager's response
+      return res.status(201).json({ playbackId });
+    })
+    .catch(err2 => {
+      console.error('Error calling Agent endpoint:', err2);
+      // We already inserted the DB record, so decide how to handle:
+      return res.status(201).json({
+        playbackId,
+        warning: 'Recorded in Manager DB, but Agent spawn failed. Check logs.'
+      });
+    });
 });
 
 managerRouter.get('/playbacks', (req, res) => {
@@ -800,5 +826,5 @@ app.use('/v1/agent', agentRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`Server running on ${serverUrl}. Swagger at http://${serverUrl}/api-docs`);
+  console.log(`Server running on ${serverUrl}. Swagger at ${serverUrl}/api-docs`);
 });
