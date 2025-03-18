@@ -1,6 +1,6 @@
 [package]
 name = "udp-to-hls"
-version = "1.0.24"
+version = "1.0.25"
 description = "UDP MpegTS to HLS VOD for UDP MpegTS Re-Stream"
 keywords = ["mpegts", "s3", "hls", "udp"]
 categories = ["command-line-utilities"]

@@ -694,6 +694,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
   const now = new Date();
   let completedInserts = 0;
   const pids = [];
+  let errors = 0;
 
   // Insert each child of the array into the DB
   for (const child of childArray) {
@@ -707,7 +708,8 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
         console.error('Error checking for existing playback:', err);
         try { process.kill(pid, 'SIGTERM'); }
         catch { }
-        return res.status(500).json({ error: err.message });
+        errors++;
+        return;
       }
       if (row) {
         if (row.status === 'running') {
@@ -736,7 +738,8 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
               console.error('Error deleting existing playback:', deleteErr);
               try { process.kill(pid, 'SIGTERM'); }
               catch { }
-              return res.status(500).json({ error: deleteErr.message });
+              errors++;
+              return;
             }
             // Deletion successful; proceed silently.
           });
@@ -786,11 +789,16 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
         completedInserts++;
         // Once we've inserted them all, we can respond
         if (completedInserts === childArray.length) {
-          return res.status(201).json({
-            message: 'Playback job accepted',
-            childCount: childArray.length,
-            pids
-          });
+          if (completedInserts > 0) {
+            console.error('Inserted all child processes:', completedInserts, ' of ', childArray.length, ' with ', errors, ' errors');
+            return res.status(201).json({
+              message: 'Playback job accepted',
+              childCount: childArray.length,
+              pids
+            });
+          } else {
+            return res.status(400).json({ error: ('Only ', completedInserts, ' child processes inserted of ', childArray.length, ' with ', errors, ' errors') });
+          }
         }
       }
     );

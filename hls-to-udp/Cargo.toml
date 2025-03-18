@@ -1,6 +1,6 @@
 [package]
 name = "hls-to-udp"
-version = "1.0.24"
+version = "1.0.25"
 edition = "2021"
 description = "HLS VOD to MPEG-TS UDP Re-cast."
 keywords = ["mpegts", "s3", "hls", "udp"]
@@ -39,5 +39,5 @@ regex = "1.11.1"
 chrono = "0.4.40"
 
 [patch.crates-io]
-libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "master" }
-libltntstools = { git = "https://github.com/groovybits/libltntstools", branch = "master" }
+libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "mutex_recursive" }
+libltntstools = { git = "https://github.com/groovybits/libltntstools", branch = "mutex_recursive" }
