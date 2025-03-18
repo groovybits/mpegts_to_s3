@@ -2,6 +2,8 @@
  * server.js — Recording/Playback API Server
  ****************************************************/
 
+const serverVersion = '1.0.26';
+
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const sqlite3 = require('sqlite3').verbose();
@@ -906,5 +908,5 @@ app.use('/v1/agent', agentRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`Server running on ${serverUrl}. Swagger at ${serverUrl}/api-docs`);
+  console.log(`Server version ${serverVersion} running on ${serverUrl}. Swagger at ${serverUrl}/api-docs`);
 });
