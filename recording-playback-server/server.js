@@ -629,7 +629,7 @@ agentRouter.post('/jobs/recordings', (req, res) => {
           try { process.kill(pid, 'SIGTERM'); } catch { }
           db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
           activeTimers.recordings.delete(jobId);
-        }, (duration + 1) * 1000);
+        }, (duration + 10) * 1000); // Add 10s buffer
         activeTimers.recordings.set(jobId, timer);
       }
 
@@ -768,5 +768,5 @@ app.use('/v1/agent', agentRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`Server running on ${serverUrl}}. Swagger at http://${serverUrl}}/api-docs`);
+  console.log(`Server running on ${serverUrl}. Swagger at http://${serverUrl}/api-docs`);
 });
