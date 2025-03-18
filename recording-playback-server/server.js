@@ -13,6 +13,11 @@ const fs = require('fs');
 const swaggerUi = require('swagger-ui-express');
 const yaml = require('js-yaml');
 
+// Server URL Base
+const PORT = 3000;
+const serverUrl = 'http://localhost' + ':' + PORT;
+const s3endPoint = 'http://192.168.50.55:9000';
+
 // ----------------------------------------------------
 // Embedded Swagger YAML as a multiline string
 // (Or store in a .yaml or inline this.)
@@ -38,7 +43,18 @@ info:
     - Full usage metrics and “god mode” under Admin endpoints.
 
 servers:
-  - url: http://localhost:3000/v1
+  - url: '{protocol}://{host}:{port}/v1'
+    description: Development server
+    variables:
+      protocol:
+        enum: ['http', 'https']
+        default: 'http'
+      host:
+        default: 'localhost'
+        description: 'Host name or IP'
+      port:
+        default: '3000'
+        description: 'Port number'
 
 tags:
   - name: Manager-Recordings
@@ -686,8 +702,8 @@ paths:
 const swaggerDoc = yaml.load(swaggerYaml);
 
 // ----------------------------------------------------
-// Helper: parse "udp://224.0.0.200:10001?interface=en0"
-// to get ip=224.0.0.200, port=10001, interface=en0
+// Helper: parse "udp://224.0.0.200:10001?interface=enp0s5"
+// to get ip=224.0.0.200, port=10001, interface=enp0s5
 // ----------------------------------------------------
 function parseUdpUrl(urlString) {
   try {
@@ -697,7 +713,7 @@ function parseUdpUrl(urlString) {
     }
     const ip = u.hostname;
     const port = u.port || '10001';
-    const iface = u.searchParams.get('interface') || 'en0';
+    const iface = u.searchParams.get('interface') || 'enp0s5';
     return { ip, port, iface };
   } catch (e) {
     return null;
@@ -825,7 +841,9 @@ managerRouter.post('/recordings', (req, res) => {
 
       console.log('About to call Agent with fetch, recordingId=', recordingId);
 
-      fetch('http://localhost:3000/v1/agent/jobs/recordings', {
+      let fetchUrl = "http://" + serverUrl + "/v1/agent/jobs/recordings";
+
+      fetch(fetchUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1056,7 +1074,7 @@ const agentRouter = express.Router();
  * Helper to spawn udp-to-hls with appropriate args
  * Returns: childProcess
  */
-function spawnUdpToHls(jobId, sourceUrl, duration) {
+function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
   // Attempt to parse the sourceUrl as a UDP URL
   const parsed = parseUdpUrl(sourceUrl);
   if (!parsed) {
@@ -1072,6 +1090,8 @@ function spawnUdpToHls(jobId, sourceUrl, duration) {
   const args = [
     '-n', iface,
     '-v', '2',
+    '-e', s3endPoint,
+    '-b', s3bucketName,
     '--duration', duration,
     '--hls_keep_segments', '10',
     '-i', ip,
@@ -1238,7 +1258,7 @@ agentRouter.post('/jobs/recordings', (req, res) => {
   }
   let child;
   try {
-    child = spawnUdpToHls(jobId, sourceUrl, duration);
+    child = spawnUdpToHls(jobId, sourceUrl, duration, destinationProfile);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
@@ -1402,7 +1422,6 @@ app.use('/v1/agent', agentRouter);
 // ----------------------------------------------------
 // Start the server
 // ----------------------------------------------------
-const PORT = 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}. Swagger at http://localhost:${PORT}/api-docs`);
+  console.log(`Server running on ${serverUrl}}. Swagger at http://${serverUrl}}/api-docs`);
 });
