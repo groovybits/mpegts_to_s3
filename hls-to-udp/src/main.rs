@@ -740,6 +740,8 @@ fn sender_thread(
                         e
                     );
                     tx_shutdown_cloned.send(()).ok();
+                    /* exit program */
+                    std::process::exit(1);
                 }
             })
         };

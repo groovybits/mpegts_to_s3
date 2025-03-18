@@ -39,5 +39,5 @@ regex = "1.11.1"
 chrono = "0.4.40"
 
 [patch.crates-io]
-libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "reduce_cpu_smoothing" }
-libltntstools = { git = "https://github.com/groovybits/libltntstools", branch = "reduce_cpu_smoothing" }
+libltntstools-sys = { git = "https://github.com/groovybits/libltntstools", branch = "master" }
+libltntstools = { git = "https://github.com/groovybits/libltntstools", branch = "master" }

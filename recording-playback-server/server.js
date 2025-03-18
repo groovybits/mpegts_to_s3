@@ -1209,6 +1209,7 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
     });
     childArray.push(child);
   }
+  console.log('vodPlaylist: Launched ', childArray.length, ' hls-to-udp processes');
 
   return childArray;
 }
