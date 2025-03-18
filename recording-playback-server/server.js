@@ -44,6 +44,42 @@ function parseUdpUrl(urlString) {
   }
 }
 
+/**
+ * Helper to read hourly_urls.log and store recording URLs into DB for a given jobId.
+ */
+function storeRecordingUrls(jobId) {
+  try {
+    const fileData = fs.readFileSync('./hourly_urls.log', 'utf-8');
+    const lines = fileData.split('\n');
+    for (const line of lines) {
+      if (!line.startsWith('Hour')) continue;
+      const parts = line.split(' => ');
+      if (parts.length !== 2) continue;
+      const hourPart = parts[0]; // e.g., "Hour job20/2025/03/18/10"
+      const url = parts[1];
+      const tokens = hourPart.split(' ');
+      if (tokens.length < 2) continue;
+      const jobDatePart = tokens[1]; // "job20/2025/03/18/10"
+      const jobIdFromFile = jobDatePart.split('/')[0];
+      if (jobIdFromFile !== jobId) continue;
+      const hourString = jobDatePart.substring(jobIdFromFile.length + 1); // "2025/03/18/10"
+      db.run(
+        `INSERT OR REPLACE INTO recording_urls (jobId, hour, url) VALUES (?, ?, ?)`,
+        [jobId, hourString, url.trim()],
+        function (err) {
+          if (err) {
+            console.error('Error inserting recording url into DB for job', jobId, ':', err.message);
+          } else {
+            console.log('Inserted recording url ', url.trim(), ' into DB for job:', jobId, 'hour:', hourString);
+          }
+        }
+      );
+    }
+  } catch (err) {
+    console.error('Error reading hourly_urls.log:', err.message);
+  }
+}
+
 // ----------------------------------------------------
 // SQLite initialization
 // ----------------------------------------------------
@@ -62,6 +98,7 @@ db.serialize(() => {
       processPid INTEGER
     )
   `);
+  // Playbacks table
   db.run(`
     CREATE TABLE IF NOT EXISTS playbacks (
       id TEXT PRIMARY KEY,
@@ -74,6 +111,7 @@ db.serialize(() => {
       processPid INTEGER
     )
   `);
+  // Pools table
   db.run(`
     CREATE TABLE IF NOT EXISTS pools (
       id TEXT PRIMARY KEY,
@@ -82,6 +120,7 @@ db.serialize(() => {
       secretKey TEXT
     )
   `);
+  // Assets table
   db.run(`
     CREATE TABLE IF NOT EXISTS assets (
       id TEXT PRIMARY KEY,
@@ -89,7 +128,15 @@ db.serialize(() => {
       metadata TEXT
     )
   `);
-
+  // Recording URLs table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS recording_urls (
+      jobId TEXT,
+      hour TEXT,
+      url TEXT,
+      PRIMARY KEY (jobId, hour)
+    )
+  `);
   // Agent tables
   db.run(`
     CREATE TABLE IF NOT EXISTS agent_recordings (
@@ -102,6 +149,7 @@ db.serialize(() => {
       startTime TEXT
     )
   `);
+  // Agent playbacks table
   db.run(`
     CREATE TABLE IF NOT EXISTS agent_playbacks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,7 +349,7 @@ managerRouter.post('/playbacks', (req, res) => {
   const { sourceProfile, destinationUrl, duration } = req.body;
   const playbackId = `play-${uuidv4()}`;
   const now = new Date();
-  const endTime = duration > 0 ? new Date(now.getTime() + duration * 1000) : null;
+  const endTime = duration > 0 ? new Date(now.getTime() + (duration + 3) * 1000) : null;
 
   db.run(
     `INSERT INTO playbacks (id, sourceProfile, destinationUrl, duration, startTime, endTime, status, processPid)
@@ -442,7 +490,7 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
     '-v', '1',
     '-e', s3endPoint,
     '-b', s3bucketName,
-    '--duration', duration,
+    //'--duration', duration,
     '--hls_keep_segments', '10',
     '-i', ip,
     '-p', port,
@@ -456,14 +504,72 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
 
   // Attach listeners for stdout and stderr
   child.stdout.on('data', data => {
-    // strip the extra newlines
-    console.log(`udp-to-hls stdout: ${data.toString().trim()}`);
+    const output = data.toString().trim();
+    console.log(`udp-to-hls stdout: ${output}`);
+    // If output starts with "Hour", parse and store in DB
+    if (output.startsWith('Hour')) {
+      // Expected format: "Hour <jobId>/<year>/<month>/<day>/<hourStr> => <url>"
+      const parts = output.split(' => ');
+      if (parts.length === 2) {
+        const hourPart = parts[0]; // e.g., "Hour rec-xxxx/yyyy/mm/dd/hh:mm:ss"
+        const url = parts[1];
+        // Remove "Hour " prefix
+        const hourInfo = hourPart.substring(5).trim();
+        const firstSlash = hourInfo.indexOf('/');
+        if (firstSlash !== -1) {
+          const currentJobId = hourInfo.substring(0, firstSlash);
+          const hourString = hourInfo.substring(firstSlash + 1); // "yyyy/mm/dd/hh:mm:ss"
+          db.run(
+            `INSERT OR REPLACE INTO recording_urls (jobId, hour, url) VALUES (?, ?, ?)`,
+            [currentJobId, hourString, url],
+            function (err) {
+              if (err) {
+                console.error('Error inserting recording url into DB:', err.message);
+              } else {
+                console.log('Inserted recording url into DB for job:', currentJobId, 'hour:', hourString);
+              }
+            }
+          );
+        }
+      }
+    }
   });
   child.stderr.on('data', data => {
     console.error(`udp-to-hls stderr: ${data.toString().trim()}`);
   });
 
   return child;
+}
+
+async function getVodPlaylists(jobId, vodStartTime, vodEndTime) {
+  return new Promise((resolve, reject) => {
+    db.all(`SELECT hour, url FROM recording_urls WHERE jobId = ?`, [jobId], (err, rows) => {
+      if (err) {
+        return reject(err);
+      }
+      const vodPlaylists = [];
+      for (const row of rows) {
+        // row.hour is expected in format "yyyy/mm/dd/hh:mm:ss"
+        const dateParts = row.hour.split('/');
+        if (dateParts.length < 4) {
+          console.log('Invalid date format in recording_urls:', row.hour);
+          continue;
+        }
+        const isoString = `${dateParts[0]}-${dateParts[1]}-${dateParts[2]}T${dateParts[3]}Z`;
+        const hourDate = new Date(isoString);
+        if (vodStartTime && vodEndTime && (vodStartTime !== "" || vodEndTime !== "")) {
+          if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
+            console.log('Using hls playback url:', row.url);
+            vodPlaylists.push(row.url);
+          }
+        } else {
+          console.log('Using hls playback url:', row.url);
+          vodPlaylists.push(row.url);
+        }
+      }
+      resolve(vodPlaylists);
+    });
+  });
 }
 
 /**
@@ -484,72 +590,18 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
   }
   const { ip, port } = parsedDest;
 
-  // Build the vodPlaylists array by reading the ./hourly_urls.log file
+  // Build the vodPlaylists array by querying the recording_urls table in the DB
   let vodPlaylists = [];
-  if (vodStartTime && vodEndTime && (vodStartTime !== "" || vodEndTime !== "")) {
-    if (new Date(vodEndTime) <= new Date(vodStartTime)) {
-      console.log('Invalid vodEndTime, vodEndTime:', vodEndTime, ' <= vodStartTime:', vodStartTime);
-      return [];
-    }
-    if (!new Date(vodStartTime).toISOString().includes(vodStartTime)) {
-      console.log('Invalid vodStartTime, vodStartTime:', vodStartTime);
-      return [];
-    }
-    if (!new Date(vodEndTime).toISOString().includes(vodEndTime)) {
-      console.log('Invalid vodEndTime, vodEndTime:', vodEndTime);
-      return [];
-    }
-    const lines = fs.readFileSync('./hourly_urls.log', 'utf-8').split('\n');
-    for (const line of lines) {
-      if (!line) continue;
-      if (!line.startsWith('Hour')) continue;
-      const [hour, url] = line.split(' => ');
-      if (!hour || !url) {
-        console.log('Invalid hour, url line:', line);
-        continue;
-      }
-      const [jobId_prefix, year, month, day, hourStr] = hour.split('/');
-      const [_, newJobId] = jobId_prefix.split(' ');
-      if (!hourStr) {
-        console.log('Invalid date, hourStr:', hourStr);
-        continue;
-      }
-      if (newJobId !== jobId) continue;
-      const hourDate = new Date(`${year}-${month}-${day}T${hourStr}:00:00Z`);
-      if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
-        console.log('Using hls playback url:', url);
-        vodPlaylists.push(url);
-      }
-    }
-  } else {
-    // No start/end times; get all URLs matching the jobId from the playlist file.
-    const lines = fs.readFileSync('./hourly_urls.log', 'utf-8').split('\n');
-    for (const line of lines) {
-      if (!line) continue;
-      if (line.startsWith('Hour')) {
-        const [hour, url] = line.split(' => ');
-        if (!hour || !url) {
-          console.log('Invalid hour, url line:', line);
-          continue;
-        }
-        const [jobId_prefix, year, month, day, hourStr] = hour.split('/');
-        const [_, newJobId] = jobId_prefix.split(' ');
-        if (!hourStr) {
-          console.log('Invalid date, hourStr:', hourStr);
-          continue;
-        }
-        if (newJobId !== jobId) continue;
-        if (url) {
-          vodPlaylists.push(url);
-          console.log('Using hls playback url:', url);
-        }
-      }
-    }
+  try {
+    vodPlaylists = await getVodPlaylists(jobId, vodStartTime, vodEndTime);
+  } catch (err) {
+    console.error('Error getting vod playlists from DB:', err.message);
+    return [];
   }
 
   let childArray = [];
   // Spawn each hls-to-udp process.
-  // Wait only for the first one if there is more than one playlist.
+  // Wait only for the first process if there is more than one playlist.
   for (let i = 0; i < vodPlaylists.length; i++) {
     let baseArgs = [];
     baseArgs.push('--vod');
@@ -634,17 +686,24 @@ agentRouter.post('/jobs/recordings', (req, res) => {
       // If duration > 0, auto-stop after duration
       if (duration && duration > 0) {
         const timer = setTimeout(() => {
-          console.log(`Auto-stopping recording jobId=${jobId} after duration`);
+          console.log(`Auto-stopping recording jobId=${jobId} after duration=${duration}`);
           // Stop the process
           try { process.kill(pid, 'SIGTERM'); } catch { }
+          // Store the recording URLs in DB from the hourly_urls.log file
+          storeRecordingUrls(jobId);
           db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
           activeTimers.recordings.delete(jobId);
-        }, (duration + 10) * 1000); // Add 10s buffer
+        }, (duration + 60.0) * 1000); // Add up to 60s buffer for GOP alignment or other delays
         activeTimers.recordings.set(jobId, timer);
       }
 
       child.on('close', code => {
-        console.log(`Recording jobId=${jobId} ended with code=${code}`);
+        console.log(`Recording jobId=${jobId} ended with code=${code} after duration=${duration}`);
+        // Store the recording URLs in DB from the hourly_urls.log file
+        storeRecordingUrls(jobId);
+        db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
+        activeTimers.recordings.delete
+          (jobId);
       });
       res.status(201).json({ message: 'Recording job accepted', pid });
     }
@@ -694,6 +753,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
   const now = new Date();
   let completedInserts = 0;
   const pids = [];
+  let errors = 0;
 
   // Insert each child of the array into the DB
   for (const child of childArray) {
@@ -707,7 +767,8 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
         console.error('Error checking for existing playback:', err);
         try { process.kill(pid, 'SIGTERM'); }
         catch { }
-        return res.status(500).json({ error: err.message });
+        errors++;
+        return;
       }
       if (row) {
         if (row.status === 'running') {
@@ -736,7 +797,8 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
               console.error('Error deleting existing playback:', deleteErr);
               try { process.kill(pid, 'SIGTERM'); }
               catch { }
-              return res.status(500).json({ error: deleteErr.message });
+              errors++;
+              return;
             }
             // Deletion successful; proceed silently.
           });
@@ -761,13 +823,19 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
             try { process.kill(pid, 'SIGTERM'); } catch { }
             db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
             activeTimers.playbacks.delete(jobId);
-          }, (duration) * 1000);
+          }, (duration + 3.0) * 1000);
           activeTimers.playbacks.set(jobId, timer);
         } else {
           /* get the duration from the db */
           db.get(`SELECT duration FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
-            if (err) return res.status(500).json({ error: err.message });
-            if (!row) return res.status(404).json({ message: 'Not found' });
+            if (err) {
+              console.error('Error getting duration from db:', err);
+              return;
+            }
+            if (!row) {
+              console.error('No duration found in db for jobId:', jobId);
+              return;
+            }
             const durationFull = row.duration;
             if (durationFull && durationFull > 0) {
               const timer = setTimeout(() => {
@@ -775,7 +843,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
                 try { process.kill(pid, 'SIGTERM'); } catch { }
                 db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
                 activeTimers.playbacks.delete(jobId);
-              }, (durationFull + 10) * 1000);
+              }, (durationFull + 3.0) * 1000);
               activeTimers.playbacks.set(jobId, timer);
             } else {
               console.log('No duration found in db for jobId:', jobId);
@@ -786,11 +854,24 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
         completedInserts++;
         // Once we've inserted them all, we can respond
         if (completedInserts === childArray.length) {
-          return res.status(201).json({
-            message: 'Playback job accepted',
-            childCount: childArray.length,
-            pids
-          });
+          if (completedInserts > 0) {
+            child.on('close', code => {
+              console.log(`Playback jobId=${jobId} ended with code=${code}`);
+              try { process.kill(pid, 'SIGTERM'); }
+              catch { }
+              db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
+              activeTimers.playbacks.delete(jobId);
+            }
+            );
+            console.error('Inserted all child processes:', completedInserts, ' of ', childArray.length, ' with ', errors, ' errors');
+            return res.status(201).json({
+              message: 'Playback job accepted',
+              childCount: childArray.length,
+              pids
+            });
+          } else {
+            return res.status(400).json({ error: ('Only ', completedInserts, ' child processes inserted of ', childArray.length, ' with ', errors, ' errors') });
+          }
         }
       }
     );

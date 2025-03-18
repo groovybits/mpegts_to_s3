@@ -1276,11 +1276,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             break;
         }
 
-        if duration > 0 && Instant::now().duration_since(start_time) >= Duration::from_secs(duration) {
-            println!("UDPtoHLS: Duration limit reached, exiting main loop");
-            break;
-        }
-
         let (packet_data, timestamp) = match pcap_rx.recv() {
             Ok((data, ts)) => (data, ts),
             Err(e) => {
@@ -1375,6 +1370,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 hex::encode(&packet_data[..16]),
                 packet_data.len()
             );
+        }
+
+        if duration > 0 && Instant::now().duration_since(start_time) >= Duration::from_secs(duration + 15) {
+            println!("UDPtoHLS: Duration limit reached after {} seconds", duration);
+            break;
         }
     }
 
