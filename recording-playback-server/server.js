@@ -349,7 +349,7 @@ managerRouter.post('/playbacks', (req, res) => {
   const { sourceProfile, destinationUrl, duration } = req.body;
   const playbackId = `play-${uuidv4()}`;
   const now = new Date();
-  const endTime = duration > 0 ? new Date(now.getTime() + duration * 1000) : null;
+  const endTime = duration > 0 ? new Date(now.getTime() + (duration + 3) * 1000) : null;
 
   db.run(
     `INSERT INTO playbacks (id, sourceProfile, destinationUrl, duration, startTime, endTime, status, processPid)
@@ -686,19 +686,24 @@ agentRouter.post('/jobs/recordings', (req, res) => {
       // If duration > 0, auto-stop after duration
       if (duration && duration > 0) {
         const timer = setTimeout(() => {
-          console.log(`Auto-stopping recording jobId=${jobId} after duration`);
+          console.log(`Auto-stopping recording jobId=${jobId} after duration=${duration}`);
           // Stop the process
           try { process.kill(pid, 'SIGTERM'); } catch { }
           // Store the recording URLs in DB from the hourly_urls.log file
           storeRecordingUrls(jobId);
           db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
           activeTimers.recordings.delete(jobId);
-        }, (duration + 30.0) * 1000); // Add up to 30s buffer for GOP alignment
+        }, (duration + 60.0) * 1000); // Add up to 60s buffer for GOP alignment or other delays
         activeTimers.recordings.set(jobId, timer);
       }
 
       child.on('close', code => {
-        console.log(`Recording jobId=${jobId} ended with code=${code}`);
+        console.log(`Recording jobId=${jobId} ended with code=${code} after duration=${duration}`);
+        // Store the recording URLs in DB from the hourly_urls.log file
+        storeRecordingUrls(jobId);
+        db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
+        activeTimers.recordings.delete
+          (jobId);
       });
       res.status(201).json({ message: 'Recording job accepted', pid });
     }
@@ -818,7 +823,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
             try { process.kill(pid, 'SIGTERM'); } catch { }
             db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
             activeTimers.playbacks.delete(jobId);
-          }, (duration) * 1000);
+          }, (duration + 3.0) * 1000);
           activeTimers.playbacks.set(jobId, timer);
         } else {
           /* get the duration from the db */
@@ -838,7 +843,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
                 try { process.kill(pid, 'SIGTERM'); } catch { }
                 db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
                 activeTimers.playbacks.delete(jobId);
-              }, (durationFull + 1.0) * 1000);
+              }, (durationFull + 3.0) * 1000);
               activeTimers.playbacks.set(jobId, timer);
             } else {
               console.log('No duration found in db for jobId:', jobId);
@@ -850,6 +855,14 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
         // Once we've inserted them all, we can respond
         if (completedInserts === childArray.length) {
           if (completedInserts > 0) {
+            child.on('close', code => {
+              console.log(`Playback jobId=${jobId} ended with code=${code}`);
+              try { process.kill(pid, 'SIGTERM'); }
+              catch { }
+              db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
+              activeTimers.playbacks.delete(jobId);
+            }
+            );
             console.error('Inserted all child processes:', completedInserts, ' of ', childArray.length, ' with ', errors, ' errors');
             return res.status(201).json({
               message: 'Playback job accepted',
