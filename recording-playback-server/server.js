@@ -1089,7 +1089,7 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
   // You may add other flags for S3 endpoints, etc.
   const args = [
     '-n', iface,
-    '-v', '2',
+    '-v', '1',
     '-e', s3endPoint,
     '-b', s3bucketName,
     '--duration', duration,
@@ -1227,7 +1227,7 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
     baseArgs.push('--vod');
     baseArgs.push('-i', './hourly_urls.log');
     baseArgs.push('--use-smoother');
-    baseArgs.push('-v', '2');
+    baseArgs.push('-v', '1');
     baseArgs.push('-u', `${vodPlaylist}`);
 
     // Output
