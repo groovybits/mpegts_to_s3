@@ -442,7 +442,7 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
     '-v', '1',
     '-e', s3endPoint,
     '-b', s3bucketName,
-    '--duration', duration,
+    //'--duration', duration,
     '--hls_keep_segments', '10',
     '-i', ip,
     '-p', port,
