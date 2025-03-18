@@ -74,7 +74,7 @@ paths:
         According to specs:
         - Minimum duration: 10 seconds  
         - Maximum duration: 6 hours  
-        - Accepts an LTN endpoint, a UDP URL, or an SRT URL.  
+        - Accepts an endpoint, a UDP URL, or an RTP URL.  
         - destinationProfile references internal AWS/MinIO credentials.
       requestBody:
         required: true
@@ -85,7 +85,7 @@ paths:
               properties:
                 sourceUrl:
                   type: string
-                  description: LTN / UDP / SRT endpoint
+                  description: UDP / RTP endpoint
                 duration:
                   type: integer
                   description: Duration in seconds (10 sec to 6 hrs)
@@ -362,7 +362,7 @@ paths:
       description: >
         Begins a playback job immediately (no scheduling).  
         Can handle static or growing assets for partial time range playback.  
-        Accepts LTN, UDP, or SRT as destinations, plus S3 references.
+        Accepts UDP, or RTP as destinations, plus S3 references.
       requestBody:
         required: true
         content:
@@ -375,7 +375,7 @@ paths:
                   description: References credentials for reading the asset
                 destinationUrl:
                   type: string
-                  description: LTN, UDP, or SRT URL for playout
+                  description: UDP, or RTP URL for playout
                 duration:
                   type: integer
                   description: Duration in seconds (could be 'infinite' if 0 or omitted)
