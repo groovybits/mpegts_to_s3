@@ -1,0 +1,674 @@
+openapi: 3.0.3
+info:
+  title: Recording & Playback 2025 API
+  version: 1.0.0
+  description: >
+    Comprehensive API specification for the Recording/Playback stack.  
+    This document covers:
+    - **Manager API** (externally facing, single instance per cluster).  
+    - **Agent API** (one instance per server, controlled by the Manager).  
+
+    Key points from the specs:
+    - **MPEG-TS** SPTS or MPTS as the storage/transfer format.
+    - **Immediate start** for all recordings and playbacks (no future scheduling).
+    - **S3-based Pools** for asset storage (AWS or MinIO), with flexible credentials.
+    - **Durations** range from 10 seconds (minimum) to 6 hours (maximum).
+    - **Bitrates** range from 1 Kb/s to 240 Mb/s.
+    - Thumbnails generated approximately every 60 seconds (where applicable).
+    - Full usage metrics and “god mode” under Admin endpoints.
+
+servers:
+  - url: "{protocol}://{host}:{port}/v1"
+    description: Development server
+    variables:
+      protocol:
+        enum: ["http", "https"]
+        default: "http"
+      host:
+        default: "localhost"
+        description: "Host name or IP"
+      port:
+        default: "3000"
+        description: "Port number"
+
+tags:
+  - name: Manager-Recordings
+    description: Manager-facing endpoints to create and manage recording jobs.
+  - name: Manager-Playbacks
+    description: Manager-facing endpoints for playback control.
+  - name: Manager-Pools
+    description: Manage or query user-defined storage pools.
+  - name: Manager-Assets
+    description: Endpoints to query or delete stored assets.
+  - name: Manager-Admin
+    description: Administrative (support/god) mode operations.
+  - name: Agent-Recordings
+    description: Agent's recording execution endpoints.
+  - name: Agent-Playbacks
+    description: Agent's playback execution endpoints.
+  - name: Agent-Misc
+    description: Agent status, metrics, and other endpoints.
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+security:
+  - BearerAuth: []
+
+paths:
+  ########################################################
+  # Manager API - RECORDINGS
+  ########################################################
+
+  /recordings:
+    post:
+      tags:
+        - Manager-Recordings
+      summary: Create a new recording
+      description: >
+        Initiates a new recording immediately, creating a growing asset.  
+        According to specs:
+        - Minimum duration: 10 seconds  
+        - Maximum duration: 6 hours  
+        - Accepts an LTN endpoint, a UDP URL, or an SRT URL.  
+        - destinationProfile references internal AWS/MinIO credentials.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sourceUrl:
+                  type: string
+                  description: LTN / UDP / SRT endpoint
+                duration:
+                  type: integer
+                  description: Duration in seconds (10 sec to 6 hrs)
+                destinationProfile:
+                  type: string
+                  description: Shortcut to internal credential set
+              required:
+                - sourceUrl
+                - duration
+                - destinationProfile
+      responses:
+        "201":
+          description: Recording job created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recordingId:
+                    type: string
+                    description: Unique identifier for the recording
+
+    get:
+      tags:
+        - Manager-Recordings
+      summary: List all active or recent recordings
+      description: >
+        Returns metadata about ongoing or recently completed recording jobs
+        for the authenticated user.
+      responses:
+        "200":
+          description: List of recordings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    recordingId:
+                      type: string
+                    sourceUrl:
+                      type: string
+                    duration:
+                      type: integer
+                    destinationProfile:
+                      type: string
+                    startTime:
+                      type: string
+                      format: date-time
+                    endTime:
+                      type: string
+                      format: date-time
+                    status:
+                      type: string
+                      enum: [starting, active, completed, canceled]
+
+  /recordings/{recordingId}:
+    get:
+      tags:
+        - Manager-Recordings
+      summary: Get details of a specific recording
+      description: >
+        Returns detailed status and metadata for a single recording job, including
+        current size, bitrate, and thumbnail URL updated every 60 seconds.
+      parameters:
+        - in: path
+          name: recordingId
+          schema:
+            type: string
+          required: true
+      responses:
+        "200":
+          description: Recording details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recordingId:
+                    type: string
+                  sourceUrl:
+                    type: string
+                  duration:
+                    type: integer
+                  destinationProfile:
+                    type: string
+                  currentSize:
+                    type: integer
+                  startTime:
+                    type: string
+                    format: date-time
+                  endTime:
+                    type: string
+                    format: date-time
+                  bitrate:
+                    type: integer
+                  ccErrorCount:
+                    type: integer
+                  thumbnailUrl:
+                    type: string
+                  status:
+                    type: string
+
+    delete:
+      tags:
+        - Manager-Recordings
+      summary: Cancel a recording
+      parameters:
+        - in: path
+          name: recordingId
+          schema:
+            type: string
+          required: true
+      responses:
+        "204":
+          description: Recording canceled
+
+  ########################################################
+  # Manager API - POOLS
+  ########################################################
+
+  /pools:
+    post:
+      tags:
+        - Manager-Pools
+      summary: Create a new storage pool
+      description: >
+        Defines a user-specific S3 (or similar) bucket with credentials.
+        Pools are not shared between users (yet).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bucketName:
+                  type: string
+                  description: Name of the S3/MinIO bucket
+                credentials:
+                  type: object
+                  properties:
+                    accessKey:
+                      type: string
+                    secretKey:
+                      type: string
+                  required:
+                    - accessKey
+                    - secretKey
+              required:
+                - bucketName
+                - credentials
+      responses:
+        "201":
+          description: Pool created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poolId:
+                    type: string
+                    description: Unique pool identifier
+                  bucketName:
+                    type: string
+
+    get:
+      tags:
+        - Manager-Pools
+      summary: Enumerate all pools for the authenticated user
+      responses:
+        "200":
+          description: List of pools
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    poolId:
+                      type: string
+                    bucketName:
+                      type: string
+
+  /pools/{poolId}/assets:
+    get:
+      tags:
+        - Manager-Assets
+      summary: List assets within a specific pool
+      parameters:
+        - in: path
+          name: poolId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Assets in the pool
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    assetId:
+                      type: string
+                      description: Globally unique (POOLID-ASSETID)
+                    metadata:
+                      type: object
+                      description: Arbitrary metadata about the asset
+
+    delete:
+      tags:
+        - Manager-Assets
+      summary: Delete an asset from a pool
+      parameters:
+        - in: path
+          name: poolId
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: assetId
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Asset deleted
+
+  ########################################################
+  # Manager API - ASSETS
+  ########################################################
+
+  /assets/{assetId}:
+    get:
+      tags:
+        - Manager-Assets
+      summary: Get metadata for a single asset
+      parameters:
+        - in: path
+          name: assetId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Asset metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assetId:
+                    type: string
+                  poolId:
+                    type: string
+                  metadata:
+                    type: object
+                    description: Additional details (bitrate, size, etc.)
+
+  ########################################################
+  # Manager API - PLAYBACKS
+  ########################################################
+
+  /playbacks:
+    post:
+      tags:
+        - Manager-Playbacks
+      summary: Create a new playback job
+      description: >
+        Begins a playback job immediately (no scheduling).  
+        Can handle static or growing assets for partial time range playback.  
+        Accepts LTN, UDP, or SRT as destinations, plus S3 references.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sourceProfile:
+                  type: string
+                  description: References credentials for reading the asset
+                destinationUrl:
+                  type: string
+                  description: LTN, UDP, or SRT URL for playout
+                duration:
+                  type: integer
+                  description: Duration in seconds (could be 'infinite' if 0 or omitted)
+              required:
+                - sourceProfile
+                - destinationUrl
+                - duration
+      responses:
+        "201":
+          description: Playback job created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playbackId:
+                    type: string
+
+    get:
+      tags:
+        - Manager-Playbacks
+      summary: List all playback jobs
+      responses:
+        "200":
+          description: A list of playback jobs for the user
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    playbackId:
+                      type: string
+                    sourceProfile:
+                      type: string
+                    destinationUrl:
+                      type: string
+                    duration:
+                      type: integer
+                    status:
+                      type: string
+
+  /playbacks/{playbackId}:
+    get:
+      tags:
+        - Manager-Playbacks
+      summary: Get details about a playback job
+      parameters:
+        - in: path
+          name: playbackId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Playback details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playbackId:
+                    type: string
+                  sourceProfile:
+                    type: string
+                  destinationUrl:
+                    type: string
+                  duration:
+                    type: integer
+                  currentSize:
+                    type: integer
+                  startTime:
+                    type: string
+                    format: date-time
+                  endTime:
+                    type: string
+                    format: date-time
+                  bitrate:
+                    type: integer
+                  ccErrorCount:
+                    type: integer
+                  thumbnailUrl:
+                    type: string
+                  status:
+                    type: string
+
+    delete:
+      tags:
+        - Manager-Playbacks
+      summary: Cancel a playback job
+      parameters:
+        - in: path
+          name: playbackId
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Playback job canceled
+
+  ########################################################
+  # Manager API - ADMIN (SUPPORT / GOD MODE)
+  ########################################################
+
+  /admin/stats:
+    get:
+      tags:
+        - Manager-Admin
+      summary: System-wide metrics and usage
+      description: >
+        Provides consolidated stats such as concurrent usage, total assets, 
+        cluster performance metrics, and system load.
+      responses:
+        "200":
+          description: Admin statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  concurrentRecordings:
+                    type: integer
+                  concurrentPlaybacks:
+                    type: integer
+                  clusterUsage:
+                    type: object
+                  systemLoad:
+                    type: number
+                  totalAssets:
+                    type: integer
+
+  ########################################################
+  # AGENT API - RECORDINGS
+  ########################################################
+
+  /agent/jobs/recordings:
+    post:
+      tags:
+        - Agent-Recordings
+      summary: Start a new recording on this Agent
+      description: >
+        The Manager instructs the Agent to launch a recording process.
+        The Agent is responsible for spawning binaries, handling containerization, etc.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jobId:
+                  type: string
+                sourceUrl:
+                  type: string
+                duration:
+                  type: integer
+                destinationProfile:
+                  type: string
+              required:
+                - jobId
+                - sourceUrl
+                - duration
+                - destinationProfile
+      responses:
+        "201":
+          description: Agent accepted the recording job
+
+  /agent/recordings/{jobId}:
+    delete:
+      tags:
+        - Agent-Recordings
+      summary: Stop a recording job on this Agent
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Recording job stopped
+
+  ########################################################
+  # AGENT API - PLAYBACKS
+  ########################################################
+
+  /agent/jobs/playbacks:
+    post:
+      tags:
+        - Agent-Playbacks
+      summary: Start a new playback job on this Agent
+      description: >
+        Manager instructs the Agent to commence a playback process,
+        reading from a specified asset and streaming out via destinationUrl.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jobId:
+                  type: string
+                sourceProfile:
+                  type: string
+                destinationUrl:
+                  type: string
+                duration:
+                  type: integer
+                vodStartTime:
+                  type: string
+                  description: "Optional. E.g. '2025/03/04 08:10:00'"
+                vodEndTime:
+                  type: string
+                  description: "Optional. E.g. '2025/03/04 08:20:00'"
+              required:
+                - jobId
+                - sourceProfile
+                - destinationUrl
+                - duration
+      responses:
+        "201":
+          description: Playback job accepted
+
+  /agent/playbacks/{jobId}:
+    delete:
+      tags:
+        - Agent-Playbacks
+      summary: Cancel a playback job on this Agent
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Playback job canceled
+
+  ########################################################
+  # AGENT API - MISC
+  ########################################################
+
+  /agent/status:
+    get:
+      tags:
+        - Agent-Misc
+      summary: Check Agent status and currently running jobs
+      description: >
+        Returns health indicators and lists active recording/playback jobs
+        on this specific Agent node.
+      responses:
+        "200":
+          description: Agent status returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agentId:
+                    type: string
+                  status:
+                    type: string
+                  activeRecordings:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        jobId:
+                          type: string
+                        sourceUrl:
+                          type: string
+                        duration:
+                          type: integer
+                        destinationProfile:
+                          type: string
+                        startTime:
+                          type: string
+                          format: date-time
+                  activePlaybacks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        jobId:
+                          type: string
+                        sourceProfile:
+                          type: string
+                        destinationUrl:
+                          type: string
+                        duration:
+                          type: integer
+                        startTime:
+                          type: string
+                          format: date-time
