@@ -1225,7 +1225,7 @@ function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEn
     // If we have a start/end time, assume we want multi-hour VOD mode
     let baseArgs = [];
     baseArgs.push('--vod');
-    baseArgs.push('-i', './hourly_urls.log');
+    //baseArgs.push('-i', './hourly_urls.log');
     baseArgs.push('--use-smoother');
     baseArgs.push('-v', '1');
     baseArgs.push('-u', `${vodPlaylist}`);
