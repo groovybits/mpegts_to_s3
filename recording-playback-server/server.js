@@ -14,9 +14,9 @@ const swaggerUi = require('swagger-ui-express');
 const yaml = require('js-yaml');
 
 // Server URL Base
-const PORT = 3000;
-const serverUrl = 'http://127.0.0.1' + ':' + PORT;
-const s3endPoint = 'http://192.168.50.55:9000';
+const PORT = process.env.SERVER_PORT || 3000;
+const serverUrl = 'http://' + (process.env.SERVER_HOST || '127.0.0.1') + ':' + PORT;
+const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://192.168.50.55:9000';
 
 // ----------------------------------------------------
 // Swagger YAML read in and parsed
@@ -318,7 +318,6 @@ managerRouter.post('/playbacks', (req, res) => {
     ],
     err => {
       if (err) return res.status(500).json({ error: err.message });
-      //res.status(201).json({ playbackId });
     }
   );
   // Call the agent to start the playback
