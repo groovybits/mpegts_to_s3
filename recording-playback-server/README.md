@@ -25,6 +25,17 @@ This project includes an API server written in Node.js that manages recording an
 	```
 
 2. **Start the Server**  
+	Set env variables (can store in `.env`)
+	```bash
+	export SERVER_HOST=localhost
+	export SERVER_PORT=3000
+	export MINIO_ROOT_USER=minioadmin (S3 Access Key)
+	export MINIO_ROOT_PASSWORD=minioadmin (S3 Secret Key)
+	export AWS_S3_ENDPOINT=http://127.0.01:9000
+	export URL_SIGNING_SECONDS=604800
+	export SEGMENT_DURATION_MS=2000
+	export MAX_SEGMENT_SIZE_BYTES=5000000
+	```
 	Launch the API server with:
 	```bash
 	node server.js
