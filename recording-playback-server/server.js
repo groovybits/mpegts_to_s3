@@ -533,8 +533,6 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
     throw new Error(`Invalid or non-UDP sourceUrl: ${sourceUrl}`);
   }
 
-
-
   const { ip, port, iface } = parsed;
   // Example invocation, adjust arguments as needed.
   // We’ll store segments in a subdirectory named by jobId.
@@ -746,8 +744,8 @@ agentRouter.post('/jobs/recordings', (req, res) => {
           // Stop the process
           try { process.kill(pid, 'SIGTERM'); } catch { }
           // Store the recording URLs in DB from the hourly_urls.log file
-          storeRecordingUrls(jobId);
-          db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
+          //storeRecordingUrls(jobId);
+          //db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
           activeTimers.recordings.delete(jobId);
         }, (duration + 60.0) * 1000); // Add up to 60s buffer for GOP alignment or other delays
         activeTimers.recordings.set(jobId, timer);
