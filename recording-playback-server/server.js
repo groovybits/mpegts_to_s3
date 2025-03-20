@@ -1,5 +1,44 @@
 /****************************************************
  * server.js — Recording/Playback API Server
+ * 
+ * Environment Variables:
+ * - SERVER_PORT: Port for the server to listen on (default: 3000)
+ * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
+ * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
+ * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
+ * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
+ * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
+ * 
+ * Usage:
+ * - Start the server with `node server.js`
+ * - Access the Swagger UI at http://localhost:3000/api-docs
+ * - Use the API to create recordings and playbacks
+ * - The server will spawn the appropriate agents to handle the jobs
+ * - The agents will spawn the appropriate processes to handle the jobs
+ * - The server will store the job status in the SQLite database
+ * - The server will auto-stop the jobs after the given durations
+ * - The server will store the recording URLs in the SQLite database
+ * - The server will serve the recording URLs to the clients
+ * 
+ * URL parameters for UDP MpegTS:
+ * - udp://multicast_ip:port?interface=net1
+ * 
+ * Dependencies:
+ * - express: Web server framework
+ * - sqlite3: SQLite database
+ * - udp-to-hls: UDP to HLS converter
+ * - hls-to-udp: HLS to UDP converter
+ * - MinIO: S3-compatible server
+ * - node-fetch: Fetch API for Node.js
+ * 
+ * Build Instructions:
+ * - Install Node.js and npm version greater than 18 ideally
+ * - Run `npm install` to install dependencies
+ * - Build the udp-to-hls and hls-to-udp in ../ one directory down using `make && make install`
+ * - Run `node server.js` to start the server
+ * 
+ * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
+ * 
  ****************************************************/
 
 const serverVersion = '1.0.26';
@@ -15,24 +54,32 @@ const fs = require('fs');
 const swaggerUi = require('swagger-ui-express');
 const yaml = require('js-yaml');
 
-// Server URL Base
-const PORT = process.env.SERVER_PORT || 3000;
-const serverUrl = 'http://' + (process.env.SERVER_HOST || '127.0.0.1') + ':' + PORT;
-const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://192.168.50.55:9000';
-
 // For fetch
 const fetch = require('node-fetch');
+const { env } = require('process');
+
+// Server URL Base
+const SERVER_PORT = process.env.SERVER_PORT || 3000;
+const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1";
+const serverUrl = 'http://' + SERVER_HOST + ':' + SERVER_PORT;
+const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
+
+// check env and set the values for the baseargs, else set to defaults, use vars below
+const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 500;
+const PLAYBACK_VERBOSE = process.env.VERBOSE || 2;
+const RECORDING_VERBOSE = process.env.VERBOSE || 1;
+const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 0;
+const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger.yaml';
 
 // ----------------------------------------------------
 // Swagger YAML read in and parsed
 // ----------------------------------------------------
-const swaggerYaml = fs.readFileSync('swagger.yaml', 'utf8');
-
+const swaggerYaml = fs.readFileSync(SWAGGER_FILE, 'utf8');
 const swaggerDoc = yaml.load(swaggerYaml);
 
 // ----------------------------------------------------
-// Helper: parse "udp://224.0.0.200:10001?interface=enp0s5"
-// to get ip=224.0.0.200, port=10001, interface=enp0s5
+// Helper: parse "udp://224.0.0.200:10001?interface=net1"
+// to get ip=224.0.0.200, port=10001, interface=net1
 // ----------------------------------------------------
 function parseUdpUrl(urlString) {
   try {
@@ -41,8 +88,8 @@ function parseUdpUrl(urlString) {
       return null;
     }
     const ip = u.hostname;
-    const port = u.port || '10001';
-    const iface = u.searchParams.get('interface') || 'enp0s5';
+    const port = u.port || '4102';
+    const iface = u.searchParams.get('interface') || 'net1';
     return { ip, port, iface };
   } catch (e) {
     return null;
@@ -486,17 +533,19 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
     throw new Error(`Invalid or non-UDP sourceUrl: ${sourceUrl}`);
   }
 
+
+
   const { ip, port, iface } = parsed;
   // Example invocation, adjust arguments as needed.
   // We’ll store segments in a subdirectory named by jobId.
   // You may add other flags for S3 endpoints, etc.
   const args = [
     '-n', iface,
-    '-v', '1',
+    '-v', `${RECORDING_VERBOSE}`,
     '-e', s3endPoint,
     '-b', s3bucketName,
     //'--duration', duration,
-    '--hls_keep_segments', '10',
+    '--hls_keep_segments', '0',
     '-i', ip,
     '-p', port,
     '-o', jobId  // acts as the "channel name"/local output folder
@@ -610,11 +659,10 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
   for (let i = 0; i < vodPlaylists.length; i++) {
     let baseArgs = [];
     baseArgs.push('--vod');
-    //baseArgs.push('--use-smoother');
-    baseArgs.push('-b', '1316');
-    //baseArgs.push('-b', '2632');
-    //baseArgs.push('-b', '3948');
-    baseArgs.push('-v', '3');
+    baseArgs.push('--use-smoother');
+    baseArgs.push('-l', `${SMOOTHER_LATENCY}`);
+    baseArgs.push('-b', `${UDP_BUFFER_BYTES}`);
+    baseArgs.push('-v', `${PLAYBACK_VERBOSE}`);
     baseArgs.push('-u', `${vodPlaylists[i]}`);
     baseArgs.push('-o', `${ip}:${port}`);
 
@@ -913,6 +961,36 @@ app.use('/v1/agent', agentRouter);
 // ----------------------------------------------------
 // Start the server
 // ----------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`Server version ${serverVersion} running on ${serverUrl}. Swagger at ${serverUrl}/api-docs`);
+app.listen(SERVER_PORT, () => {
+  console.log(`Server version ${serverVersion} running on ${serverUrl}.`);
+  let capture_buffer_size = env.CAPTURE_BUFFER_SIZE || `4193904`;
+  let segment_duration_ms = env.SEGMENT_DURATION_MS || `2000`;
+  let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
+  let minio_root_password = env.MINIO_ROOT_PASSWORD || `minioadmin`;
+  let url_signing_seconds = env.URL_SIGNING_SECONDS || `604800`;
+  let use_estimated_duration = env.USE_ESTIMATED_DURATION || `true`;
+  let max_segment_size_bytes = env.MAX_SEGMENT_SIZE_BYTES || `5242756`;
+
+  const help_msg = `
+Environment Variables:
+  - SERVER_PORT: Port for the Node server to listen on (default: ` + SERVER_PORT + `)
+  - SERVER_HOST: Host for the Node server to listen on (default: ` + SERVER_HOST + `)
+  - AWS_S3_ENDPOINT: Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
+  - SMOOTHER_LATENCY: Smoother latency for hls-to-udp output (default: ` + SMOOTHER_LATENCY + `)
+  - PLAYBACK_VERBOSE: Verbosity level for hls-to-udp (default: ` + PLAYBACK_VERBOSE + `)
+  - RECORDING_VERBOSE: Verbosity level for udp-to-hls (default: ` + RECORDING_VERBOSE + `)
+  - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: ` + UDP_BUFFER_BYTES + `)
+  - CAPTURE_BUFFER_SIZE: Buffer size for udp-to-hls (default: ` + capture_buffer_size + `)
+  - MINIO_ROOT_USER: S3 Access Key (default: ` + minio_root_user + `)
+  - MINIO_ROOT_PASSWORD: S3 Secret Key (default: ` + minio_root_password + `)
+  - URL_SIGNING_SECONDS: S3 URL Signing time duration (default: ` + url_signing_seconds + `)
+  - SEGMENT_DURATION_MS: ~Duration (estimate) of each segment in milliseconds (default: ` + segment_duration_ms + `)
+  - MAX_SEGMENT_SIZE_BYTES: Maximum size of each segment in bytes (default: ` + max_segment_size_bytes + `)
+  - USE_ESTIMATED_DURATION: Use estimated duration for recording (default: ` + use_estimated_duration + `)
+`;
+  console.log('\nRecord/Playback Server URL:', serverUrl);
+  console.log('Storage Pool default S3 Endpoint:', s3endPoint);
+  console.log('Swagger UI at:', serverUrl + '/api-docs');
+  console.log(help_msg);
+  console.log(`\nRecord/Playback Server started at: ${new Date().toISOString()}\n- Listening for connections...\n`);
 });

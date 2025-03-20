@@ -42,7 +42,7 @@ This project includes an API server written in Node.js that manages recording an
 	export URL_SIGNING_SECONDS=604800
 	export SEGMENT_DURATION_MS=2000
 	export MAX_SEGMENT_SIZE_BYTES=5000000
-	export USE_ESTIMATED_DURATION=false
+	export USE_ESTIMATED_DURATION=true
 	```
 	Launch the API server with:
 	```bash

@@ -36,9 +36,9 @@ use tokio::sync::Mutex;
 
 fn get_segment_duration_ms() -> f64 {
     std::env::var("SEGMENT_DURATION_MS")
-        .unwrap_or_else(|_| "1000.0".to_string())
+        .unwrap_or_else(|_| "2000.0".to_string())
         .parse()
-        .unwrap_or(1000.0)
+        .unwrap_or(2000.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
@@ -95,9 +95,9 @@ fn get_snaplen() -> i32 {
 
 fn get_buffer_size() -> i32 {
     std::env::var("CAPTURE_BUFFER_SIZE")
-        .unwrap_or_else(|_| "1048476".to_string())
+        .unwrap_or_else(|_| "4193904".to_string())
         .parse()
-        .unwrap_or(1048476)
+        .unwrap_or(4193904)
 }
 
 fn get_use_estimated_duration() -> bool {
