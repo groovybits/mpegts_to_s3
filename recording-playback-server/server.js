@@ -739,15 +739,19 @@ agentRouter.post('/jobs/recordings', (req, res) => {
 
       // If duration > 0, auto-stop after duration
       if (duration && duration > 0) {
+        let max_duration = duration * 1.2;
         const timer = setTimeout(() => {
-          console.log(`Auto-stopping recording jobId=${jobId} after duration=${duration}`);
+          console.log(`Auto-stopping recording jobId=${jobId} of duration=${duration} after max_duration=${max_duration}`);
           // Stop the process
-          try { process.kill(pid, 'SIGTERM'); } catch { }
-          // Store the recording URLs in DB from the hourly_urls.log file
-          //storeRecordingUrls(jobId);
-          //db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
+          try {
+            process.kill(pid, 'SIGTERM');
+            console.log(`Killed recording jobId=${jobId} of duration ${duration}`);
+          } catch (err) {
+            console.error(`Error killing recording jobId=${jobId} of duration ${duration}: ${err}`);
+          }
+          db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
           activeTimers.recordings.delete(jobId);
-        }, (duration + 60.0) * 1000); // Add up to 60s buffer for GOP alignment or other delays
+        }, (max_duration) * 1000); // Add up to 60s buffer for GOP alignment or other delays
         activeTimers.recordings.set(jobId, timer);
       }
 
