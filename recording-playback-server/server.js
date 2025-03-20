@@ -68,7 +68,7 @@ const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
 const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 500;
 const PLAYBACK_VERBOSE = process.env.VERBOSE || 2;
 const RECORDING_VERBOSE = process.env.VERBOSE || 1;
-const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 0;
+const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 1316;
 const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger.yaml';
 
 // ----------------------------------------------------
