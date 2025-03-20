@@ -300,7 +300,7 @@ fn receiver_thread(
                     return;
                 }
                 thread::sleep(Duration::from_millis(
-                    ((seg_duration * 1000.0) * 0.80) as u64,
+                    ((seg_duration * 1000.0) * 0.90) as u64,
                 ));
             }
             log::warn!(
@@ -1269,7 +1269,7 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("100")
+                .default_value("500")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1323,14 +1323,14 @@ fn main() -> Result<()> {
             Arg::new("segment_queue_size")
                 .short('q')
                 .long("segment-queue-size")
-                .default_value("10")
+                .default_value("1")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("udp_queue_size")
                 .short('z')
                 .long("udp-queue-size")
-                .default_value("512")
+                .default_value("32")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1390,7 +1390,7 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(512);
+        .unwrap_or(32);
     let udp_send_buffer = matches
         .get_one::<String>("udp_send_buffer")
         .unwrap()
@@ -1400,7 +1400,7 @@ fn main() -> Result<()> {
         .get_one::<String>("segment_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(10);
+        .unwrap_or(1);
     let pkt_size = matches
         .get_one::<String>("packet_size")
         .unwrap()
@@ -1436,7 +1436,7 @@ fn main() -> Result<()> {
         .get_one::<String>("poll_ms")
         .unwrap()
         .parse::<u64>()
-        .unwrap_or(100);
+        .unwrap_or(500);
     let hist_cap = matches
         .get_one::<String>("history_size")
         .unwrap()
