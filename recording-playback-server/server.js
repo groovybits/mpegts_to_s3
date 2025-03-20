@@ -874,6 +874,8 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
           console.error('Error inserting playback:', err);
         }
 
+        let max_duration = duration * 1.2;
+
         // If duration > 0, auto-stop
         if (duration && duration > 0) {
           const timer = setTimeout(() => {
@@ -881,7 +883,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
             try { process.kill(pid, 'SIGTERM'); } catch { }
             db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
             activeTimers.playbacks.delete(jobId);
-          }, (duration + 3.0) * 1000);
+          }, (max_duration) * 1000);
           activeTimers.playbacks.set(jobId, timer);
         } else {
           /* get the duration from the db */
@@ -901,7 +903,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
                 try { process.kill(pid, 'SIGTERM'); } catch { }
                 db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
                 activeTimers.playbacks.delete(jobId);
-              }, (durationFull + 3.0) * 1000);
+              }, (max_duration) * 1000);
               activeTimers.playbacks.set(jobId, timer);
             } else {
               console.log('No duration found in db for jobId:', jobId);
