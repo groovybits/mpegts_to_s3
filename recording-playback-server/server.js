@@ -20,6 +20,9 @@ const PORT = process.env.SERVER_PORT || 3000;
 const serverUrl = 'http://' + (process.env.SERVER_HOST || '127.0.0.1') + ':' + PORT;
 const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://192.168.50.55:9000';
 
+// For fetch
+const fetch = require('node-fetch');
+
 // ----------------------------------------------------
 // Swagger YAML read in and parsed
 // ----------------------------------------------------
