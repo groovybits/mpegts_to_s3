@@ -835,7 +835,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
               return;
             }
             if (!row) {
-              console.error('No duration found in db for jobId:', jobId);
+              console.error('No row with duration found in db for jobId:', jobId);
               return;
             }
             const durationFull = row.duration;

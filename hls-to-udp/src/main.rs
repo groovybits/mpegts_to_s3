@@ -836,12 +836,12 @@ fn sender_thread(
                                 let elapsed = last_packet_send_time.elapsed();
                                 let elapsed_micros = elapsed.as_micros();
                                 if elapsed_micros > 0 {
-                                    let sent_bps = (chunk.as_ref().len() as u64 * 8 * 1000)
+                                    let sent_bps = (chunk.as_ref().len() as u64 * 8 * 1000000)
                                         / elapsed_micros as u64;
                                     log::info!("HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.", chunk.as_ref().len(), elapsed_micros, sent_bps);
                                     if sent_bps > 0 {
                                         frame_time_micros =
-                                            (chunk.as_ref().len() as u64 * 8 * 1000) / sent_bps;
+                                            (chunk.as_ref().len() as u64 * 8 * 1000000) / sent_bps;
                                     }
                                 }
                                 let sleep_time_micros: u64 = (chunk.as_ref().len() / TS_PACKET_SIZE)
@@ -880,8 +880,7 @@ fn sender_thread(
                                             }
                                             total_bytes_sent += chunk.as_ref().len();
                                             let elapsed = last_packet_send_time.elapsed();
-                                            if !vod
-                                                && elapsed
+                                            if !vod && elapsed
                                                     < Duration::from_micros(sleep_time_micros)
                                             {
                                                 let sleep_time =
