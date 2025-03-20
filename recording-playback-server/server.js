@@ -607,8 +607,10 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
   for (let i = 0; i < vodPlaylists.length; i++) {
     let baseArgs = [];
     baseArgs.push('--vod');
-    baseArgs.push('--use-smoother');
+    //baseArgs.push('--use-smoother');
     baseArgs.push('-b', '1316');
+    //baseArgs.push('-b', '2632');
+    //baseArgs.push('-b', '3948');
     baseArgs.push('-v', '3');
     baseArgs.push('-u', `${vodPlaylists[i]}`);
     baseArgs.push('-o', `${ip}:${port}`);
