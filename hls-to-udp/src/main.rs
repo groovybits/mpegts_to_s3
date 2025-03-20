@@ -300,7 +300,7 @@ fn receiver_thread(
                     return;
                 }
                 thread::sleep(Duration::from_millis(
-                    ((seg_duration * 1000.0) * 0.80) as u64,
+                    ((seg_duration * 1000.0) * 0.90) as u64,
                 ));
             }
             log::warn!(
@@ -836,12 +836,10 @@ fn sender_thread(
                                 let elapsed = last_packet_send_time.elapsed();
                                 let elapsed_micros = elapsed.as_micros();
                                 if elapsed_micros > 0 {
-                                    let sent_bps = (chunk.as_ref().len() as u64 * 8 * 1000)
-                                        / elapsed_micros as u64;
                                     log::info!("HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.", chunk.as_ref().len(), elapsed_micros, sent_bps);
                                     if sent_bps > 0 {
                                         frame_time_micros =
-                                            (chunk.as_ref().len() as u64 * 8 * 1000) / sent_bps;
+                                            (chunk.as_ref().len() as u64 * 8 * 1000000) / sent_bps as u64;
                                     }
                                 }
                                 let sleep_time_micros: u64 = (chunk.as_ref().len() / TS_PACKET_SIZE)
@@ -880,8 +878,7 @@ fn sender_thread(
                                             }
                                             total_bytes_sent += chunk.as_ref().len();
                                             let elapsed = last_packet_send_time.elapsed();
-                                            if !vod
-                                                && elapsed
+                                            if !vod && elapsed
                                                     < Duration::from_micros(sleep_time_micros)
                                             {
                                                 let sleep_time =
@@ -1270,7 +1267,7 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("100")
+                .default_value("500")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1324,14 +1321,14 @@ fn main() -> Result<()> {
             Arg::new("segment_queue_size")
                 .short('q')
                 .long("segment-queue-size")
-                .default_value("10")
+                .default_value("1")
                 .action(ArgAction::Set),
         )
         .arg(
             Arg::new("udp_queue_size")
                 .short('z')
                 .long("udp-queue-size")
-                .default_value("512")
+                .default_value("32")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1391,7 +1388,7 @@ fn main() -> Result<()> {
         .get_one::<String>("udp_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(512);
+        .unwrap_or(32);
     let udp_send_buffer = matches
         .get_one::<String>("udp_send_buffer")
         .unwrap()
@@ -1401,7 +1398,7 @@ fn main() -> Result<()> {
         .get_one::<String>("segment_queue_size")
         .unwrap()
         .parse::<usize>()
-        .unwrap_or(10);
+        .unwrap_or(1);
     let pkt_size = matches
         .get_one::<String>("packet_size")
         .unwrap()
@@ -1437,7 +1434,7 @@ fn main() -> Result<()> {
         .get_one::<String>("poll_ms")
         .unwrap()
         .parse::<u64>()
-        .unwrap_or(100);
+        .unwrap_or(500);
     let hist_cap = matches
         .get_one::<String>("history_size")
         .unwrap()

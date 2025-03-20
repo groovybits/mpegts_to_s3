@@ -95,16 +95,16 @@ fn get_snaplen() -> i32 {
 
 fn get_buffer_size() -> i32 {
     std::env::var("CAPTURE_BUFFER_SIZE")
-        .unwrap_or_else(|_| "1048476".to_string())
+        .unwrap_or_else(|_| "4193904".to_string())
         .parse()
-        .unwrap_or(1048476)
+        .unwrap_or(4193904)
 }
 
 fn get_use_estimated_duration() -> bool {
     std::env::var("USE_ESTIMATED_DURATION")
-        .unwrap_or_else(|_| "false".to_string())
+        .unwrap_or_else(|_| "true".to_string())
         .parse()
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn get_version() -> &'static str {
@@ -958,7 +958,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("hls_keep_segments")
                 .long("hls_keep_segments")
                 .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
-                .default_value("3"),
+                .default_value("0"),
         )
         .arg(
             Arg::new("unsigned_urls")

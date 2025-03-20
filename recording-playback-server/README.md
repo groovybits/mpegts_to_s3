@@ -23,11 +23,30 @@ This project includes an API server written in Node.js that manages recording an
 	```bash
 	npm install
 	```
+	Build the udp-to-hls and hls-to-udp binaries:
+	```bash
+	cd ../
+	make setup # one time setup of system for Linux specifically
+	make && make install # installs in ./bin/ directory
+	cd -
+	```
 
 2. **Start the Server**  
+	Set env variables (can store in `.env`)
+	```bash
+	export SERVER_HOST=localhost
+	export SERVER_PORT=3000
+	export MINIO_ROOT_USER=minioadmin (S3 Access Key)
+	export MINIO_ROOT_PASSWORD=minioadmin (S3 Secret Key)
+	export AWS_S3_ENDPOINT=http://127.0.01:9000
+	export URL_SIGNING_SECONDS=604800
+	export SEGMENT_DURATION_MS=2000
+	export MAX_SEGMENT_SIZE_BYTES=5000000
+	export USE_ESTIMATED_DURATION=true
+	```
 	Launch the API server with:
 	```bash
-	node server.js
+	sudo node server.js # Must be root for pcap capture (Linux/Mac) permissions
 	```
 	The server listens on port 3000 by default.
 
@@ -80,8 +99,7 @@ This project includes an API server written in Node.js that manages recording an
 - **MinIO/S3 Server:** Ensure MinIO is available locally or via a container.
 - **Dependencies:**  
   - Install libpcap for packet capture.
-  - FFmpeg (optional) for HLS segmentation.
-  - udp-to-hls and hls-to-udp binaries for recording and playback.
+  - build ../bin/udp-to-hls and ../bin/hls-to-udp binaries for recording and playback.
 - **Ports:**  
   - Open ports 3000 (API server) and 9000 (MinIO/S3).
 - **Node.js:**  
