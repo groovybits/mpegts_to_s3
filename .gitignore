@@ -3,6 +3,8 @@
 debug/
 target/
 
+.vscode
+
 data/
 hls/
 

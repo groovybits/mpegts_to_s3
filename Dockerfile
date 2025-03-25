@@ -11,13 +11,10 @@ WORKDIR /app
 
 # Update system and handle GPG key update
 RUN set -eux; \
-    # Import the AlmaLinux GPG key
     rpm --import https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux && \
-    # Clean up the DNF cache and update packages
     dnf clean all && \
     dnf makecache && \
     dnf update -yq && \
-    # Clean up to reduce image size
     dnf clean all
 
 RUN dnf install -yq almalinux-release-synergy
@@ -38,7 +35,6 @@ COPY hls-to-udp/Cargo.toml hls-to-udp/Cargo.toml
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# avoid resource issues
 ARG JOBS
 ENV CPUS=4
 ENV JOBS=${JOBS:-${CPUS}}
@@ -58,110 +54,67 @@ RUN strip /app/bin/*
 ### START OF Runtime Container
 FROM almalinux:8-minimal as binary
 
-## Set up the environment for the RPM probes location of the binaries
+## Add the built binaries to the PATH
 ENV PATH="/app/bin:${PATH}"
 
-## Alma Release Synergy GRPC and Protobuf
-RUN microdnf update -y > /dev/null
-RUN microdnf install -y libpcap  > /dev/null
+## Set up nvm directory and environment variable
+RUN mkdir -p /app/.nvm
+ENV NVM_DIR="/app/.nvm"
 
-WORKDIR /app/hls
+## Update system and install dependencies needed for nvm and node
+RUN microdnf update -y > /dev/null && \
+    microdnf install -y libpcap findutils curl tar gzip
 
-## Probe binaries and tools / scripts
+## Install nvm and use it to install Node.js 20, then symlink the node binaries for runtime
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash && \
+    bash -c "source \$NVM_DIR/nvm.sh && \
+    nvm install 20 && \
+    nvm alias default 20 && \
+    nvm use default && \
+    mkdir -p /app/bin && \
+    ln -sf \$(nvm which default) /app/bin/node && \
+    ln -sf \$(dirname \$(nvm which default))/npm /app/bin/npm && \
+    ln -sf \$(dirname \$(nvm which default))/npx /app/bin/npx"
+
+## Copy application binaries and scripts from the builder
 COPY --from=builder /app/bin/hls-to-udp /app/bin/hls-to-udp
 COPY --from=builder /app/bin/udp-to-hls /app/bin/udp-to-hls
 
 COPY scripts/entrypoint_udp-to-hls.sh /app/entrypoint_udp-to-hls.sh
 COPY scripts/entrypoint_hls-to-udp.sh /app/entrypoint_hls-to-udp.sh
+COPY scripts/entrypoint_recording-playback-server.sh /app/entrypoint_recording-playback-server.sh
 
-# Make directory for eBPF program binary
-RUN rm -rf /usr/share/*
-RUN rm -rf /usr/libexec/*
+RUN mkdir -p /app/recording-playback-server/hls
+WORKDIR /app/recording-playback-server
+ENV HLS_DIR=""
+ENV SWAGGER_FILE="/app/recording-playback-server/swagger.yaml"
+ENV HOURLY_URLS_LOG="/app/recording-playback-server/hls/index.txt"
+COPY recording-playback-server/package.json /app/recording-playback-server/package.json
+COPY recording-playback-server/server.js /app/recording-playback-server/server.js
+COPY recording-playback-server/.env.example /app/recording-playback-server/.env
+COPY recording-playback-server/.env.example /app/recording-playback-server/hls/.env
+COPY recording-playback-server/swagger.yaml ${SWAGGER_FILE}
+
+## Install recording-playback-server dependencies
+RUN npm install
+WORKDIR /app/recording-playback-server/hls
+
 RUN ldconfig 2> /dev/null
 
-## Clean up and save space
+## Clean up to save space
 RUN rm -rf /var/cache/* && \
-        rm -rf /usr/lib*/lib*.a && \
-        rm -rf /usr/lib*/lib*.la && \
-        rm -rf /usr/lib/.build-id;
-
-RUN microdnf clean all > /dev/null && rm -rf /var/cache/yum
-
-# remove unnecessary files
-RUN cd /usr/bin && \
-    rm -f addgnupghome agetty alias ambiguous_words arch aserver awk \
-        b2sum base32 base64 bashbug* bg brotli bunzip2 busctl bzcat \
-        bzcmp bzdiff bzegrep bzfgrep bzgrep bzip2* bzless bzmore \
-        ca-legacy cairo-sphinx cal captoinfo catchsegv cd chacl \
-        chage chcon chgrp chmem chmod chown chrt cksum clear cmp \
-        cntraining col colcrt colrm column combine_* comm coredumpctl \
-        csplit curl cut date dawg2wordlist db_* dbus-* dd debuginfod-find \
-        df diff* dir* dmesg dnf-3 du dumpiso \
-        fc* fgrep fincore fmt fold fribidi g13 gawk gdbm* gdbus gencat \
-        getconf getent getfacl getopt getopts gio* glib* glx* \
-        gpasswd gpg* gr2fonttest grep grpc_* gst-* gunzip gzexe gzip \
-        head hexdump hostid i386 iconv id info* ionice ipc* join journalctl \
-        last* ld.so ldd libinput* libwacom* link linux* look lstmeval \
-        lstmtraining make* mc* md5sum merge* mftraining modulemd* more mount* \
-        namei newgid* newgrp newuid* nice nl nohup nproc nsenter numfmt od \
-        openssl orc* pango* paste pathchk pinky pldd pr printenv printf \
-        protoc ptx pwd* python* raw read* realpath rename resolvectl \
-        runcon script* sdiff sed sendiso seq set_unicharset setarch && \
-    cd /usr/sbin && rm -f * && \
-    # Remove development files and libraries
-    rm -rf /usr/lib/debug/* \
-           /usr/lib/games/* \
-           /usr/lib/fontconfig/* \
-           /usr/lib/environment.d/* \
-           /usr/include/* \
-           /usr/lib64/gcc-* \
-           /usr/lib64/cmake/* \
-           /usr/lib64/X11/* \
-           /usr/lib64/libQt5* \
-           /usr/lib64/gconv/* \
-           /usr/lib/.build-id/* \
-           /usr/lib64/.build-id/* && \
-    # Remove documentation, locale, and other non-essential data
-    rm -rf /usr/share/doc/* \
-           /usr/share/info/* \
-           /usr/share/man/* \
-           /usr/share/gnupg/* \
-           /usr/share/i18n/* \
-           /usr/share/backgrounds/* \
-           /usr/share/icons/* \
-           /usr/share/fonts/* \
-           /usr/share/cracklib/* \
-           /usr/share/applications/* \
-           /usr/share/locale/* \
-           /usr/share/X11/* && \
-    # Remove package management and temp files
-    rm -rf /var/cache/* \
-           /var/log/* \
-           /tmp/* \
-           /var/tmp/* && \
-    # Remove non-essential system files
-    rm -rf /usr/games \
-           /usr/local/share/* \
-           /usr/local/man/* \
-           /usr/local/doc/* && \
-    # Final cleanup
+    rm -rf /usr/lib*/lib*.a && \
+    rm -rf /usr/lib*/lib*.la && \
+    rm -rf /usr/lib/.build-id && \
+    microdnf clean all > /dev/null && rm -rf /var/cache/yum && \
+    rm -rf /var/cache/* /var/log/* /tmp/* /var/tmp/* && \
+    rm -rf /usr/games /usr/local/man/* /usr/local/doc/* && \
     microdnf clean all && \
     rm -rf /var/cache/dnf && \
     rm -rf /var/lib/rpm
 
-# Library Cleanup - preserve only needed libraries
-RUN cd /usr/lib && \
-    rm -rf binfmt.d environment.d debug fontconfig games && \
-    cd /usr/lib64 && \
-    rm -f libasound* libpulse* libjack* libsndfile* \
-        libicu* libsqlite* libgirepository* \
-        libgphoto* libgpm* libgusb* libmagic* \
-        libmozjs* libwrap* libxslt* libgst* && \
-    rm -rf /usr/lib/.build-id/* \
-           /usr/lib64/.build-id/* \
-           /usr/lib64/gstreamer-1.0/*
-
-## Quick confirmation the binary executes
+## Quick confirmation that the binaries execute correctly
 RUN hls-to-udp -V
 RUN udp-to-hls -V
-
+RUN node --version
+RUN npm --version

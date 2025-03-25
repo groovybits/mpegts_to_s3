@@ -1,6 +1,6 @@
 # UDP MpegTS to HLS VOD for UDP MpegTS Re-Stream
 
-UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application. See the hls to udp relay for a way to replay the content [hls-to-udp](hls-to-udp/README.md).
+UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application. See the hls to udp relay for a way to replay the content [hls-to-udp](hls-to-udp/README.md). There is an API Server in Node.js that can be used to manage the capture and playback jobs in [recording-playback-server](recording-playback-server).
 
 ```mermaid
 graph LR
@@ -36,8 +36,20 @@ cd mpegts_to_s3
 # Edit the config.env file to set the desired settings
 vim config.env
 
-# Start MinIO and the Mpeg_to_S3 capture using config.env values for settings
-podman-compose up --build
+# Edit the recording-playback-server/.env.example file to set the desired settings
+vim recording-playback-server/.env.example
+
+## Two different compose files to run the containerized version, either
+## with or without the recording-playback-server API container that manages the capture and playback jobs
+
+## Separate containers, no API server, Start MinIO and the Mpeg_to_S3 capture using config.env values for settings
+#podman-compose up --build
+
+# With the API server, Start MinIO, the Mpeg_to_S3 capture, and the API server
+podman-compose -f docker-compose_recording_playback_server.yml up --build
+
+# Now browse to the host IP on port 3000 to access the API server swagger UI
+# webbrowser --url http://localhost:3000/api-docs
 ```
 
 There is a container at `docker.io/groovybits/mpegts_to_s3:latest` which can be used.

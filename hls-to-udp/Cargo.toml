@@ -1,6 +1,6 @@
 [package]
 name = "hls-to-udp"
-version = "1.0.23"
+version = "1.0.27"
 edition = "2021"
 description = "HLS VOD to MPEG-TS UDP Re-cast."
 keywords = ["mpegts", "s3", "hls", "udp"]
@@ -22,7 +22,7 @@ clap = "4"
 env_logger = "0.11.6"
 log = "0.4.25"
 m3u8-rs = "6"
-reqwest = { version = "0.11", features = ["blocking"] }
+reqwest = { version = "0.12.12", features = ["blocking"] }
 url = "2.2"
 socket2 = "0.5.8"
 ctrlc = "3.4.5"

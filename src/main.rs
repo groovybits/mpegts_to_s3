@@ -95,20 +95,27 @@ fn get_snaplen() -> i32 {
 
 fn get_buffer_size() -> i32 {
     std::env::var("CAPTURE_BUFFER_SIZE")
-        .unwrap_or_else(|_| "1048476".to_string())
+        .unwrap_or_else(|_| "4193904".to_string())
         .parse()
-        .unwrap_or(1048476)
+        .unwrap_or(4193904)
 }
 
 fn get_use_estimated_duration() -> bool {
     std::env::var("USE_ESTIMATED_DURATION")
-        .unwrap_or_else(|_| "false".to_string())
+        .unwrap_or_else(|_| "true".to_string())
         .parse()
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+fn get_hourly_urls_log() -> std::path::PathBuf {
+    std::env::var("HOURLY_URLS_LOG")
+        .unwrap_or_else(|_| "".to_string())
+        .parse()
+        .unwrap_or_else(|_| std::path::Path::new("").join("index.txt"))
 }
 
 // ------------- HOURLY INDEX CREATOR -------------
@@ -245,8 +252,9 @@ impl HourlyIndexCreator {
     }
 
     fn rewrite_urls_log(&mut self, hour_dir: &str, final_url: &str) -> std::io::Result<()> {
-        let log_path = std::path::Path::new("").join("hourly_urls.log");
-        let temp_path = std::path::Path::new("").join("hourly_urls_temp.log");
+        let log_path = get_hourly_urls_log();
+        let uuid_str: String = uuid::Uuid::new_v4().to_string();
+        let temp_path = log_path.with_file_name(format!("{}_temp", uuid_str));
 
         let mut lines = vec![];
         if log_path.exists() {
@@ -958,7 +966,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arg::new("hls_keep_segments")
                 .long("hls_keep_segments")
                 .help("Limit how many segments to keep in index.m3u8 (0=unlimited).")
-                .default_value("3"),
+                .default_value("0"),
         )
         .arg(
             Arg::new("unsigned_urls")
@@ -997,12 +1005,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .help("Drop corrupt TS packets")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("duration")
+                .long("duration")
+                .default_value("0")
+                .help("Duration of recording in seconds (0=unlimited)"),
+        )
         .get_matches();
 
     debug!("UDPtoHLS: Command-line arguments parsed: {:?}", matches);
 
     println!("UDPtoHLS: version: {}", get_version());
 
+    let duration: u64 = matches.get_one::<String>("duration").unwrap().parse()?;
     let drop_corrupt_ts = matches.get_flag("drop_corrupt_ts");
     let quiet = matches.get_flag("quiet");
     let pcap_stats_interval: u64 = matches
@@ -1259,6 +1274,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Use a vector to accumulate TS packets as Arc slices to avoid unnecessary copies.
     let mut batch_buffer_arcs: Vec<Arc<[u8]>> = Vec::new();
 
+    /* store start time to compare for duration calculations */
+    let start_time = Instant::now();
+
     debug!("Starting main processing loop now...");
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
@@ -1360,6 +1378,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 hex::encode(&packet_data[..16]),
                 packet_data.len()
             );
+        }
+
+        if duration > 0
+            && Instant::now().duration_since(start_time) >= Duration::from_secs(duration + 15)
+        {
+            println!(
+                "UDPtoHLS: Duration limit reached after {} seconds",
+                duration
+            );
+            break;
         }
     }
 
