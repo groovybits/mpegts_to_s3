@@ -19,6 +19,12 @@ clean:
 	cargo clean
 	cd hls-to-udp && cargo clean
 	rm -rf bin
+	rm -rf recording-playback-server/node_modules
+	rm -f recording-playback-server/package-lock.json
+
+distclean: clean
+	rm -f recording-playback-server/media_jobs.db
+	rm -f recording-playback-server/hourly_urls.log
 
 container: clean
 	podman-compose build

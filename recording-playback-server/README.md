@@ -16,7 +16,42 @@ This project includes an API server written in Node.js that manages recording an
 4. **SQLite Integration**  
 	- Job metadata, including process IDs, is stored in `media_jobs.db` for tracking both active and completed jobs.
 
-## Setup and Running
+5. **Containerization**  
+	- The server can be containerized using Docker for easy deployment.
+
+## Setup and Running (Docker without compose file, not recommended)
+
+1. **Build the Docker Image**  
+	From the project root, run:
+	```bash
+	docker build -t recording-playback-server .
+	```
+
+2. **Run the Docker Container**  
+	```bash
+	docker run -d -p 3000:3000 --env-file recording-playback-server/.env.example recording-playback-server
+	```
+
+3. **Access Swagger UI**
+	Open your browser and navigate to [http://localhost:3000/api-docs](http://localhost:3000/api-docs) to view and test API endpoints.
+
+## Setup and Running (Docker with compose file)
+
+1. **Build the Docker Image**  
+	From the project root, run:
+	```bash
+	docker-compose -f docker-compose_recording_playback_server.yml build
+	```
+
+2. **Run the Docker Container**  
+	```bash
+	docker-compose -f docker-compose_recording_playback_server.yml up -d
+	```
+
+3. **Access Swagger UI**
+	Open your browser and navigate to [http://localhost:3000/api-docs](http://localhost:3000/api-docs) to view and test API endpoints.
+
+## Setup and Running (Native Linux/Mac)
 
 1. **Install Dependencies**  
 	Ensure Node.js and npm are installed. From the project root, run:
@@ -32,17 +67,17 @@ This project includes an API server written in Node.js that manages recording an
 	```
 
 2. **Start the Server**  
-	Set env variables (can store in `.env`)
+	Set env variables (can store in `.env`) Replace 192.168.130.93 with your server IP.
 	```bash
-	export SERVER_HOST=localhost
-	export SERVER_PORT=3000
-	export MINIO_ROOT_USER=minioadmin (S3 Access Key)
-	export MINIO_ROOT_PASSWORD=minioadmin (S3 Secret Key)
-	export AWS_S3_ENDPOINT=http://127.0.01:9000
-	export URL_SIGNING_SECONDS=604800
-	export SEGMENT_DURATION_MS=2000
-	export MAX_SEGMENT_SIZE_BYTES=5000000
-	export USE_ESTIMATED_DURATION=true
+		SERVER_HOST=192.168.130.93
+		SERVER_PORT=3000
+		MINIO_ROOT_USER=minioadmin
+		MINIO_ROOT_PASSWORD=minioadmin
+		AWS_S3_ENDPOINT=http://192.168.130.93:9000
+		URL_SIGNING_SECONDS=604800
+		SEGMENT_DURATION_MS=2000
+		MAX_SEGMENT_SIZE_BYTES=5000000
+		USE_ESTIMATED_DURATION=false
 	```
 	Launch the API server with:
 	```bash
