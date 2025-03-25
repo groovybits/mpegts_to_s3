@@ -1151,8 +1151,10 @@ app.listen(SERVER_PORT, () => {
 
   const help_msg = `
 Environment Variables:
-  - SERVER_PORT: Port for the Node server to listen on (default: ` + SERVER_PORT + `)
-  - SERVER_HOST: Host for the Node server to listen on (default: ` + SERVER_HOST + `)
+  - SERVER_PORT: Port for the Node server to listen on as a Manager or Agent (default: ` + SERVER_PORT + `)
+  - SERVER_HOST: Host for the Node server to listen on as a Manager or Agent (default: ` + SERVER_HOST + `)
+  - AGENT_PORT: Port for the Agent server used by the Manager (default: ` + AGENT_PORT + `)
+  - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
   - AWS_S3_ENDPOINT: Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
   - SMOOTHER_LATENCY: Smoother latency for hls-to-udp output (default: ` + SMOOTHER_LATENCY + `)
   - PLAYBACK_VERBOSE: Verbosity level for hls-to-udp (default: ` + PLAYBACK_VERBOSE + `)
