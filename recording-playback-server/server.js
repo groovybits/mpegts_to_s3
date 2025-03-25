@@ -41,7 +41,7 @@
  * 
  ****************************************************/
 
-const serverVersion = '1.0.28';
+const serverVersion = '1.0.29';
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
