@@ -674,7 +674,6 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
   const { ip, port, iface } = parsed;
   // Example invocation, adjust arguments as needed.
   // We’ll store segments in a subdirectory named by jobId.
-  // You may add other flags for S3 endpoints, etc.
   const args = [
     '-n', iface,
     '-v', `${RECORDING_VERBOSE}`,
@@ -928,7 +927,7 @@ agentRouter.post('/jobs/recordings', (req, res) => {
 agentRouter.delete('/recordings/:jobId', (req, res) => {
   const { jobId } = req.params;
 
-  /* check if we have the db file availble */
+  /* check if we have the db file available */
   if (!fs.existsSync(db_file)) {
     console.error('Database file does not exist:', db_file);
     return res.status(500).json({ error: 'Database file not found' });
@@ -976,7 +975,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
   const pids = [];
   let errors = 0;
 
-  /* check if we have the db file availble */
+  // check if we have the db file availble
   if (!fs.existsSync(db_file)) {
     console.error('Database file does not exist:', db_file);
     return res.status(500).json({ error: 'Database file not found' });
