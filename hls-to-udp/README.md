@@ -121,11 +121,18 @@ VOD Multiple hour span using the index created by udp-to-hls to get the hour m3u
 
 ## Container Deployment
 
-1. Build the container image:
+1. Build the container image for recording and playback API server:
     ```sh
-    # The Dockerfile.replay and docker-compose.yaml are in the mpegts_to_s3 directory ../ below this one
+    # The Dockerfile and docker-compose_*.yaml's are in the directory below this one in the base ../ git repo.
     cd ../
-    podman-compose up --build
+    podman-compose -f docker-compose_recording-playback-server.yaml up --build
+    ```
+
+2. Optionally you can build a container per service without the recording and playback API server: (not recommended)
+    ```sh
+    # The Dockerfile and docker-compose_*.yaml's are in the directory below this one in the base ../ git repo.
+    cd ../
+    podman-compose -f docker-compose_udp_to_hls_to_udp.yaml up --build (optionally choose the service you want to build/up)
     ```
 
 ## Usage outside of a container

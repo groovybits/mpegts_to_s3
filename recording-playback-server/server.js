@@ -41,7 +41,7 @@
  * 
  ****************************************************/
 
-const serverVersion = '1.0.26';
+const serverVersion = '1.0.27';
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
@@ -67,9 +67,16 @@ const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
 // check env and set the values for the baseargs, else set to defaults, use vars below
 const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 500;
 const PLAYBACK_VERBOSE = process.env.VERBOSE || 2;
-const RECORDING_VERBOSE = process.env.VERBOSE || 1;
+const RECORDING_VERBOSE = process.env.VERBOSE || 2;
 const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 1316;
 const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger.yaml';
+const ORIGINAL_DIR = process.cwd() + '/';
+const HLS_DIR = process.env.HLS_DIR || '';
+
+// Add ../bin/ to PATH env variable if it exists
+if (fs.existsSync('../bin/')) {
+  process.env.PATH = process.env.PATH + ':../bin';
+}
 
 // ----------------------------------------------------
 // Swagger YAML read in and parsed
@@ -97,11 +104,24 @@ function parseUdpUrl(urlString) {
 }
 
 /**
- * Helper to read hourly_urls.log and store recording URLs into DB for a given jobId.
+ * Helper to read ${HLS_DIR}/index.txt and store recording URLs into DB for a given jobId.
  */
 function storeRecordingUrls(jobId) {
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return;
+  }
+  let hourly_urls = ORIGINAL_DIR + HLS_DIR + 'index.txt';
+
+  /* check if hourly_urls file exists */
+  if (!fs.existsSync(hourly_urls)) {
+    console.error('Hourly URLs file does not exist:', hourly_urls, ' for jobId:', jobId, ' current working directory:', process.cwd());
+    return;
+  }
+
   try {
-    const fileData = fs.readFileSync('./hourly_urls.log', 'utf-8');
+    const fileData = fs.readFileSync(hourly_urls, 'utf-8');
     const lines = fileData.split('\n');
     for (const line of lines) {
       if (!line.startsWith('Hour')) continue;
@@ -128,14 +148,21 @@ function storeRecordingUrls(jobId) {
       );
     }
   } catch (err) {
-    console.error('Error reading hourly_urls.log:', err.message);
+    console.error('Error reading ', hourly_urls, ': ', err.message);
   }
 }
 
 // ----------------------------------------------------
 // SQLite initialization
 // ----------------------------------------------------
-const db = new sqlite3.Database('media_jobs.db');
+const db_file = ORIGINAL_DIR + HLS_DIR + 'media_jobs.db';
+// check if db_file actually exists
+if (!fs.existsSync(db_file)) {
+  console
+    .log('Database file does not exist, creating a new one:', db_file);
+}
+const db = new sqlite3.Database(db_file);
+console.log('Using SQLite database:', db_file);
 db.serialize(() => {
   // Manager tables
   db.run(`
@@ -246,6 +273,12 @@ managerRouter.post('/recordings', (req, res) => {
   const now = new Date();
   const endTime = new Date(now.getTime() + duration * 1000);
 
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.run(`
     INSERT INTO recordings (id, sourceUrl, duration, destinationProfile, startTime, endTime, status, processPid)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -296,6 +329,12 @@ managerRouter.post('/recordings', (req, res) => {
 });
 
 managerRouter.get('/recordings', (req, res) => {
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.all(`SELECT * FROM recordings`, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
@@ -304,6 +343,12 @@ managerRouter.get('/recordings', (req, res) => {
 
 managerRouter.get('/recordings/:recordingId', (req, res) => {
   const { recordingId } = req.params;
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(`SELECT * FROM recordings WHERE id = ?`, [recordingId], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ message: 'Not found' });
@@ -313,6 +358,12 @@ managerRouter.get('/recordings/:recordingId', (req, res) => {
 
 managerRouter.delete('/recordings/:recordingId', (req, res) => {
   const { recordingId } = req.params;
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(`SELECT * FROM recordings WHERE id = ?`, [recordingId], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ message: 'Not found' });
@@ -334,6 +385,12 @@ managerRouter.delete('/recordings/:recordingId', (req, res) => {
 managerRouter.post('/pools', (req, res) => {
   const { bucketName, credentials } = req.body;
   if (!credentials) return res.status(400).json({ error: 'Missing credentials' });
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   const poolId = `pool-${uuidv4()}`;
   db.run(
     `INSERT INTO pools (id, bucketName, accessKey, secretKey) VALUES (?, ?, ?, ?)`,
@@ -346,6 +403,12 @@ managerRouter.post('/pools', (req, res) => {
 });
 
 managerRouter.get('/pools', (req, res) => {
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.all(`SELECT * FROM pools`, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
@@ -355,6 +418,12 @@ managerRouter.get('/pools', (req, res) => {
 // --------------- ASSETS ---------------
 managerRouter.get('/pools/:poolId/assets', (req, res) => {
   const { poolId } = req.params;
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.all(`SELECT * FROM assets WHERE poolId=?`, [poolId], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
@@ -364,6 +433,12 @@ managerRouter.get('/pools/:poolId/assets', (req, res) => {
 managerRouter.delete('/pools/:poolId/assets', (req, res) => {
   const { poolId } = req.params;
   const { assetId } = req.query;
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(
     `SELECT * FROM assets WHERE id=? AND poolId=?`,
     [assetId, poolId],
@@ -384,6 +459,12 @@ managerRouter.delete('/pools/:poolId/assets', (req, res) => {
 
 managerRouter.get('/assets/:assetId', (req, res) => {
   const { assetId } = req.params;
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(`SELECT * FROM assets WHERE id=?`, [assetId], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ message: 'Asset not found' });
@@ -402,6 +483,12 @@ managerRouter.post('/playbacks', (req, res) => {
   const playbackId = `play-${uuidv4()}`;
   const now = new Date();
   const endTime = duration > 0 ? new Date(now.getTime() + (duration + 3) * 1000) : null;
+
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
 
   db.run(
     `INSERT INTO playbacks (id, sourceProfile, destinationUrl, duration, startTime, endTime, status, processPid)
@@ -450,6 +537,12 @@ managerRouter.post('/playbacks', (req, res) => {
 });
 
 managerRouter.get('/playbacks', (req, res) => {
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.all(`SELECT * FROM playbacks`, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
@@ -458,6 +551,12 @@ managerRouter.get('/playbacks', (req, res) => {
 
 managerRouter.get('/playbacks/:playbackId', (req, res) => {
   const { playbackId } = req.params;
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(`SELECT * FROM playbacks WHERE id=?`, [playbackId], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ message: 'Playback not found' });
@@ -467,6 +566,12 @@ managerRouter.get('/playbacks/:playbackId', (req, res) => {
 
 managerRouter.delete('/playbacks/:playbackId', (req, res) => {
   const { playbackId } = req.params;
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(`SELECT * FROM playbacks WHERE id=?`, [playbackId], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ message: 'Playback not found' });
@@ -485,6 +590,12 @@ managerRouter.delete('/playbacks/:playbackId', (req, res) => {
 // --------------- ADMIN ---------------
 managerRouter.get('/admin/stats', (req, res) => {
   // Summaries
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.all(`SELECT COUNT(*) AS cnt FROM recordings WHERE status='active'`, (err, rec) => {
     if (err) return res.status(500).json({ error: err.message });
     const concurrentRecordings = rec[0].cnt;
@@ -533,6 +644,12 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
     throw new Error(`Invalid or non-UDP sourceUrl: ${sourceUrl}`);
   }
 
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    throw new Error('Database file not found', db_file);
+  }
+
   const { ip, port, iface } = parsed;
   // Example invocation, adjust arguments as needed.
   // We’ll store segments in a subdirectory named by jobId.
@@ -543,14 +660,14 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
     '-e', s3endPoint,
     '-b', s3bucketName,
     //'--duration', duration,
-    '--hls_keep_segments', '0',
+    '--hls_keep_segments', '0', // Keep all segments
     '-i', ip,
     '-p', port,
     '-o', jobId  // acts as the "channel name"/local output folder
   ];
 
-  console.log(`Spawning udp-to-hls => ../bin/udp-to-hls ${args.join(' ')}`);
-  const child = spawn('../bin/udp-to-hls', args, {
+  console.log(`Spawning => udp-to-hls ${args.join(' ')}`);
+  const child = spawn('udp-to-hls', args, {
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
@@ -594,6 +711,12 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
 }
 
 async function getVodPlaylists(jobId, vodStartTime, vodEndTime) {
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return [];
+  }
+
   return new Promise((resolve, reject) => {
     db.all(`SELECT hour, url FROM recording_urls WHERE jobId = ?`, [jobId], (err, rows) => {
       if (err) {
@@ -664,8 +787,8 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
     baseArgs.push('-u', `${vodPlaylists[i]}`);
     baseArgs.push('-o', `${ip}:${port}`);
 
-    console.log(`Spawning hls-to-udp => ../bin/hls-to-udp ${baseArgs.join(' ')}`);
-    const child = spawn('../bin/hls-to-udp', baseArgs, {
+    console.log(`Spawning hls-to-udp => ${baseArgs.join(' ')}`);
+    const child = spawn('hls-to-udp', baseArgs, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
     childArray.push(child);
@@ -697,6 +820,12 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
 
 // GET status
 agentRouter.get('/status', (req, res) => {
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.all(`SELECT * FROM agent_recordings`, (err, recRows) => {
     if (err) return res.status(500).json({ error: err.message });
     db.all(`SELECT * FROM agent_playbacks`, (err2, pbRows) => {
@@ -725,6 +854,12 @@ agentRouter.post('/jobs/recordings', (req, res) => {
   }
   const pid = child.pid;
   const now = new Date();
+
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
 
   // Insert into DB
   db.run(
@@ -757,7 +892,7 @@ agentRouter.post('/jobs/recordings', (req, res) => {
 
       child.on('close', code => {
         console.log(`Recording jobId=${jobId} ended with code=${code} after duration=${duration}`);
-        // Store the recording URLs in DB from the hourly_urls.log file
+        // Store the recording URLs in DB from the hourly_urls index.txt file
         storeRecordingUrls(jobId);
         db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
         activeTimers.recordings.delete
@@ -771,6 +906,13 @@ agentRouter.post('/jobs/recordings', (req, res) => {
 // Stop a recording job
 agentRouter.delete('/recordings/:jobId', (req, res) => {
   const { jobId } = req.params;
+
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(`SELECT * FROM agent_recordings WHERE jobId=?`, [jobId], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ message: 'Not found' });
@@ -812,6 +954,12 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
   let completedInserts = 0;
   const pids = [];
   let errors = 0;
+
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
 
   // Insert each child of the array into the DB
   for (const child of childArray) {
@@ -941,6 +1089,13 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
 // Stop a playback job
 agentRouter.delete('/playbacks/:jobId', (req, res) => {
   const { jobId } = req.params;
+
+  /* check if we have the db file availble */
+  if (!fs.existsSync(db_file)) {
+    console.error('Database file does not exist:', db_file);
+    return res.status(500).json({ error: 'Database file not found' });
+  }
+
   db.get(`SELECT * FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!row) return res.status(404).json({ message: 'Not found' });
@@ -991,10 +1146,23 @@ Environment Variables:
   - SEGMENT_DURATION_MS: ~Duration (estimate) of each segment in milliseconds (default: ` + segment_duration_ms + `)
   - MAX_SEGMENT_SIZE_BYTES: Maximum size of each segment in bytes (default: ` + max_segment_size_bytes + `)
   - USE_ESTIMATED_DURATION: Use estimated duration for recording (default: ` + use_estimated_duration + `)
+  - HLS_DIR: Directory to change to before spawning hls-to-udp or udp-to-hls (default: ` + HLS_DIR + `)
+  - ORIGINAL_DIR: Original directory before changing to HLS_DIR (default: ` + ORIGINAL_DIR + `)
+  - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
   console.log('\nRecord/Playback Server URL:', serverUrl);
+  console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');
   console.log(help_msg);
+  /* check if env.HOURLY_URLS_LOG is defined, not empty and is a valid file, if not touch it and create it */
+  if (env.HOURLY_URLS_LOG && env.HOURLY_URLS_LOG !== ""
+    && fs.existsSync(env.HOURLY_URLS_LOG) && fs.lstatSync(env.HOURLY_URLS_LOG).isFile()) {
+    console.log('Hourly URLs log file:', env.HOURLY_URLS_LOG);
+  }
+  else if (env.HOURLY_URLS_LOG && env.HOURLY_URLS_LOG !== "") {
+    console.log('Hourly URLs log file defined and not found, creating it:', env.HOURLY_URLS_LOG);
+    fs.writeFileSync(env.HOURLY_URLS_LOG, '');
+  }
   console.log(`\nRecord/Playback Server started at: ${new Date().toISOString()}\n- Listening for connections...\n`);
 });

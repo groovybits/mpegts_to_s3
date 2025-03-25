@@ -589,9 +589,11 @@ paths:
                 vodStartTime:
                   type: string
                   description: "Optional. E.g. '2025/03/04 08:10:00'"
+                  default: ""
                 vodEndTime:
                   type: string
                   description: "Optional. E.g. '2025/03/04 08:20:00'"
+                  default: ""
               required:
                 - jobId
                 - sourceProfile

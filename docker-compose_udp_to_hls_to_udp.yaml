@@ -9,8 +9,8 @@ services:
     network_mode: "host"
     hostname: "s3minio"
     container_name: "s3minio"
-    env_file:
-      - "configs/config.env"
+    env_file: # Change this to your own .env file
+      - "configs/config.env" # Copy config.env to config_custom.env and fill in the values
 
     volumes:
       - "./data:/data:rw"
@@ -66,8 +66,8 @@ services:
       - SYS_ADMIN
       - BPF
     privileged: true # Required for eBPF and Pcap
-    env_file:
-      - "./configs/config.env"
+    env_file: # Change this to your own .env file
+      - "./configs/config.env" # Copy config.env to config_custom.env and fill in the values
     # Mount local 'hls' directory as the working directory
     # where mpegts_to_s3 will write its files.
     volumes:
@@ -90,8 +90,8 @@ services:
       args:
         ENABLE_DEBUG: "false"
     container_name: "hls-to-udp"
-    env_file:
-      - "./configs/config.env"
+    env_file: # Change this to your own .env file
+      - "./configs/config.env" # Copy config.env to config_custom.env and fill in the values
     volumes:
       - "./hls:/app/hls:rw"
     depends_on:
@@ -99,4 +99,5 @@ services:
       - hls-http-server
     restart: unless-stopped
     entrypoint: ["/app/entrypoint_hls-to-udp.sh"]
+
 

@@ -111,6 +111,13 @@ fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+fn get_hourly_urls_log() -> std::path::PathBuf {
+    std::env::var("HOURLY_URLS_LOG")
+        .unwrap_or_else(|_| "".to_string())
+        .parse()
+        .unwrap_or_else(|_| std::path::Path::new("").join("index.txt"))
+}
+
 // ------------- HOURLY INDEX CREATOR -------------
 #[derive(Debug, Clone)]
 pub struct HourlyIndexEntry {
@@ -245,8 +252,9 @@ impl HourlyIndexCreator {
     }
 
     fn rewrite_urls_log(&mut self, hour_dir: &str, final_url: &str) -> std::io::Result<()> {
-        let log_path = std::path::Path::new("").join("hourly_urls.log");
-        let temp_path = std::path::Path::new("").join("hourly_urls_temp.log");
+        let log_path = get_hourly_urls_log();
+        let uuid_str: String = uuid::Uuid::new_v4().to_string();
+        let temp_path = log_path.with_file_name(format!("{}_temp", uuid_str));
 
         let mut lines = vec![];
         if log_path.exists() {
@@ -1372,8 +1380,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
 
-        if duration > 0 && Instant::now().duration_since(start_time) >= Duration::from_secs(duration + 15) {
-            println!("UDPtoHLS: Duration limit reached after {} seconds", duration);
+        if duration > 0
+            && Instant::now().duration_since(start_time) >= Duration::from_secs(duration + 15)
+        {
+            println!(
+                "UDPtoHLS: Duration limit reached after {} seconds",
+                duration
+            );
             break;
         }
     }
