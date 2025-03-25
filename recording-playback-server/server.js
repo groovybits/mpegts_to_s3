@@ -498,10 +498,12 @@ managerRouter.get('/assets/:assetId', (req, res) => {
 
 // --------------- PLAYBACKS ---------------
 managerRouter.post('/playbacks', (req, res) => {
-  const { sourceProfile, destinationUrl, duration } = req.body;
+  const { sourceProfile, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
   const playbackId = `play-${uuidv4()}`;
   const now = new Date();
-  const endTime = duration > 0 ? new Date(now.getTime() + (duration + 3) * 1000) : null;
+  const startTime = vodStartTime;
+  const endTime = vodEndTime; // TODO: improve how this works for offset to endpoint, store starttime and endtime in DB
+
 
   /* check if we have the db file availble */
   if (!fs.existsSync(db_file)) {
@@ -517,8 +519,8 @@ managerRouter.post('/playbacks', (req, res) => {
       sourceProfile,
       destinationUrl,
       duration,
-      now.toISOString(),
-      endTime ? endTime.toISOString() : null,
+      (startTime && startTime !== "") ? startTime.toISOString() : "",
+      (endTime && endTime !== "") ? endTime.toISOString() : "",
       'active',
       null
     ],
@@ -533,8 +535,8 @@ managerRouter.post('/playbacks', (req, res) => {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      jobId: playbackId,
-      sourceProfile,
+      jobId: sourceProfile,
+      playbackId,
       destinationUrl,
       duration
     })

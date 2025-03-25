@@ -3,19 +3,23 @@ info:
   title: Recording & Playback 2025 API
   version: 1.0.0
   description: >
-    Comprehensive API specification for the Recording/Playback stack.  
-    This document covers:
-    - **Manager API** (externally facing, single instance per cluster).  
-    - **Agent API** (one instance per server, controlled by the Manager).  
+    Comprehensive API specification for the Recording/Playback stack.
 
-    Key points from the specs:
-    - **MPEG-TS** SPTS or MPTS as the storage/transfer format.
-    - **Immediate start** for all recordings and playbacks (no future scheduling).
-    - **S3-based Pools** for asset storage (AWS or MinIO), with flexible credentials.
-    - **Durations** range from 10 seconds (minimum) to 6 hours (maximum).
-    - **Bitrates** range from 1 Kb/s to 240 Mb/s.
-    - Thumbnails generated approximately every 60 seconds (where applicable).
-    - Full usage metrics and “god mode” under Admin endpoints.
+    This document covers:
+      - **Manager API**: Externally facing endpoints (a single instance per cluster) to manage recording, playback, pools, and assets.
+      - **Agent API**: Endpoints running on individual agents (one per server) that actually execute recording/playback jobs.
+
+    **Key Points:**
+      - **MPEG-TS** as the underlying storage/transfer format.
+      - **Immediate start** for all recordings and playbacks (no future scheduling).
+      - **S3-based Pools** for asset storage (AWS or MinIO) with flexible credentials.
+      - Duration limits: from 10 seconds (minimum) up to 6 hours (maximum).
+      - Bitrate range: 1 Kb/s to 240 Mb/s.
+      - Thumbnails generated approximately every 60 seconds (where applicable).
+      - Administrative endpoints provide full usage metrics and “god mode” operations.
+
+    **Usage Examples & Developer Guide:**
+      For detailed usage examples, debugging tips, and best practices for deployment and scaling, please refer to the developer guide included in the repository’s README.
 
 servers:
   - url: "{protocol}://{host}:{port}/v1"
@@ -26,28 +30,28 @@ servers:
         default: "http"
       host:
         default: "localhost"
-        description: "Host name or IP"
+        description: "Host name or IP address of the server"
       port:
         default: "3000"
-        description: "Port number"
+        description: "Port number on which the API is served"
 
 tags:
   - name: Manager-Recordings
-    description: Manager-facing endpoints to create and manage recording jobs.
+    description: Manager-facing endpoints to create, list, and manage recording jobs.
   - name: Manager-Playbacks
-    description: Manager-facing endpoints for playback control.
+    description: Manager-facing endpoints for playback job creation and control.
   - name: Manager-Pools
-    description: Manage or query user-defined storage pools.
+    description: Endpoints to create and query user-defined S3/MinIO storage pools.
   - name: Manager-Assets
-    description: Endpoints to query or delete stored assets.
+    description: Endpoints to retrieve metadata and delete stored assets.
   - name: Manager-Admin
-    description: Administrative (support/god) mode operations.
+    description: Administrative endpoints providing system metrics and usage.
   - name: Agent-Recordings
-    description: Agent's recording execution endpoints.
+    description: Agent-specific endpoints for executing recording jobs.
   - name: Agent-Playbacks
-    description: Agent's playback execution endpoints.
+    description: Agent-specific endpoints for executing playback jobs.
   - name: Agent-Misc
-    description: Agent status, metrics, and other endpoints.
+    description: Endpoints for reporting agent status, metrics, and other runtime details.
 
 components:
   securitySchemes:
@@ -56,6 +60,72 @@ components:
       scheme: bearer
       bearerFormat: JWT
 
+  responses:
+    BadRequest:
+      description: Bad Request – the request was invalid or cannot be otherwise served.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Bad Request"
+                message: "The request parameters are missing or invalid."
+    Unauthorized:
+      description: Unauthorized – authentication is required or has failed.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Unauthorized"
+                message: "Authentication credentials were missing or incorrect."
+    NotFound:
+      description: Not Found – the requested resource could not be found.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Not Found"
+                message: "The requested resource does not exist."
+    InternalServerError:
+      description: Internal Server Error – an unexpected error occurred.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Internal Server Error"
+                message: "An unexpected error occurred on the server."
+
 security:
   - BearerAuth: []
 
@@ -63,20 +133,20 @@ paths:
   ########################################################
   # Manager API - RECORDINGS
   ########################################################
-
   /recordings:
     post:
       tags:
         - Manager-Recordings
-      summary: Create a new recording
+      summary: Create a new recording job
       description: >
-        Initiates a new recording immediately, creating a growing asset.  
-        According to specs:
-        - Minimum duration: 10 seconds  
-        - Maximum duration: 6 hours  
-        - Accepts an endpoint, a UDP URL, or an RTP URL.  
-        - destinationProfile references internal AWS/MinIO credentials.
+        Initiates a new recording immediately by capturing a UDP or RTP stream. 
+        **Specifications:**
+        - Minimum duration: 10 seconds.
+        - Maximum duration: 6 hours.
+        - `sourceUrl` accepts an endpoint (UDP/RTP).
+        - `destinationProfile` references internal AWS/MinIO credentials.
       requestBody:
+        description: Recording job creation parameters.
         required: true
         content:
           application/json:
@@ -85,20 +155,23 @@ paths:
               properties:
                 sourceUrl:
                   type: string
-                  description: UDP / RTP endpoint
+                  description: "UDP or RTP endpoint URL (e.g., udp://239.0.0.1:1234)"
+                  example: "udp://239.0.0.1:1234"
                 duration:
                   type: integer
-                  description: Duration in seconds (10 sec to 6 hrs)
+                  description: "Duration of recording in seconds (between 10 and 21600)"
+                  example: 120
                 destinationProfile:
                   type: string
-                  description: Shortcut to internal credential set
+                  description: "Credential profile identifier for S3/MinIO storage"
+                  example: "default"
               required:
                 - sourceUrl
                 - duration
                 - destinationProfile
       responses:
         "201":
-          description: Recording job created
+          description: Recording job successfully created.
           content:
             application/json:
               schema:
@@ -106,18 +179,25 @@ paths:
                 properties:
                   recordingId:
                     type: string
-                    description: Unique identifier for the recording
+                    description: "Unique identifier for the created recording job"
+                example:
+                  recordingId: "rec-12345"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
     get:
       tags:
         - Manager-Recordings
-      summary: List all active or recent recordings
+      summary: List all active or recent recording jobs
       description: >
-        Returns metadata about ongoing or recently completed recording jobs
-        for the authenticated user.
+        Returns metadata for ongoing or recently completed recording jobs for the authenticated user.
       responses:
         "200":
-          description: List of recordings
+          description: An array of recording jobs.
           content:
             application/json:
               schema:
@@ -127,39 +207,60 @@ paths:
                   properties:
                     recordingId:
                       type: string
+                      description: "Unique recording identifier"
                     sourceUrl:
                       type: string
+                      description: "Source endpoint URL"
                     duration:
                       type: integer
+                      description: "Recording duration in seconds"
                     destinationProfile:
                       type: string
+                      description: "Credential profile used for storage"
                     startTime:
                       type: string
                       format: date-time
+                      description: "Recording start time"
                     endTime:
                       type: string
                       format: date-time
+                      description: "Recording end time (if completed)"
                     status:
                       type: string
+                      description: "Recording status"
                       enum: [starting, active, completed, canceled]
+                example:
+                  - recordingId: "rec-12345"
+                    sourceUrl: "udp://239.0.0.1:1234"
+                    duration: 120
+                    destinationProfile: "default"
+                    startTime: "2025-03-25T08:00:00Z"
+                    endTime: "2025-03-25T08:02:00Z"
+                    status: "completed"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /recordings/{recordingId}:
+    parameters:
+      - name: recordingId
+        in: path
+        required: true
+        description: "Unique identifier for the recording job"
+        schema:
+          type: string
     get:
       tags:
         - Manager-Recordings
-      summary: Get details of a specific recording
+      summary: Get details of a specific recording job
       description: >
-        Returns detailed status and metadata for a single recording job, including
-        current size, bitrate, and thumbnail URL updated every 60 seconds.
-      parameters:
-        - in: path
-          name: recordingId
-          schema:
-            type: string
-          required: true
+        Retrieves detailed status and metadata for a single recording job, including current size, bitrate, and thumbnail URL.
       responses:
         "200":
-          description: Recording details
+          description: Recording job details.
           content:
             application/json:
               schema:
@@ -175,6 +276,7 @@ paths:
                     type: string
                   currentSize:
                     type: integer
+                    description: "Current size in bytes of the recording"
                   startTime:
                     type: string
                     format: date-time
@@ -183,40 +285,65 @@ paths:
                     format: date-time
                   bitrate:
                     type: integer
+                    description: "Current bitrate in Kb/s"
                   ccErrorCount:
                     type: integer
+                    description: "Count of closed-captioning errors"
                   thumbnailUrl:
                     type: string
+                    description: "URL to the current thumbnail image"
                   status:
                     type: string
-
+              example:
+                recordingId: "rec-12345"
+                sourceUrl: "udp://239.0.0.1:1234"
+                duration: 120
+                destinationProfile: "default"
+                currentSize: 10485760
+                startTime: "2025-03-25T08:00:00Z"
+                endTime: "2025-03-25T08:02:00Z"
+                bitrate: 1500
+                ccErrorCount: 0
+                thumbnailUrl: "http://localhost/thumbnails/rec-12345.jpg"
+                status: "active"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       tags:
         - Manager-Recordings
-      summary: Cancel a recording
-      parameters:
-        - in: path
-          name: recordingId
-          schema:
-            type: string
-          required: true
+      summary: Cancel an existing recording job
+      description: >
+        Cancels a recording job specified by its unique identifier.
       responses:
         "204":
-          description: Recording canceled
+          description: Recording job canceled successfully. No content returned.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   ########################################################
   # Manager API - POOLS
   ########################################################
-
   /pools:
     post:
       tags:
         - Manager-Pools
       summary: Create a new storage pool
       description: >
-        Defines a user-specific S3 (or similar) bucket with credentials.
-        Pools are not shared between users (yet).
+        Creates a new S3/MinIO storage pool using provided bucket details and credentials.
       requestBody:
+        description: Pool creation parameters.
         required: true
         content:
           application/json:
@@ -225,14 +352,20 @@ paths:
               properties:
                 bucketName:
                   type: string
-                  description: Name of the S3/MinIO bucket
+                  description: "Name of the S3/MinIO bucket"
+                  example: "hls-bucket"
                 credentials:
                   type: object
+                  description: "Access credentials for S3/MinIO"
                   properties:
                     accessKey:
                       type: string
+                      description: "Access key identifier"
+                      example: "minioadmin"
                     secretKey:
                       type: string
+                      description: "Secret access key"
+                      example: "minioadmin"
                   required:
                     - accessKey
                     - secretKey
@@ -241,7 +374,7 @@ paths:
                 - credentials
       responses:
         "201":
-          description: Pool created
+          description: Storage pool created successfully.
           content:
             application/json:
               schema:
@@ -249,17 +382,26 @@ paths:
                 properties:
                   poolId:
                     type: string
-                    description: Unique pool identifier
+                    description: "Unique pool identifier"
                   bucketName:
                     type: string
+              example:
+                poolId: "pool-67890"
+                bucketName: "hls-bucket"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
     get:
       tags:
         - Manager-Pools
-      summary: Enumerate all pools for the authenticated user
+      summary: List all storage pools for the authenticated user
       responses:
         "200":
-          description: List of pools
+          description: An array of storage pools.
           content:
             application/json:
               schema:
@@ -271,21 +413,31 @@ paths:
                       type: string
                     bucketName:
                       type: string
+                example:
+                  - poolId: "pool-67890"
+                    bucketName: "hls-bucket"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /pools/{poolId}/assets:
+    parameters:
+      - name: poolId
+        in: path
+        required: true
+        description: "Unique identifier of the storage pool"
+        schema:
+          type: string
     get:
       tags:
         - Manager-Assets
-      summary: List assets within a specific pool
-      parameters:
-        - in: path
-          name: poolId
-          required: true
-          schema:
-            type: string
+      summary: List assets within a specific storage pool
       responses:
         "200":
-          description: Assets in the pool
+          description: An array of assets stored in the specified pool.
           content:
             application/json:
               schema:
@@ -295,48 +447,70 @@ paths:
                   properties:
                     assetId:
                       type: string
-                      description: Globally unique (POOLID-ASSETID)
+                      description: "Globally unique asset identifier (e.g., POOLID-ASSETID)"
                     metadata:
                       type: object
-                      description: Arbitrary metadata about the asset
-
+                      description: "Arbitrary metadata associated with the asset"
+                example:
+                  - assetId: "pool-67890-asset-001"
+                    metadata:
+                      bitrate: 1500
+                      size: 10485760
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       tags:
         - Manager-Assets
-      summary: Delete an asset from a pool
+      summary: Delete an asset from a storage pool
       parameters:
-        - in: path
-          name: poolId
+        - name: poolId
+          in: path
           required: true
+          description: "Unique identifier of the storage pool"
           schema:
             type: string
-        - in: query
-          name: assetId
+        - name: assetId
+          in: query
           required: true
+          description: "Unique identifier of the asset to delete"
           schema:
             type: string
       responses:
         "204":
-          description: Asset deleted
+          description: Asset deleted successfully.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   ########################################################
   # Manager API - ASSETS
   ########################################################
-
   /assets/{assetId}:
+    parameters:
+      - name: assetId
+        in: path
+        required: true
+        description: "Unique asset identifier"
+        schema:
+          type: string
     get:
       tags:
         - Manager-Assets
       summary: Get metadata for a single asset
-      parameters:
-        - in: path
-          name: assetId
-          required: true
-          schema:
-            type: string
       responses:
         "200":
-          description: Asset metadata
+          description: Asset metadata returned.
           content:
             application/json:
               schema:
@@ -348,22 +522,36 @@ paths:
                     type: string
                   metadata:
                     type: object
-                    description: Additional details (bitrate, size, etc.)
+                    description: "Additional asset details (e.g., bitrate, size)"
+                example:
+                  assetId: "pool-67890-asset-001"
+                  poolId: "pool-67890"
+                  metadata:
+                    bitrate: 1500
+                    size: 10485760
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   ########################################################
   # Manager API - PLAYBACKS
   ########################################################
-
   /playbacks:
     post:
       tags:
         - Manager-Playbacks
       summary: Create a new playback job
       description: >
-        Begins a playback job immediately (no scheduling).  
-        Can handle static or growing assets for partial time range playback.  
-        Accepts UDP, or RTP as destinations, plus S3 references.
+        Initiates a playback job immediately.
+        Supports both static and growing assets for partial or full playback.
+        Accepts a UDP or RTP destination URL along with S3-based source profile credentials.
       requestBody:
+        description: Playback job creation parameters.
         required: true
         content:
           application/json:
@@ -372,20 +560,23 @@ paths:
               properties:
                 sourceProfile:
                   type: string
-                  description: References credentials for reading the asset
+                  description: "Credential profile identifier for accessing the asset"
+                  example: "default"
                 destinationUrl:
                   type: string
-                  description: UDP, or RTP URL for playout
+                  description: "UDP or RTP URL for playback output"
+                  example: "udp://239.0.0.1:1234"
                 duration:
                   type: integer
-                  description: Duration in seconds (could be 'infinite' if 0 or omitted)
+                  description: "Duration in seconds; a value of 0 may indicate an infinite duration"
+                  example: 0
               required:
                 - sourceProfile
                 - destinationUrl
                 - duration
       responses:
         "201":
-          description: Playback job created
+          description: Playback job created successfully.
           content:
             application/json:
               schema:
@@ -393,14 +584,22 @@ paths:
                 properties:
                   playbackId:
                     type: string
-
+                    description: "Unique identifier for the playback job"
+                example:
+                  playbackId: "play-98765"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     get:
       tags:
         - Manager-Playbacks
-      summary: List all playback jobs
+      summary: List all playback jobs for the authenticated user
       responses:
         "200":
-          description: A list of playback jobs for the user
+          description: An array of playback jobs.
           content:
             application/json:
               schema:
@@ -418,21 +617,34 @@ paths:
                       type: integer
                     status:
                       type: string
+                  example:
+                    playbackId: "play-98765"
+                    sourceProfile: "default"
+                    destinationUrl: "udp://239.0.0.1:1234"
+                    duration: 0
+                    status: "active"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /playbacks/{playbackId}:
+    parameters:
+      - name: playbackId
+        in: path
+        required: true
+        description: "Unique identifier for the playback job"
+        schema:
+          type: string
     get:
       tags:
         - Manager-Playbacks
-      summary: Get details about a playback job
-      parameters:
-        - in: path
-          name: playbackId
-          required: true
-          schema:
-            type: string
+      summary: Get detailed information about a playback job
       responses:
         "200":
-          description: Playback details
+          description: Playback job details.
           content:
             application/json:
               schema:
@@ -448,50 +660,84 @@ paths:
                     type: integer
                   currentSize:
                     type: integer
+                    description: "Current size of the asset in bytes"
                   startTime:
                     type: string
                     format: date-time
+                    description: "Playback start time"
                   endTime:
                     type: string
                     format: date-time
+                    description: "Playback end time (if applicable)"
                   bitrate:
                     type: integer
+                    description: "Bitrate of the playback stream"
                   ccErrorCount:
                     type: integer
                   thumbnailUrl:
                     type: string
                   status:
                     type: string
-
+                example:
+                  playbackId: "play-98765"
+                  sourceProfile: "default"
+                  destinationUrl: "udp://239.0.0.1:1234"
+                  duration: 0
+                  currentSize: 10485760
+                  startTime: "2025-03-25T08:05:00Z"
+                  endTime: ""
+                  bitrate: 1500
+                  ccErrorCount: 0
+                  thumbnailUrl: "http://localhost/thumbnails/play-98765.jpg"
+                  status: "active"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       tags:
         - Manager-Playbacks
       summary: Cancel a playback job
       parameters:
-        - in: path
-          name: playbackId
+        - name: playbackId
+          in: path
           required: true
+          description: "Unique identifier for the playback job"
           schema:
             type: string
       responses:
         "204":
-          description: Playback job canceled
+          description: Playback job canceled successfully.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   ########################################################
   # Manager API - ADMIN (SUPPORT / GOD MODE)
   ########################################################
-
   /admin/stats:
     get:
       tags:
         - Manager-Admin
-      summary: System-wide metrics and usage
+      summary: Retrieve system-wide metrics and usage statistics
       description: >
-        Provides consolidated stats such as concurrent usage, total assets, 
-        cluster performance metrics, and system load.
+        Provides consolidated statistics including:
+          - Concurrent recordings and playbacks.
+          - Cluster usage and performance metrics.
+          - Overall system load.
+          - Total number of assets.
       responses:
         "200":
-          description: Admin statistics
+          description: Administrative statistics returned successfully.
           content:
             application/json:
               schema:
@@ -503,24 +749,40 @@ paths:
                     type: integer
                   clusterUsage:
                     type: object
+                    description: "Detailed cluster usage metrics"
                   systemLoad:
                     type: number
+                    description: "Current system load average"
                   totalAssets:
                     type: integer
+                example:
+                  concurrentRecordings: 3
+                  concurrentPlaybacks: 2
+                  clusterUsage:
+                    cpu: 75
+                    memory: 60
+                  systemLoad: 1.5
+                  totalAssets: 150
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   ########################################################
   # AGENT API - RECORDINGS
   ########################################################
-
   /agent/jobs/recordings:
     post:
       tags:
         - Agent-Recordings
-      summary: Start a new recording on this Agent
+      summary: Instruct the Agent to start a new recording job
       description: >
-        The Manager instructs the Agent to launch a recording process.
-        The Agent is responsible for spawning binaries, handling containerization, etc.
+        The Manager sends a request to the Agent to launch a recording process.
+        The Agent is responsible for spawning binaries, container management, and resource allocation.
       requestBody:
+        description: Agent recording job parameters.
         required: true
         content:
           application/json:
@@ -529,12 +791,20 @@ paths:
               properties:
                 jobId:
                   type: string
+                  description: "Unique job identifier assigned by the Manager"
+                  example: "job-abc123"
                 sourceUrl:
                   type: string
+                  description: "Source URL for capturing the stream (UDP/RTP)"
+                  example: "udp://239.0.0.1:1234"
                 duration:
                   type: integer
+                  description: "Recording duration in seconds"
+                  example: 120
                 destinationProfile:
                   type: string
+                  description: "Credential profile for asset storage"
+                  example: "default"
               required:
                 - jobId
                 - sourceUrl
@@ -542,36 +812,51 @@ paths:
                 - destinationProfile
       responses:
         "201":
-          description: Agent accepted the recording job
+          description: Agent accepted the recording job.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /agent/recordings/{jobId}:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        description: "Unique identifier for the recording job on the Agent"
+        schema:
+          type: string
     delete:
       tags:
         - Agent-Recordings
-      summary: Stop a recording job on this Agent
-      parameters:
-        - in: path
-          name: jobId
-          required: true
-          schema:
-            type: string
+      summary: Stop a recording job running on the Agent
       responses:
         "204":
-          description: Recording job stopped
+          description: Recording job stopped successfully.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   ########################################################
   # AGENT API - PLAYBACKS
   ########################################################
-
   /agent/jobs/playbacks:
     post:
       tags:
         - Agent-Playbacks
-      summary: Start a new playback job on this Agent
+      summary: Instruct the Agent to start a new playback job
       description: >
-        Manager instructs the Agent to commence a playback process,
-        reading from a specified asset and streaming out via destinationUrl.
+        The Manager sends a request to the Agent to commence playback.
+        The Agent will read from a specified asset and stream out via the given destination URL.
       requestBody:
+        description: Agent playback job parameters.
         required: true
         content:
           application/json:
@@ -580,59 +865,86 @@ paths:
               properties:
                 jobId:
                   type: string
+                  description: "Unique job identifier assigned by the Manager"
+                  example: "job-play-xyz789"
                 sourceProfile:
                   type: string
+                  description: "Credential profile for reading the asset"
+                  example: "default"
                 destinationUrl:
                   type: string
+                  description: "Destination URL for streaming output (UDP/RTP)"
+                  example: "udp://239.0.0.1:1234"
                 duration:
                   type: integer
+                  description: "Playback duration in seconds (0 for infinite)"
+                  example: 0
                 vodStartTime:
                   type: string
-                  description: "Optional. E.g. '2025/03/04 08:10:00'"
+                  format: date-time
+                  description: "Optional start time for VOD playback (if applicable)"
+                  example: "2025-03-04T08:10:00Z"
                   default: ""
                 vodEndTime:
                   type: string
-                  description: "Optional. E.g. '2025/03/04 08:20:00'"
+                  format: date-time
+                  description: "Optional end time for VOD playback (if applicable)"
+                  example: "2025-03-04T08:20:00Z"
                   default: ""
               required:
                 - jobId
                 - sourceProfile
                 - destinationUrl
                 - duration
+                #- vodStartTime
+                #- vodEndTime
       responses:
         "201":
-          description: Playback job accepted
+          description: Playback job accepted by the Agent.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /agent/playbacks/{jobId}:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        description: "Unique identifier for the playback job on the Agent"
+        schema:
+          type: string
     delete:
       tags:
         - Agent-Playbacks
-      summary: Cancel a playback job on this Agent
-      parameters:
-        - in: path
-          name: jobId
-          required: true
-          schema:
-            type: string
+      summary: Cancel a playback job running on the Agent
       responses:
         "204":
-          description: Playback job canceled
+          description: Playback job canceled successfully.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   ########################################################
   # AGENT API - MISC
   ########################################################
-
   /agent/status:
     get:
       tags:
         - Agent-Misc
-      summary: Check Agent status and currently running jobs
+      summary: Retrieve current status and running jobs on the Agent
       description: >
-        Returns health indicators and lists active recording/playback jobs
-        on this specific Agent node.
+        Returns the health status, current running recording and playback jobs, and other agent metrics.
       responses:
         "200":
-          description: Agent status returned
+          description: Agent status information.
           content:
             application/json:
               schema:
@@ -640,10 +952,13 @@ paths:
                 properties:
                   agentId:
                     type: string
+                    description: "Unique identifier for the Agent"
                   status:
                     type: string
+                    description: "Overall health status of the Agent"
                   activeRecordings:
                     type: array
+                    description: "List of active recording jobs on the Agent"
                     items:
                       type: object
                       properties:
@@ -660,6 +975,7 @@ paths:
                           format: date-time
                   activePlaybacks:
                     type: array
+                    description: "List of active playback jobs on the Agent"
                     items:
                       type: object
                       properties:
@@ -674,3 +990,24 @@ paths:
                         startTime:
                           type: string
                           format: date-time
+                example:
+                  agentId: "agent-001"
+                  status: "healthy"
+                  activeRecordings:
+                    - jobId: "job-abc123"
+                      sourceUrl: "udp://239.0.0.1:1234"
+                      duration: 120
+                      destinationProfile: "default"
+                      startTime: "2025-03-25T08:00:00Z"
+                  activePlaybacks:
+                    - jobId: "job-play-xyz789"
+                      sourceProfile: "default"
+                      destinationUrl: "udp://239.0.0.1:1234"
+                      duration: 0
+                      startTime: "2025-03-25T08:05:00Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
