@@ -41,7 +41,7 @@
  * 
  ****************************************************/
 
-const serverVersion = '1.0.27';
+const serverVersion = '1.0.28';
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
@@ -58,17 +58,36 @@ const yaml = require('js-yaml');
 const fetch = require('node-fetch');
 const { env } = require('process');
 
-// Server URL Base
+/*
+ * The SERVER_HOST and SERVER_PORT are the host and port of the recording-playback-server which can be a Manager or Agent role.
+ * The AGENT_HOST and AGENT_PORT are the host and port of the recording-playback-server which can be remotely called by a Manager role.
+ * Agents are basically nodes that run the heavier processes of recording and playback.
+ * Managers are nodes that manage the Agents and the recording and playback processes.
+ */
+
+// Server Manager and Agent URL Bases used for fetch calls (same server in this case)
+const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
 const SERVER_PORT = process.env.SERVER_PORT || 3000;
-const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1";
-const serverUrl = 'http://' + SERVER_HOST + ':' + SERVER_PORT;
+const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // Manager and local Agents base server
+const serverUrl = SERVER_PROTOCOL + '://' + SERVER_HOST + ':' + SERVER_PORT;
+
+const AGENT_PROTOCOL = process.env.AGENT_PROTOCOL || 'http';
+const AGENT_PORT = process.env.AGENT_PORT || 3000;
+const AGENT_HOST = process.env.AGENT_HOST || "127.0.0.1"; // Agent is running on the same server as Manager (us)
+const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
+
+// S3 endpoint for the MinIO server
 const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
+
+// Runtime verbosity levels of Rust programs, 0-4: error, warn, info, debug, trace
+const PLAYBACK_VERBOSE = process.env.PLAYBACK_VERBOSE || 2;
+const RECORDING_VERBOSE = process.env.RECORDING_VERBOSE || 2;
 
 // check env and set the values for the baseargs, else set to defaults, use vars below
 const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 500;
-const PLAYBACK_VERBOSE = process.env.VERBOSE || 2;
-const RECORDING_VERBOSE = process.env.VERBOSE || 2;
 const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 1316;
+
+// setup directorie paths and locations of files
 const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger.yaml';
 const ORIGINAL_DIR = process.cwd() + '/';
 const HLS_DIR = process.env.HLS_DIR || '';
@@ -297,7 +316,7 @@ managerRouter.post('/recordings', (req, res) => {
         return res.status(500).json({ error: err.message });
       }
 
-      let fetchUrl = serverUrl + "/v1/agent/jobs/recordings";
+      let fetchUrl = agentUrl + "/v1/agent/jobs/recordings";
       console.log('About to call Agent with fetch, recordingId=', recordingId, ' Url=', sourceUrl, ' Duration=', duration, ' DestinationProfile=', destinationProfile, ' FetchUrl=', fetchUrl);
 
       fetch(fetchUrl, {
@@ -479,10 +498,12 @@ managerRouter.get('/assets/:assetId', (req, res) => {
 
 // --------------- PLAYBACKS ---------------
 managerRouter.post('/playbacks', (req, res) => {
-  const { sourceProfile, destinationUrl, duration } = req.body;
+  const { sourceProfile, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
   const playbackId = `play-${uuidv4()}`;
   const now = new Date();
-  const endTime = duration > 0 ? new Date(now.getTime() + (duration + 3) * 1000) : null;
+  const startTime = vodStartTime;
+  const endTime = vodEndTime; // TODO: improve how this works for offset to endpoint, store starttime and endtime in DB
+
 
   /* check if we have the db file availble */
   if (!fs.existsSync(db_file)) {
@@ -498,8 +519,8 @@ managerRouter.post('/playbacks', (req, res) => {
       sourceProfile,
       destinationUrl,
       duration,
-      now.toISOString(),
-      endTime ? endTime.toISOString() : null,
+      (startTime && startTime !== "") ? startTime.toISOString() : "",
+      (endTime && endTime !== "") ? endTime.toISOString() : "",
       'active',
       null
     ],
@@ -508,14 +529,14 @@ managerRouter.post('/playbacks', (req, res) => {
     }
   );
   // Call the agent to start the playback
-  let fetchUrl = serverUrl + "/v1/agent/jobs/playbacks";
+  let fetchUrl = agentUrl + "/v1/agent/jobs/playbacks";
   console.log('About to call Agent with fetch, playbackId=', playbackId, ' SourceProfile=', sourceProfile, ' DestinationUrl=', destinationUrl, ' Duration=', duration, ' FetchUrl=', fetchUrl);
   fetch(fetchUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      jobId: playbackId,
-      sourceProfile,
+      jobId: sourceProfile,
+      playbackId,
       destinationUrl,
       duration
     })
@@ -1121,7 +1142,7 @@ app.use('/v1/agent', agentRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
-  console.log(`Server version ${serverVersion} running on ${serverUrl}.`);
+  console.log(`Manager/Agent API Server version ${serverVersion} Manager@${serverUrl} AgentUrl@${agentUrl}.`);
   let capture_buffer_size = env.CAPTURE_BUFFER_SIZE || `4193904`;
   let segment_duration_ms = env.SEGMENT_DURATION_MS || `2000`;
   let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
@@ -1132,8 +1153,10 @@ app.listen(SERVER_PORT, () => {
 
   const help_msg = `
 Environment Variables:
-  - SERVER_PORT: Port for the Node server to listen on (default: ` + SERVER_PORT + `)
-  - SERVER_HOST: Host for the Node server to listen on (default: ` + SERVER_HOST + `)
+  - SERVER_PORT: Port for the Node server to listen on as a Manager or Agent (default: ` + SERVER_PORT + `)
+  - SERVER_HOST: Host for the Node server to listen on as a Manager or Agent (default: ` + SERVER_HOST + `)
+  - AGENT_PORT: Port for the Agent server used by the Manager (default: ` + AGENT_PORT + `)
+  - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
   - AWS_S3_ENDPOINT: Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
   - SMOOTHER_LATENCY: Smoother latency for hls-to-udp output (default: ` + SMOOTHER_LATENCY + `)
   - PLAYBACK_VERBOSE: Verbosity level for hls-to-udp (default: ` + PLAYBACK_VERBOSE + `)
@@ -1150,7 +1173,7 @@ Environment Variables:
   - ORIGINAL_DIR: Original directory before changing to HLS_DIR (default: ` + ORIGINAL_DIR + `)
   - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
-  console.log('\nRecord/Playback Server URL:', serverUrl);
+  console.log('\nRecord/Playback API Server Manager URL:', serverUrl, ' Agent URL:', agentUrl);
   console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');
