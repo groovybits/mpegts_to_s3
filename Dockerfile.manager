@@ -1,0 +1,47 @@
+###
+### START OF Runtime Container
+FROM almalinux:8-minimal as binary
+
+ARG ENABLE_DEBUG
+ENV ENABLE_DEBUG=${ENABLE_DEBUG:-false}
+
+## Add the built binaries to the PATH
+ENV PATH="/app/bin:${PATH}"
+
+## Set up environment variables
+ENV HOURLY_URLS_LOG="/app/hls/index.txt"
+ENV SWAGGER_FILE="/app/swagger_manager.yaml"
+ENV NVM_DIR="/app/.nvm"
+
+## Update system and install dependencies needed for nvm and node
+RUN microdnf update -y > /dev/null && \
+    microdnf install -y findutils curl tar gzip
+
+## Install nvm and use it to install Node.js 20, then symlink the node binaries for runtime
+RUN mkdir -p ${NVM_DIR} && curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash && \
+    bash -c "source \$NVM_DIR/nvm.sh && \
+    nvm install 20 && \
+    nvm alias default 20 && \
+    nvm use default && \
+    mkdir -p /app/bin && \
+    ln -sf \$(nvm which default) /app/bin/node && \
+    ln -sf \$(dirname \$(nvm which default))/npm /app/bin/npm && \
+    ln -sf \$(dirname \$(nvm which default))/npx /app/bin/npx"
+
+## Quick confirmation that the binaries execute correctly
+RUN node --version
+RUN npm --version
+
+COPY scripts/entrypoint_manager.sh /app/entrypoint_manager.sh
+COPY recording-playback-server/swagger_manager.yaml ${SWAGGER_FILE}
+
+COPY recording-playback-server/package.json /app/package.json
+COPY recording-playback-server/package-lock.json /package-lock.json
+COPY recording-playback-server/manager.js /app/manager.js
+
+WORKDIR /app
+
+## Install recording-playback-server dependencies
+RUN npm install
+
+## Finished building the runtime container

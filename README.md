@@ -1,6 +1,8 @@
-# UDP MpegTS to HLS VOD for UDP MpegTS Re-Stream
+# UDP to HLS Capture and Upload MpegTS to S3/MinIO
 
-UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can then be signed for secure playback. You can also run diskless and not store the segments locally, only in memory and upload to S3/MinIO. It has a container deployment option using Podman that sets up a local MinIO server and the capture application. See the hls to udp relay for a way to replay the content [hls-to-udp](hls-to-udp/README.md). There is an API Server in Node.js that can be used to manage the capture and playback jobs in [recording-playback-server](recording-playback-server).
+UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can be signed for secure playback. It runs diskless and doesn't store segments locally, only in memory and upload to S3/MinIO. 
+
+There are container image build and compose options using Podman/Docker + *-Compose that set up a local MinIO server and an API Server consisting of a Manager and an Agent that runs the udp-to-hls and hls-to-udp when requested. See  [hls-to-udp](hls-to-udp/README.md) and the API Server in Node.js [recording-playback-server](recording-playback-server).
 
 ```mermaid
 graph LR
@@ -34,25 +36,23 @@ git clone https://github.com/groovybits/mpegts_to_s3.git
 cd mpegts_to_s3
 
 # Edit the config.env file to set the desired settings
-vim config.env
+ls configs/*.env && cp -R configs configs_custom && vim configs_custom/*.env
+# Then edit the docker-compose_* manager and agent to point to the custom configs
 
-# Edit the recording-playback-server/.env.example file to set the desired settings
-vim recording-playback-server/.env.example
-
-## Two different compose files to run the containerized version, either
-## with or without the recording-playback-server API container that manages the capture and playback jobs
-
-## Separate containers, no API server, Start MinIO and the Mpeg_to_S3 capture using config.env values for settings
-#podman-compose up --build
+# Start MinIO Server
+podman-compose -f docker-compose_minio.yml up -d --build
 
 # With the API server, Start MinIO, the Mpeg_to_S3 capture, and the API server
-podman-compose -f docker-compose_recording_playback_server.yml up --build
+podman-compose -f docker-compose_apiserver.yml up --build
 
 # Now browse to the host IP on port 3000 to access the API server swagger UI
-# webbrowser --url http://localhost:3000/api-docs
+# webbrowser --url http://localhost:3000/api-docs  # Manager default port is 3000
+# webbrowser --url http://localhost:3001/api-docs  # Agent default port is 3001
 ```
 
-There is a container at `docker.io/groovybits/mpegts_to_s3:latest` which can be used.
+There are official stable release containers available at: 
+- `docker.io/groovybits/manager:latest`
+- `docker.io/groovybits/agent:latest`
 
 ## Quick Start Guide (Local Build)
 
@@ -62,73 +62,37 @@ git clone https://github.com/groovybits/mpegts_to_s3.git
 cd mpegts_to_s3
 
 # Build the udp-to-hls application in release mode
-cargo build --release
-
-# Build the hls-to-udp application in release mode
-cd hls-to-udp
-cargo build --release --features=smoother
+make && make install
 ```
 
 ### Configure and Run the Components
-#### 1. Start MinIO Server
+#### Start MinIO Server (runs on ports 9000 and 9001 like S3)
 ```bash
-# Start the MinIO server (uses ./data/ for storage)
-TARGET_SERVER=192.168.1.1 scripts/minio_server.py &
+# Start the MinIO server for local testing (uses ./data/ for storage)
+podman-compose -f docker-compose_minio.yml up --build
 ```
 
-#### 2. Serve HLS Playlist
-```bash
-# Create HLS directory for serving the index.m3u8 file
-mkdir hls && cd hls
-
-# Run Python HTTP Server to serve files from the ./hls/ directory
-../scripts/http_server.py &
-```
-
-#### 3. Capture and Segment UDP Stream to HLS
+#### Capture and Segment UDP Stream to HLS
 ```bash
 # Capture multicast stream from udp://224.0.0.200:10001 on interface eth0
-# Segments can be saved to ./ts/ directory with 2-second duration and uploaded to S3/MinIO
-SEGMENT_DURATION_SECONDS=2 \
-../target/release/udp-to-hls \
+# Segments are uploaded to S3/MinIO in the s3://hls/channel01/* bucket/key
+cd hls && ../bin/udp-to-hls \
     -n eth0 \         # Network interface for packet capture
     -i 224.0.0.200 \  # Multicast IP to filter
     -p 10001 \        # UDP port to filter
+    -b hls \
     -o channel01      # Unique Identifier and Output directory for .ts segments
 ```
 
-#### 4. Playback from HLS to UDP
+#### Playback from HLS to UDP
 
-See [hls-to-udp](hls-to-udp/README.md) for details on playback and VOD recall of specific date/time start/end points.
-
-- **Direct Playback:**
-  1. Use the index.m3u8 for playback of the current live stream:
+- **Playback with hls-to-udp** [hls-to-udp](hls-to-udp/README.md)
+  1. Start the hls-to-udp agent
      ```bash
-     mpv -i http://127.0.0.1:80/index.m3u8
+     # Get the last m3u8 hour url in S3 storage to playback to MpegTS UDP via multicast
+     ./bin/hls-to-udp -u `cat hls/index.txt | tail -1` -o 224.0.0.200:10001
      ```
-
-- **MinIO Playback:**
-  1. Retrieve the signed URL for the desired hour:
-     ```bash
-     curl -s http://127.0.0.1:80/hourly_urls.log | tail -1
-     ```
-  2. Setup an SSH tunnel for the HTTP server:
-     ```bash
-     scripts/minio_tunnel.sh
-     ```
-  3. Play back the hourly playlist:
-     ```bash
-     mpv http://127.0.0.1:9000/ltnhls/2025/01/16/06/hourly_index.m3u8?...(signed_url_params)
-     ```
-
-- **Custom Playback with hls-to-udp relay** [hls-to-udp](hls-to-udp/README.md)
-  1. Start the hls-to-udp relay
-     ```bash
-     cd hls-to-udp
-     cargo build --release
-     ./target/release/hls-to-udp -u http://127.0.0.1:80/index.m3u8 -o 224.0.0.200:10001
-     ```
-  2. Play the relayed stream
+  2. Play the relayed stream while being re-broadcasted
      ```bash
      mpv udp://224.0.0.200:10001
      ```
@@ -141,7 +105,7 @@ See [hls-to-udp](hls-to-udp/README.md) for details on playback and VOD recall of
 - **Dependencies:** Install `libpcap` for packet capture and FFmpeg (optional) for HLS segment generation.
 - **Ports:** Open ports 9000 and 9001 for MinIO and the HTTP server.
 - **SSH Tunneling:** For HTTP access to MinIO, set up SSH forwarding.
-- **LibLTNTSTools (optional):** Use the `smoother` feature flag to enable the Bitrate Smoother.
+- **LibLTNTSTools (optional, really is important):** Use the `smoother` feature flag to enable the Bitrate Smoother, without it the output will not be broadcast compliant but will playback fine with possibly some jitter.
 
 ```bash
 
@@ -208,27 +172,26 @@ See [hls-to-udp](hls-to-udp/README.md) for details on playback and VOD recall of
 
 ---
 
-## Example File Structure
-```text
-hls/
+## Example of the Storage S3 object key hierarchy
+hls/{recordId}/
 ├── index.m3u8
 ├── 2025/
     └── 01/
         └── 16/
             └── 06/
                 ├── segment_20250116-060000__0000.ts
-                └── hourly_index.m3u8
+                └── index.m3u8
 ```
 ---
 
 ## Development Notes
 
-The full source code is located in the `src/` directory. Additional utility scripts for managing MinIO and HTTP servers are available in the `scripts/` folder.
+Additional utility scripts for managing MinIO and HTTP servers are available in the `scripts/` folder.
 
 For questions or issues, refer to the repository's issue tracker.
 
 ---
 
 **Author:** wizard@groovy.org
-**Date:** January 15, 2025
+**Date:** March 2025
 

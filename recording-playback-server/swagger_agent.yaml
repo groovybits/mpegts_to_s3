@@ -1,0 +1,339 @@
+openapi: 3.0.3
+info:
+  title: Recording/Playback Agent API
+  version: 1.0.0
+  description: >
+    Comprehensive API specification for the Recording/Playback Agent.
+
+servers:
+  - url: "{protocol}://{host}:{port}/v1"
+    description: Agent API Endpoint
+    variables:
+      protocol:
+        enum: ["http", "https"]
+        default: "http"
+      host:
+        default: "localhost"
+        description: "Host name or IP address of the Agent API server"
+      port:
+        default: "3001"
+        description: "Port number on which the Agent API is served"
+
+tags:
+  - name: Agent-Recordings
+    description: Agent-specific endpoints for executing recording jobs.
+  - name: Agent-Playbacks
+    description: Agent-specific endpoints for executing playback jobs.
+  - name: Agent-Misc
+    description: Endpoints for reporting agent status, metrics, and other runtime details.
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    BadRequest:
+      description: Bad Request – the request was invalid or cannot be otherwise served.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Bad Request"
+                message: "The request parameters are missing or invalid."
+    Unauthorized:
+      description: Unauthorized – authentication is required or has failed.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Unauthorized"
+                message: "Authentication credentials were missing or incorrect."
+    NotFound:
+      description: Not Found – the requested resource could not be found.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Not Found"
+                message: "The requested resource does not exist."
+    InternalServerError:
+      description: Internal Server Error – an unexpected error occurred.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+          examples:
+            default:
+              value:
+                error: "Internal Server Error"
+                message: "An unexpected error occurred on the server."
+
+security:
+  - BearerAuth: []
+
+paths:
+  ########################################################
+  # AGENT API - RECORDINGS
+  ########################################################
+  /agent/jobs/recordings:
+    post:
+      tags:
+        - Agent-Recordings
+      summary: Instruct the Agent to start a new recording job
+      description: >
+        The Manager sends a request to the Agent to launch a recording process.
+        The Agent is responsible for spawning binaries, container management, and resource allocation.
+      requestBody:
+        description: Agent recording job parameters.
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jobId:
+                  type: string
+                  description: "Unique job identifier assigned by the Manager"
+                  example: "job-abc123"
+                sourceUrl:
+                  type: string
+                  description: "Source URL for capturing the stream (UDP/RTP)"
+                  example: "udp://227.1.1.102:4102"
+                duration:
+                  type: integer
+                  description: "Recording duration in seconds"
+                  example: 30
+                destinationProfile:
+                  type: string
+                  description: "Credential profile for asset storage"
+                  example: "default"
+              required:
+                - jobId
+                - sourceUrl
+                - duration
+                - destinationProfile
+      responses:
+        "201":
+          description: Agent accepted the recording job.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /agent/recordings/{jobId}:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        description: "Unique identifier for the recording job on the Agent"
+        schema:
+          type: string
+    delete:
+      tags:
+        - Agent-Recordings
+      summary: Stop a recording job running on the Agent
+      responses:
+        "204":
+          description: Recording job stopped successfully.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  ########################################################
+  # AGENT API - PLAYBACKS
+  ########################################################
+  /agent/jobs/playbacks:
+    post:
+      tags:
+        - Agent-Playbacks
+      summary: Instruct the Agent to start a new playback job
+      description: >
+        The Manager sends a request to the Agent to commence playback.
+        The Agent will read from a specified asset and stream out via the given destination URL.
+      requestBody:
+        description: Agent playback job parameters.
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jobId:
+                  type: string
+                  description: "Unique job identifier assigned by the Manager"
+                  example: "job-play-xyz789"
+                destinationUrl:
+                  type: string
+                  description: "Destination URL for streaming output (UDP/RTP)"
+                  example: "udp://224.0.0.200:10002"
+                duration:
+                  type: integer
+                  description: "Playback duration in seconds (0 for infinite)"
+                  example: 0
+                vodStartTime:
+                  type: string
+                  format: date-time
+                  description: "Optional start time for VOD playback (if applicable)"
+                  example: "2025-03-04T08:10:00Z"
+                  default: ""
+                vodEndTime:
+                  type: string
+                  format: date-time
+                  description: "Optional end time for VOD playback (if applicable)"
+                  example: "2025-03-04T08:20:00Z"
+                  default: ""
+              required:
+                - jobId
+                - destinationUrl
+                - duration
+                - vodStartTime
+                - vodEndTime
+      responses:
+        "201":
+          description: Playback job accepted by the Agent.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /agent/playbacks/{jobId}:
+    parameters:
+      - name: jobId
+        in: path
+        required: true
+        description: "Unique identifier for the playback job on the Agent"
+        schema:
+          type: string
+    delete:
+      tags:
+        - Agent-Playbacks
+      summary: Cancel a playback job running on the Agent
+      responses:
+        "204":
+          description: Playback job canceled successfully.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  ########################################################
+  # AGENT API - MISC
+  ########################################################
+  /agent/status:
+    get:
+      tags:
+        - Agent-Misc
+      summary: Retrieve current status and running jobs on the Agent
+      description: >
+        Returns the health status, current running recording and playback jobs, and other agent metrics.
+      responses:
+        "200":
+          description: Agent status information.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agentId:
+                    type: string
+                    description: "Unique identifier for the Agent"
+                  status:
+                    type: string
+                    description: "Overall health status of the Agent"
+                  activeRecordings:
+                    type: array
+                    description: "List of active recording jobs on the Agent"
+                    items:
+                      type: object
+                      properties:
+                        jobId:
+                          type: string
+                        sourceUrl:
+                          type: string
+                        duration:
+                          type: integer
+                        destinationProfile:
+                          type: string
+                        startTime:
+                          type: string
+                          format: date-time
+                  activePlaybacks:
+                    type: array
+                    description: "List of active playback jobs on the Agent"
+                    items:
+                      type: object
+                      properties:
+                        jobId:
+                          type: string
+                        destinationUrl:
+                          type: string
+                        duration:
+                          type: integer
+                        startTime:
+                          type: string
+                          format: date-time
+                example:
+                  agentId: "agent-001"
+                  status: "healthy"
+                  activeRecordings:
+                    - jobId: "job-abc123"
+                      sourceUrl: "udp://227.1.1.102:4102"
+                      duration: 60
+                      destinationProfile: "default"
+                      startTime: "2025-03-25T08:00:00Z"
+                  activePlaybacks:
+                    - jobId: "job-play-xyz789"
+                      destinationUrl: "udp://227.1.1.102:4102"
+                      duration: 0
+                      startTime: "2025-03-25T08:05:00Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
