@@ -920,14 +920,14 @@ agentRouter.delete('/recordings/:jobId', async (req, res) => {
 
 // Start a playback job
 agentRouter.post('/jobs/playbacks', async (req, res) => {
-  const { jobId, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
+  const { jobId, recordingId, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
   if (!jobId || !destinationUrl) {
     return res.status(400).json({ error: 'Missing jobId or destinationUrl' });
   }
 
   let childArray;
   try {
-    childArray = await spawnHlsToUdp(jobId, destinationUrl, vodStartTime, vodEndTime);
+    childArray = await spawnHlsToUdp(recordingId, destinationUrl, vodStartTime, vodEndTime);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
