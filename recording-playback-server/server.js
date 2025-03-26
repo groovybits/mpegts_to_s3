@@ -15,9 +15,9 @@
  * - Use the API to create recordings and playbacks
  * - The server will spawn the appropriate agents to handle the jobs
  * - The agents will spawn the appropriate processes to handle the jobs
- * - The server will store the job status in the SQLite database
+ * - The server will store the job status in S3 as JSON files
  * - The server will auto-stop the jobs after the given durations
- * - The server will store the recording URLs in the SQLite database
+ * - The server will store the recording URLs in S3
  * - The server will serve the recording URLs to the clients
  * 
  * URL parameters for UDP MpegTS:
@@ -25,7 +25,7 @@
  * 
  * Dependencies:
  * - express: Web server framework
- * - sqlite3: SQLite database
+ * - @aws-sdk/client-s3: AWS SDK for S3
  * - udp-to-hls: UDP to HLS converter
  * - hls-to-udp: HLS to UDP converter
  * - MinIO: S3-compatible server
@@ -45,9 +45,8 @@ const serverVersion = '1.0.30';
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
-const sqlite3 = require('sqlite3').verbose();
 const { spawn } = require('child_process');
-
+const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const fs = require('fs');
 
 // For Swagger
@@ -78,6 +77,10 @@ const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
 
 // S3 endpoint for the MinIO server
 const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
+const s3Region = process.env.AWS_REGION || 'us-east-1';
+const s3AccessKey = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
+const s3SecretKey = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
+const s3Bucket = process.env.AWS_S3_BUCKET || 'hls';
 
 // Runtime verbosity levels of Rust programs, 0-4: error, warn, info, debug, trace
 const PLAYBACK_VERBOSE = process.env.PLAYBACK_VERBOSE || 2;
@@ -95,6 +98,479 @@ const HLS_DIR = process.env.HLS_DIR || '';
 // Add ../bin/ to PATH env variable if it exists
 if (fs.existsSync('../bin/')) {
   process.env.PATH = process.env.PATH + ':../bin';
+}
+
+/**
+ * S3Database - A class to handle database operations using S3 and JSON files
+ * Each table is stored as a collection of JSON files in an S3 bucket
+ */
+class S3Database {
+  constructor(endpoint, bucket, region = 'us-east-1', accessKey = null, secretKey = null) {
+    // Create S3 client
+    this.s3Client = new S3Client({
+      region,
+      endpoint,
+      credentials: accessKey && secretKey ? {
+        accessKeyId: accessKey,
+        secretAccessKey: secretKey
+      } : undefined,
+      forcePathStyle: true // Needed for MinIO and other S3-compatible servers
+    });
+
+    // Default bucket name
+    this.bucket = bucket;
+
+    // Track tables that have been initialized
+    this.tables = new Set();
+  }
+
+  /**
+   * Initialize table structure if needed (similar to CREATE TABLE IF NOT EXISTS)
+   * @param {string} tableName - Name of the table
+   * @param {object} schema - Optional schema definition
+   */
+  async serialize(callback) {
+    // Initialize standard tables
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS recordings (
+        id TEXT PRIMARY KEY,
+        sourceUrl TEXT,
+        duration INTEGER,
+        destinationProfile TEXT,
+        startTime TEXT,
+        endTime TEXT,
+        status TEXT,
+        processPid INTEGER
+      )
+    `);
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS playbacks (
+        id TEXT PRIMARY KEY,
+        sourceProfile TEXT,
+        destinationUrl TEXT,
+        duration INTEGER,
+        startTime TEXT,
+        endTime TEXT,
+        status TEXT,
+        processPid INTEGER
+      )
+    `);
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS pools (
+        id TEXT PRIMARY KEY,
+        bucketName TEXT,
+        accessKey TEXT,
+        secretKey TEXT
+      )
+    `);
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS assets (
+        id TEXT PRIMARY KEY,
+        poolId TEXT,
+        metadata TEXT
+      )
+    `);
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS recording_urls (
+        jobId TEXT,
+        hour TEXT,
+        url TEXT,
+        PRIMARY KEY (jobId, hour)
+      )
+    `);
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS agent_recordings (
+        jobId TEXT PRIMARY KEY,
+        sourceUrl TEXT,
+        duration INTEGER,
+        destinationProfile TEXT,
+        status TEXT,
+        processPid INTEGER,
+        startTime TEXT
+      )
+    `);
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS agent_playbacks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        jobId TEXT,
+        sourceProfile TEXT,
+        destinationUrl TEXT,
+        duration INTEGER,
+        status TEXT,
+        processPid INTEGER,
+        startTime TEXT
+      )
+    `);
+
+    if (callback) {
+      callback();
+    }
+  }
+
+  /**
+   * Ensure the table exists in S3
+   * @param {string} tableName - Table name
+   */
+  async ensureTable(tableName) {
+    if (this.tables.has(tableName)) return;
+
+    try {
+      const params = {
+        Bucket: this.bucket,
+        Key: `${tableName}/_metadata.json`
+      };
+
+      try {
+        await this.s3Client.send(new GetObjectCommand(params));
+      } catch (err) {
+        // If metadata doesn't exist, create it
+        const createParams = {
+          Bucket: this.bucket,
+          Key: `${tableName}/_metadata.json`,
+          Body: JSON.stringify({
+            tableName,
+            created: new Date().toISOString()
+          })
+        };
+
+        await this.s3Client.send(new PutObjectCommand(createParams));
+      }
+
+      this.tables.add(tableName);
+    } catch (err) {
+      console.error(`Error ensuring table ${tableName}:`, err);
+      throw err;
+    }
+  }
+
+  /**
+   * Execute a "CREATE TABLE" statement (creates the table metadata in S3)
+   * @param {string} sql - SQL-like CREATE TABLE statement (parsed for table name only)
+   */
+  async run(sql, params = [], callback) {
+    try {
+      // Extract table name from CREATE TABLE statement
+      if (typeof sql === 'string' && sql.trim().toUpperCase().startsWith('CREATE TABLE')) {
+        const match = sql.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i);
+        if (match && match[1]) {
+          const tableName = match[1];
+          await this.ensureTable(tableName);
+          if (callback) callback();
+          return;
+        }
+      }
+
+      // For non-CREATE TABLE statements, handle INSERT, UPDATE, DELETE
+      if (typeof sql === 'string') {
+        // INSERT
+        if (sql.trim().toUpperCase().startsWith('INSERT INTO')) {
+          const match = sql.match(/INSERT\s+INTO\s+(\w+)/i);
+          if (match && match[1]) {
+            const tableName = match[1];
+            await this.ensureTable(tableName);
+
+            // For simplicity, assume params contains the full object to insert
+            const id = params[0]; // Assuming first param is ID
+            const data = {};
+
+            // Parse the columns and values from the SQL
+            const colMatch = sql.match(/\(([^)]+)\)/);
+            if (colMatch && colMatch[1]) {
+              const columns = colMatch[1].split(',').map(c => c.trim());
+
+              // Combine columns with params to create data object
+              for (let i = 0; i < columns.length; i++) {
+                data[columns[i]] = params[i];
+              }
+
+              // Store in S3
+              const putParams = {
+                Bucket: this.bucket,
+                Key: `${tableName}/${id}.json`,
+                Body: JSON.stringify(data)
+              };
+
+              await this.s3Client.send(new PutObjectCommand(putParams));
+              if (callback) callback();
+              return;
+            }
+          }
+        }
+
+        // UPDATE
+        if (sql.trim().toUpperCase().startsWith('UPDATE')) {
+          const match = sql.match(/UPDATE\s+(\w+)\s+SET/i);
+          if (match && match[1]) {
+            const tableName = match[1];
+            await this.ensureTable(tableName);
+
+            // Extract ID from WHERE clause (e.g., "WHERE id=?")
+            const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
+            if (whereMatch && whereMatch[1]) {
+              const idField = whereMatch[1];
+              const id = params[params.length - 1]; // Assuming ID is the last param
+
+              // Get existing item
+              const getParams = {
+                Bucket: this.bucket,
+                Key: `${tableName}/${id}.json`
+              };
+
+              try {
+                const response = await this.s3Client.send(new GetObjectCommand(getParams));
+                const dataStr = await streamToString(response.Body);
+                const existingData = JSON.parse(dataStr);
+
+                // Parse SET clause to determine updates
+                const setMatch = sql.match(/SET\s+([^WHERE]+)/i);
+                if (setMatch && setMatch[1]) {
+                  const setParts = setMatch[1].split(',').map(p => p.trim());
+                  const updates = {};
+
+                  for (let i = 0; i < setParts.length; i++) {
+                    const fieldMatch = setParts[i].match(/(\w+)\s*=\s*\?/);
+                    if (fieldMatch && fieldMatch[1]) {
+                      const field = fieldMatch[1];
+                      updates[field] = params[i];
+                    }
+                  }
+
+                  // Merge updates with existing data
+                  const updatedData = { ...existingData, ...updates };
+
+                  // Store updated data
+                  const putParams = {
+                    Bucket: this.bucket,
+                    Key: `${tableName}/${id}.json`,
+                    Body: JSON.stringify(updatedData)
+                  };
+
+                  await this.s3Client.send(new PutObjectCommand(putParams));
+                  if (callback) callback();
+                  return;
+                }
+              } catch (err) {
+                console.error(`Error updating item in ${tableName}:`, err);
+                if (callback) callback(err);
+                return;
+              }
+            }
+          }
+        }
+
+        // DELETE
+        if (sql.trim().toUpperCase().startsWith('DELETE FROM')) {
+          const match = sql.match(/DELETE\s+FROM\s+(\w+)/i);
+          if (match && match[1]) {
+            const tableName = match[1];
+            await this.ensureTable(tableName);
+
+            // Extract ID from WHERE clause
+            const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
+            if (whereMatch && whereMatch[1]) {
+              const idField = whereMatch[1];
+              const id = params[0]; // Assuming ID is the first param
+
+              // Delete from S3
+              const deleteParams = {
+                Bucket: this.bucket,
+                Key: `${tableName}/${id}.json`
+              };
+
+              try {
+                await this.s3Client.send(new DeleteObjectCommand(deleteParams));
+                if (callback) callback();
+                return;
+              } catch (err) {
+                console.error(`Error deleting from ${tableName}:`, err);
+                if (callback) callback(err);
+                return;
+              }
+            }
+          }
+        }
+      }
+
+      // Handle direct object inserts (for simplified API)
+      if (typeof sql === 'object' && params && params.length >= 2) {
+        const tableName = sql.table;
+        const data = sql.data;
+        const id = data.id || uuidv4();
+
+        // Ensure ID is set
+        data.id = id;
+
+        await this.ensureTable(tableName);
+
+        // Store in S3
+        const putParams = {
+          Bucket: this.bucket,
+          Key: `${tableName}/${id}.json`,
+          Body: JSON.stringify(data)
+        };
+
+        await this.s3Client.send(new PutObjectCommand(putParams));
+        if (callback) callback(null, { id });
+        return;
+      }
+
+      // If we get here, the operation wasn't recognized
+      console.error('Unrecognized operation:', sql);
+      if (callback) callback(new Error('Unrecognized operation'));
+    } catch (err) {
+      console.error('Error in run operation:', err);
+      if (callback) callback(err);
+    }
+  }
+
+  /**
+   * Get a single record by ID
+   * @param {string} sql - SQL-like SELECT statement (parsed for table name and WHERE clause)
+   * @param {array} params - Parameters (usually just the ID)
+   * @param {function} callback - Callback function(err, row)
+   */
+  async get(sql, params, callback) {
+    try {
+      // Extract table name from SELECT statement
+      const tableMatch = sql.match(/FROM\s+(\w+)/i);
+      if (!tableMatch || !tableMatch[1]) {
+        throw new Error('Could not parse table name from SQL');
+      }
+
+      const tableName = tableMatch[1];
+      await this.ensureTable(tableName);
+
+      // Extract ID field and value from WHERE clause
+      const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
+      if (!whereMatch || !whereMatch[1]) {
+        throw new Error('Could not parse ID field from WHERE clause');
+      }
+
+      const idField = whereMatch[1];
+      const id = params[0];
+
+      // Get the item from S3
+      const getParams = {
+        Bucket: this.bucket,
+        Key: `${tableName}/${id}.json`
+      };
+
+      try {
+        const response = await this.s3Client.send(new GetObjectCommand(getParams));
+        const dataStr = await streamToString(response.Body);
+        const data = JSON.parse(dataStr);
+
+        if (callback) callback(null, data);
+        return data;
+      } catch (err) {
+        if (err.name === 'NoSuchKey') {
+          // Item not found
+          if (callback) callback(null, null);
+          return null;
+        }
+        throw err;
+      }
+    } catch (err) {
+      console.error('Error in get operation:', err);
+      if (callback) callback(err, null);
+      return null;
+    }
+  }
+
+  /**
+   * Get multiple records, optionally filtered
+   * @param {string} sql - SQL-like SELECT statement
+   * @param {array} params - Parameters for filtering
+   * @param {function} callback - Callback function(err, rows)
+   */
+  async all(sql, params = [], callback) {
+    try {
+      // Extract table name from SELECT statement
+      const tableMatch = sql.match(/FROM\s+(\w+)/i);
+      if (!tableMatch || !tableMatch[1]) {
+        throw new Error('Could not parse table name from SQL');
+      }
+
+      const tableName = tableMatch[1];
+      await this.ensureTable(tableName);
+
+      // List all objects for this table
+      const listParams = {
+        Bucket: this.bucket,
+        Prefix: `${tableName}/`,
+        MaxKeys: 1000 // Adjust as needed
+      };
+
+      const response = await this.s3Client.send(new ListObjectsV2Command(listParams));
+      const items = [];
+
+      if (response.Contents) {
+        // Extract WHERE clause if present
+        let whereClause = null;
+        let whereField = null;
+        let whereValue = null;
+
+        if (sql.includes('WHERE') && params.length > 0) {
+          const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
+          if (whereMatch && whereMatch[1]) {
+            whereField = whereMatch[1];
+            whereValue = params[0];
+          }
+        }
+
+        // Fetch and filter items
+        for (const obj of response.Contents) {
+          const key = obj.Key;
+          if (key.endsWith('_metadata.json')) continue;
+
+          const getParams = {
+            Bucket: this.bucket,
+            Key: key
+          };
+
+          try {
+            const itemResponse = await this.s3Client.send(new GetObjectCommand(getParams));
+            const dataStr = await streamToString(itemResponse.Body);
+            const data = JSON.parse(dataStr);
+
+            // Apply WHERE filter if needed
+            if (whereField && whereValue !== null) {
+              if (data[whereField] === whereValue) {
+                items.push(data);
+              }
+            } else {
+              items.push(data);
+            }
+          } catch (err) {
+            console.error(`Error reading ${key}:`, err);
+          }
+        }
+      }
+
+      if (callback) callback(null, items);
+      return items;
+    } catch (err) {
+      console.error('Error in all operation:', err);
+      if (callback) callback(err, []);
+      return [];
+    }
+  }
+}
+
+// Helper to convert a stream to a string
+async function streamToString(stream) {
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on('error', (err) => reject(err));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+  });
 }
 
 // ----------------------------------------------------
@@ -123,15 +599,11 @@ function parseUdpUrl(urlString) {
 }
 
 /**
- * Helper to read ${HLS_DIR}/index.txt and store recording URLs into DB for a given jobId.
+ * Helper to read index.txt and store recording URLs into S3 for a given jobId.
  */
-function storeRecordingUrls(jobId) {
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return;
-  }
-  let hourly_urls = ORIGINAL_DIR + HLS_DIR + 'index.txt';
+async function storeRecordingUrls(jobId) {
+  // Read from the index.txt file, as in the original implementation
+  const hourly_urls = ORIGINAL_DIR + HLS_DIR + 'index.txt';
 
   /* check if hourly_urls file exists */
   if (!fs.existsSync(hourly_urls)) {
@@ -140,8 +612,9 @@ function storeRecordingUrls(jobId) {
   }
 
   try {
-    const fileData = fs.readFileSync(hourly_urls, 'utf-8');
-    const lines = fileData.split('\n');
+    const hourlyUrlsContent = fs.readFileSync(hourly_urls, 'utf-8');
+
+    const lines = hourlyUrlsContent.split('\n');
     for (const line of lines) {
       if (!line.startsWith('Hour')) continue;
       const parts = line.split(' => ');
@@ -154,112 +627,40 @@ function storeRecordingUrls(jobId) {
       const jobIdFromFile = jobDatePart.split('/')[0];
       if (jobIdFromFile !== jobId) continue;
       const hourString = jobDatePart.substring(jobIdFromFile.length + 1); // "2025/03/18/10"
-      db.run(
-        `INSERT OR REPLACE INTO recording_urls (jobId, hour, url) VALUES (?, ?, ?)`,
-        [jobId, hourString, url.trim()],
-        function (err) {
-          if (err) {
-            console.error('Error inserting recording url into DB for job', jobId, ':', err.message);
-          } else {
-            console.log('Inserted recording url ', url.trim(), ' into DB for job:', jobId, 'hour:', hourString);
-          }
-        }
-      );
+
+      // Store recording URL in S3
+      const recordingUrlData = {
+        jobId,
+        hour: hourString,
+        url: url.trim()
+      };
+
+      const key = `recording_urls/${jobId}_${hourString.replace(/\//g, '_')}.json`;
+
+      try {
+        await db.s3Client.send(new PutObjectCommand({
+          Bucket: db.bucket,
+          Key: key,
+          Body: JSON.stringify(recordingUrlData)
+        }));
+
+        console.log('Inserted recording url', url.trim(), 'into S3 for job:', jobId, 'hour:', hourString);
+      } catch (err) {
+        console.error('Error inserting recording url into S3 for job', jobId, ':', err);
+      }
     }
   } catch (err) {
-    console.error('Error reading ', hourly_urls, ': ', err.message);
+    console.error('Error reading hourly URLs file:', hourly_urls, err);
   }
 }
 
 // ----------------------------------------------------
-// SQLite initialization
+// S3 Database initialization
 // ----------------------------------------------------
-const db_file = ORIGINAL_DIR + HLS_DIR + 'media_jobs.db';
-// check if db_file actually exists
-if (!fs.existsSync(db_file)) {
-  console
-    .log('Database file does not exist, creating a new one:', db_file);
-}
-const db = new sqlite3.Database(db_file);
-console.log('Using SQLite database:', db_file);
+console.log('Using S3 endpoint:', s3endPoint);
+const db = new S3Database(s3endPoint, s3Bucket, s3Region, s3AccessKey, s3SecretKey);
 db.serialize(() => {
-  // Manager tables
-  db.run(`
-    CREATE TABLE IF NOT EXISTS recordings (
-      id TEXT PRIMARY KEY,
-      sourceUrl TEXT,
-      duration INTEGER,
-      destinationProfile TEXT,
-      startTime TEXT,
-      endTime TEXT,
-      status TEXT,
-      processPid INTEGER
-    )
-  `);
-  // Playbacks table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS playbacks (
-      id TEXT PRIMARY KEY,
-      sourceProfile TEXT,
-      destinationUrl TEXT,
-      duration INTEGER,
-      startTime TEXT,
-      endTime TEXT,
-      status TEXT,
-      processPid INTEGER
-    )
-  `);
-  // Pools table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS pools (
-      id TEXT PRIMARY KEY,
-      bucketName TEXT,
-      accessKey TEXT,
-      secretKey TEXT
-    )
-  `);
-  // Assets table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS assets (
-      id TEXT PRIMARY KEY,
-      poolId TEXT,
-      metadata TEXT
-    )
-  `);
-  // Recording URLs table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS recording_urls (
-      jobId TEXT,
-      hour TEXT,
-      url TEXT,
-      PRIMARY KEY (jobId, hour)
-    )
-  `);
-  // Agent tables
-  db.run(`
-    CREATE TABLE IF NOT EXISTS agent_recordings (
-      jobId TEXT PRIMARY KEY,
-      sourceUrl TEXT,
-      duration INTEGER,
-      destinationProfile TEXT,
-      status TEXT,
-      processPid INTEGER,
-      startTime TEXT
-    )
-  `);
-  // Agent playbacks table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS agent_playbacks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      jobId TEXT,
-      sourceProfile TEXT,
-      destinationUrl TEXT,
-      duration INTEGER,
-      status TEXT,
-      processPid INTEGER,
-      startTime TEXT
-    )
-  `);
+  console.log('Initializing S3 database tables...');
 });
 
 // Keep track of setTimeout handles in memory so we can auto-stop
@@ -286,40 +687,36 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDoc));
 const managerRouter = express.Router();
 
 // --------------- RECORDINGS ---------------
-managerRouter.post('/recordings', (req, res) => {
+managerRouter.post('/recordings', async (req, res) => {
   const { sourceUrl, duration, destinationProfile } = req.body;
   const recordingId = `rec-${uuidv4()}`;
   const now = new Date();
   const endTime = new Date(now.getTime() + duration * 1000);
 
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
-
-  db.run(`
-    INSERT INTO recordings (id, sourceUrl, duration, destinationProfile, startTime, endTime, status, processPid)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
+  try {
+    const recordingData = {
       recordingId,
       sourceUrl,
       duration,
       destinationProfile,
-      now.toISOString(),
-      endTime.toISOString(),
-      'active',
-      null
-    ],
-    (err) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
+      startTime: now.toISOString(),
+      endTime: endTime.toISOString(),
+      status: 'active',
+      processPid: null
+    };
 
-      let fetchUrl = agentUrl + "/v1/agent/jobs/recordings";
-      console.log('About to call Agent with fetch, recordingId=', recordingId, ' Url=', sourceUrl, ' Duration=', duration, ' DestinationProfile=', destinationProfile, ' FetchUrl=', fetchUrl);
+    // Store in S3
+    await db.s3Client.send(new PutObjectCommand({
+      Bucket: db.bucket,
+      Key: `recordings/${recordingId}.json`,
+      Body: JSON.stringify(recordingData)
+    }));
 
-      fetch(fetchUrl, {
+    let fetchUrl = agentUrl + "/v1/agent/jobs/recordings";
+    console.log('About to call Agent with fetch, recordingId=', recordingId, ' Url=', sourceUrl, ' Duration=', duration, ' DestinationProfile=', destinationProfile, ' FetchUrl=', fetchUrl);
+
+    try {
+      const agentResp = await fetch(fetchUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -328,320 +725,554 @@ managerRouter.post('/recordings', (req, res) => {
           duration,
           destinationProfile
         })
-      })
-        .then(agentResp => agentResp.json().catch(() => ({})))
-        .then(agentData => {
-          // We can optionally store agentData.pid into our DB if we want
-          // but for now, we just return the Manager's response
-          return res.status(201).json({ recordingId });
-        })
-        .catch(err2 => {
-          console.error('Error calling Agent endpoint:', err2);
-          // We already inserted the DB record, so decide how to handle:
-          return res.status(201).json({
-            recordingId,
-            warning: 'Recorded in Manager DB, but Agent spawn failed. Check logs.'
-          });
-        });
+      });
+
+      const agentData = await agentResp.json().catch(() => ({}));
+      return res.status(201).json({ recordingId });
+    } catch (err2) {
+      console.error('Error calling Agent endpoint:', err2);
+      return res.status(201).json({
+        recordingId,
+        warning: 'Recorded in Manager S3, but Agent spawn failed. Check logs.'
+      });
     }
-  );
+  } catch (err) {
+    console.error('Error creating recording:', err);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
-managerRouter.get('/recordings', (req, res) => {
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+managerRouter.get('/recordings', async (req, res) => {
+  try {
+    const listParams = {
+      Bucket: db.bucket,
+      Prefix: 'recordings/',
+      MaxKeys: 1000
+    };
 
-  db.all(`SELECT * FROM recordings`, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
+    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    const items = [];
 
-managerRouter.get('/recordings/:recordingId', (req, res) => {
-  const { recordingId } = req.params;
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
 
-  db.get(`SELECT * FROM recordings WHERE id = ?`, [recordingId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ message: 'Not found' });
-    res.json(row);
-  });
-});
-
-managerRouter.delete('/recordings/:recordingId', (req, res) => {
-  const { recordingId } = req.params;
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
-
-  db.get(`SELECT * FROM recordings WHERE id = ?`, [recordingId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ message: 'Not found' });
-
-    db.run(`UPDATE recordings SET status='canceled' WHERE id=?`, [recordingId], err2 => {
-      if (err2) return res.status(500).json({ error: err2.message });
-      // kill child if any
-      if (row.processPid) {
         try {
-          process.kill(row.processPid, 'SIGTERM');
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+          items.push(data);
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+
+    res.json(items);
+  } catch (err) {
+    console.error('Error getting recordings:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+managerRouter.get('/recordings/:recordingId', async (req, res) => {
+  const { recordingId } = req.params;
+
+  try {
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `recordings/${recordingId}.json`
+    };
+
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const data = JSON.parse(dataStr);
+      res.json(data);
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        return res.status(404).json({ message: 'Not found' });
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.error('Error getting recording:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+managerRouter.delete('/recordings/:recordingId', async (req, res) => {
+  const { recordingId } = req.params;
+
+  try {
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `recordings/${recordingId}.json`
+    };
+
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const data = JSON.parse(dataStr);
+
+      // Update status to canceled
+      data.status = 'canceled';
+
+      await db.s3Client.send(new PutObjectCommand({
+        Bucket: db.bucket,
+        Key: `recordings/${recordingId}.json`,
+        Body: JSON.stringify(data)
+      }));
+
+      // Kill process if any
+      if (data.processPid) {
+        try {
+          process.kill(data.processPid, 'SIGTERM');
         } catch { }
       }
+
       return res.sendStatus(204);
-    });
-  });
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        return res.status(404).json({ message: 'Not found' });
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.error('Error deleting recording:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------- POOLS ---------------
-managerRouter.post('/pools', (req, res) => {
+managerRouter.post('/pools', async (req, res) => {
   const { bucketName, credentials } = req.body;
   if (!credentials) return res.status(400).json({ error: 'Missing credentials' });
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
 
   const poolId = `pool-${uuidv4()}`;
-  db.run(
-    `INSERT INTO pools (id, bucketName, accessKey, secretKey) VALUES (?, ?, ?, ?)`,
-    [poolId, bucketName, credentials.accessKey, credentials.secretKey],
-    err => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.status(201).json({ poolId, bucketName });
-    }
-  );
+
+  try {
+    const poolData = {
+      poolId,
+      bucketName,
+      accessKey: credentials.accessKey,
+      secretKey: credentials.secretKey
+    };
+
+    await db.s3Client.send(new PutObjectCommand({
+      Bucket: db.bucket,
+      Key: `pools/${poolId}.json`,
+      Body: JSON.stringify(poolData)
+    }));
+
+    res.status(201).json({ poolId, bucketName });
+  } catch (err) {
+    console.error('Error creating pool:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-managerRouter.get('/pools', (req, res) => {
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+managerRouter.get('/pools', async (req, res) => {
+  try {
+    const listParams = {
+      Bucket: db.bucket,
+      Prefix: 'pools/',
+      MaxKeys: 1000
+    };
 
-  db.all(`SELECT * FROM pools`, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    const items = [];
+
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+          items.push(data);
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+
+    res.json(items);
+  } catch (err) {
+    console.error('Error getting pools:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------- ASSETS ---------------
-managerRouter.get('/pools/:poolId/assets', (req, res) => {
+managerRouter.get('/pools/:poolId/assets', async (req, res) => {
   const { poolId } = req.params;
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
 
-  db.all(`SELECT * FROM assets WHERE poolId=?`, [poolId], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+  try {
+    const listParams = {
+      Bucket: db.bucket,
+      Prefix: 'assets/',
+      MaxKeys: 1000
+    };
+
+    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    const items = [];
+
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+
+          if (data.poolId === poolId) {
+            items.push(data);
+          }
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+
+    res.json(items);
+  } catch (err) {
+    console.error('Error getting assets:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-managerRouter.delete('/pools/:poolId/assets', (req, res) => {
+managerRouter.delete('/pools/:poolId/assets', async (req, res) => {
   const { poolId } = req.params;
   const { assetId } = req.query;
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
 
-  db.get(
-    `SELECT * FROM assets WHERE id=? AND poolId=?`,
-    [assetId, poolId],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(404).json({ message: 'Asset not found' });
-      db.run(
-        `DELETE FROM assets WHERE id=? AND poolId=?`,
-        [assetId, poolId],
-        err2 => {
-          if (err2) return res.status(500).json({ error: err2.message });
-          res.sendStatus(204);
-        }
-      );
+  try {
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `assets/${assetId}.json`
+    };
+
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const data = JSON.parse(dataStr);
+
+      if (data.poolId !== poolId) {
+        return res.status(404).json({ message: 'Asset not found in this pool' });
+      }
+
+      await db.s3Client.send(new DeleteObjectCommand({
+        Bucket: db.bucket,
+        Key: `assets/${assetId}.json`
+      }));
+
+      res.sendStatus(204);
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        return res.status(404).json({ message: 'Asset not found' });
+      }
+      throw err;
     }
-  );
+  } catch (err) {
+    console.error('Error deleting asset:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-managerRouter.get('/assets/:assetId', (req, res) => {
+managerRouter.get('/assets/:assetId', async (req, res) => {
   const { assetId } = req.params;
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
 
-  db.get(`SELECT * FROM assets WHERE id=?`, [assetId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ message: 'Asset not found' });
-    const data = {
-      assetId: row.id,
-      poolId: row.poolId,
-      metadata: JSON.parse(row.metadata || '{}')
+  try {
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `assets/${assetId}.json`
     };
-    res.json(data);
-  });
+
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const data = JSON.parse(dataStr);
+
+      const result = {
+        assetId: data.id,
+        poolId: data.poolId,
+        metadata: JSON.parse(data.metadata || '{}')
+      };
+
+      res.json(result);
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        return res.status(404).json({ message: 'Asset not found' });
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.error('Error getting asset:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------- PLAYBACKS ---------------
-managerRouter.post('/playbacks', (req, res) => {
+managerRouter.post('/playbacks', async (req, res) => {
   const { sourceProfile, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
   const playbackId = `play-${uuidv4()}`;
-  const now = new Date();
   const startTime = vodStartTime;
   const endTime = vodEndTime; // TODO: improve how this works for offset to endpoint, store starttime and endtime in DB
 
-
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
-
-  db.run(
-    `INSERT INTO playbacks (id, sourceProfile, destinationUrl, duration, startTime, endTime, status, processPid)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
+  try {
+    const playbackData = {
       playbackId,
       sourceProfile,
       destinationUrl,
       duration,
-      (startTime && startTime !== "") ? startTime.toISOString() : "",
-      (endTime && endTime !== "") ? endTime.toISOString() : "",
-      'active',
-      null
-    ],
-    err => {
-      if (err) return res.status(500).json({ error: err.message });
-    }
-  );
-  // Call the agent to start the playback
-  let fetchUrl = agentUrl + "/v1/agent/jobs/playbacks";
-  console.log('About to call Agent with fetch, playbackId=', playbackId, ' SourceProfile=', sourceProfile, ' DestinationUrl=', destinationUrl, ' Duration=', duration, ' FetchUrl=', fetchUrl);
-  fetch(fetchUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jobId: sourceProfile,
-      playbackId,
-      destinationUrl,
-      duration
-    })
-  })
-    .then(agentResp => agentResp.json().catch(() => ({})))
-    .then(agentData => {
-      // We can optionally store agentData.pid into our DB if we want
-      // but for now, we just return the Manager's response
+      startTime: (startTime && startTime !== "") ? startTime : "",
+      endTime: (endTime && endTime !== "") ? endTime : "",
+      status: 'active',
+      processPid: null
+    };
+
+    await db.s3Client.send(new PutObjectCommand({
+      Bucket: db.bucket,
+      Key: `playbacks/${playbackId}.json`,
+      Body: JSON.stringify(playbackData)
+    }));
+
+    // Call the agent to start the playback
+    let fetchUrl = agentUrl + "/v1/agent/jobs/playbacks";
+    console.log('About to call Agent with fetch, playbackId=', playbackId, ' SourceProfile=', sourceProfile, ' DestinationUrl=', destinationUrl, ' Duration=', duration, ' FetchUrl=', fetchUrl);
+
+    try {
+      const agentResp = await fetch(fetchUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobId: sourceProfile,
+          playbackId,
+          destinationUrl,
+          duration
+        })
+      });
+
+      const agentData = await agentResp.json().catch(() => ({}));
       return res.status(201).json({ playbackId });
-    })
-    .catch(err2 => {
-      console.error('Error calling Agent endpoint:', err2);
-      // We already inserted the DB record, so decide how to handle:
+    } catch (err) {
+      console.error('Error calling Agent endpoint:', err);
       return res.status(201).json({
         playbackId,
-        warning: 'Recorded in Manager DB, but Agent spawn failed. Check logs.'
+        warning: 'Recorded in Manager S3, but Agent spawn failed. Check logs.'
       });
-    });
+    }
+  } catch (err) {
+    console.error('Error creating playback:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-managerRouter.get('/playbacks', (req, res) => {
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+managerRouter.get('/playbacks', async (req, res) => {
+  try {
+    const listParams = {
+      Bucket: db.bucket,
+      Prefix: 'playbacks/',
+      MaxKeys: 1000
+    };
 
-  db.all(`SELECT * FROM playbacks`, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
+    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    const items = [];
 
-managerRouter.get('/playbacks/:playbackId', (req, res) => {
-  const { playbackId } = req.params;
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
 
-  db.get(`SELECT * FROM playbacks WHERE id=?`, [playbackId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ message: 'Playback not found' });
-    res.json(row);
-  });
-});
-
-managerRouter.delete('/playbacks/:playbackId', (req, res) => {
-  const { playbackId } = req.params;
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
-
-  db.get(`SELECT * FROM playbacks WHERE id=?`, [playbackId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ message: 'Playback not found' });
-    db.run(`UPDATE playbacks SET status='canceled' WHERE id=?`, [playbackId], err2 => {
-      if (err2) return res.status(500).json({ error: err2.message });
-      if (row.processPid) {
         try {
-          process.kill(row.processPid, 'SIGTERM');
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+          items.push(data);
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+
+    res.json(items);
+  } catch (err) {
+    console.error('Error getting playbacks:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+managerRouter.get('/playbacks/:playbackId', async (req, res) => {
+  const { playbackId } = req.params;
+
+  try {
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `playbacks/${playbackId}.json`
+    };
+
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const data = JSON.parse(dataStr);
+      res.json(data);
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        return res.status(404).json({ message: 'Playback not found' });
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.error('Error getting playback:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+managerRouter.delete('/playbacks/:playbackId', async (req, res) => {
+  const { playbackId } = req.params;
+
+  try {
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `playbacks/${playbackId}.json`
+    };
+
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const data = JSON.parse(dataStr);
+
+      // Update status to canceled
+      data.status = 'canceled';
+
+      await db.s3Client.send(new PutObjectCommand({
+        Bucket: db.bucket,
+        Key: `playbacks/${playbackId}.json`,
+        Body: JSON.stringify(data)
+      }));
+
+      // Kill process if any
+      if (data.processPid) {
+        try {
+          process.kill(data.processPid, 'SIGTERM');
         } catch { }
       }
+
       res.sendStatus(204);
-    });
-  });
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        return res.status(404).json({ message: 'Playback not found' });
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.error('Error deleting playback:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --------------- ADMIN ---------------
-managerRouter.get('/admin/stats', (req, res) => {
-  // Summaries
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+managerRouter.get('/admin/stats', async (req, res) => {
+  try {
+    // Count active recordings
+    const recListParams = {
+      Bucket: db.bucket,
+      Prefix: 'recordings/',
+      MaxKeys: 1000
+    };
 
-  db.all(`SELECT COUNT(*) AS cnt FROM recordings WHERE status='active'`, (err, rec) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const concurrentRecordings = rec[0].cnt;
+    const recResponse = await db.s3Client.send(new ListObjectsV2Command(recListParams));
+    let concurrentRecordings = 0;
 
-    db.all(`SELECT COUNT(*) AS cnt FROM playbacks WHERE status='active'`, (err2, pb) => {
-      if (err2) return res.status(500).json({ error: err2.message });
-      const concurrentPlaybacks = pb[0].cnt;
+    if (recResponse.Contents) {
+      for (const obj of recResponse.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
 
-      db.all(`SELECT COUNT(*) AS cnt FROM assets`, (err3, as) => {
-        if (err3) return res.status(500).json({ error: err3.message });
-        const totalAssets = as[0].cnt;
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
 
-        const systemLoad = 0.2;
-        const clusterUsage = { agentCount: 1 };
+          if (data.status === 'active') {
+            concurrentRecordings++;
+          }
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
 
-        res.json({
-          concurrentRecordings,
-          concurrentPlaybacks,
-          totalAssets,
-          systemLoad,
-          clusterUsage
-        });
-      });
+    // Count active playbacks
+    const pbListParams = {
+      Bucket: db.bucket,
+      Prefix: 'playbacks/',
+      MaxKeys: 1000
+    };
+
+    const pbResponse = await db.s3Client.send(new ListObjectsV2Command(pbListParams));
+    let concurrentPlaybacks = 0;
+
+    if (pbResponse.Contents) {
+      for (const obj of pbResponse.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+
+          if (data.status === 'active') {
+            concurrentPlaybacks++;
+          }
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+
+    // Count total assets
+    const asListParams = {
+      Bucket: db.bucket,
+      Prefix: 'assets/',
+      MaxKeys: 1000
+    };
+
+    const asResponse = await db.s3Client.send(new ListObjectsV2Command(asListParams));
+    const totalAssets = asResponse.Contents ? asResponse.Contents.length : 0;
+
+    const systemLoad = 0.2;
+    const clusterUsage = { agentCount: 1 };
+
+    res.json({
+      concurrentRecordings,
+      concurrentPlaybacks,
+      totalAssets,
+      systemLoad,
+      clusterUsage
     });
-  });
+  } catch (err) {
+    console.error('Error getting admin stats:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Bind the managerRouter under /v1
@@ -661,19 +1292,13 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
   const parsed = parseUdpUrl(sourceUrl);
   if (!parsed) {
     // Fallback: you might handle SRT or other protocols
-    // For now, we’ll just throw
+    // For now, we'll just throw
     throw new Error(`Invalid or non-UDP sourceUrl: ${sourceUrl}`);
-  }
-
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    throw new Error('Database file not found', db_file);
   }
 
   const { ip, port, iface } = parsed;
   // Example invocation, adjust arguments as needed.
-  // We’ll store segments in a subdirectory named by jobId.
+  // We'll store segments in a subdirectory named by jobId.
   const args = [
     '-n', iface,
     '-v', `${RECORDING_VERBOSE}`,
@@ -695,7 +1320,7 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
   child.stdout.on('data', data => {
     const output = data.toString().trim();
     console.log(`udp-to-hls stdout: ${output}`);
-    // If output starts with "Hour", parse and store in DB
+    // If output starts with "Hour", parse and store in S3
     if (output.startsWith('Hour')) {
       // Expected format: "Hour <jobId>/<year>/<month>/<day>/<hourStr> => <url>"
       const parts = output.split(' => ');
@@ -708,17 +1333,26 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
         if (firstSlash !== -1) {
           const currentJobId = hourInfo.substring(0, firstSlash);
           const hourString = hourInfo.substring(firstSlash + 1); // "yyyy/mm/dd/hh:mm:ss"
-          db.run(
-            `INSERT OR REPLACE INTO recording_urls (jobId, hour, url) VALUES (?, ?, ?)`,
-            [currentJobId, hourString, url],
-            function (err) {
-              if (err) {
-                console.error('Error inserting recording url into DB:', err.message);
-              } else {
-                console.log('Inserted recording url into DB for job:', currentJobId, 'hour:', hourString);
-              }
-            }
-          );
+
+          const recordingUrlData = {
+            jobId: currentJobId,
+            hour: hourString,
+            url: url.trim()
+          };
+
+          // Generate a unique key for S3
+          const key = `recording_urls/${currentJobId}_${hourString.replace(/\//g, '_')}.json`;
+
+          // Store in S3
+          db.s3Client.send(new PutObjectCommand({
+            Bucket: db.bucket,
+            Key: key,
+            Body: JSON.stringify(recordingUrlData)
+          })).then(() => {
+            console.log('Inserted recording url into S3 for job:', currentJobId, 'hour:', hourString);
+          }).catch(err => {
+            console.error('Error inserting recording url into S3:', err);
+          });
         }
       }
     }
@@ -731,40 +1365,61 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
 }
 
 async function getVodPlaylists(jobId, vodStartTime, vodEndTime) {
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
+  try {
+    const listParams = {
+      Bucket: db.bucket,
+      Prefix: 'recording_urls/',
+      MaxKeys: 1000
+    };
+
+    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    const vodPlaylists = [];
+
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        const key = obj.Key;
+        if (!key.startsWith(`recording_urls/${jobId}_`)) continue;
+
+        const getParams = {
+          Bucket: db.bucket,
+          Key: key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+
+          // data.hour is expected in format "yyyy/mm/dd/hh:mm:ss"
+          const dateParts = data.hour.split('/');
+          if (dateParts.length < 4) {
+            console.log('Invalid date format in recording_urls:', data.hour);
+            continue;
+          }
+
+          const isoString = `${dateParts[0]}-${dateParts[1]}-${dateParts[2]}T${dateParts[3]}Z`;
+          const hourDate = new Date(isoString);
+
+          if (vodStartTime && vodEndTime && (vodStartTime !== "" || vodEndTime !== "")) {
+            if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
+              console.log('Using hls playback url:', data.url);
+              vodPlaylists.push(data.url);
+            }
+          } else {
+            console.log('Using hls playback url:', data.url);
+            vodPlaylists.push(data.url);
+          }
+        } catch (err) {
+          console.error(`Error reading ${key}:`, err);
+        }
+      }
+    }
+
+    return vodPlaylists;
+  } catch (err) {
+    console.error('Error getting vod playlists from S3:', err);
     return [];
   }
-
-  return new Promise((resolve, reject) => {
-    db.all(`SELECT hour, url FROM recording_urls WHERE jobId = ?`, [jobId], (err, rows) => {
-      if (err) {
-        return reject(err);
-      }
-      const vodPlaylists = [];
-      for (const row of rows) {
-        // row.hour is expected in format "yyyy/mm/dd/hh:mm:ss"
-        const dateParts = row.hour.split('/');
-        if (dateParts.length < 4) {
-          console.log('Invalid date format in recording_urls:', row.hour);
-          continue;
-        }
-        const isoString = `${dateParts[0]}-${dateParts[1]}-${dateParts[2]}T${dateParts[3]}Z`;
-        const hourDate = new Date(isoString);
-        if (vodStartTime && vodEndTime && (vodStartTime !== "" || vodEndTime !== "")) {
-          if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
-            console.log('Using hls playback url:', row.url);
-            vodPlaylists.push(row.url);
-          }
-        } else {
-          console.log('Using hls playback url:', row.url);
-          vodPlaylists.push(row.url);
-        }
-      }
-      resolve(vodPlaylists);
-    });
-  });
 }
 
 /**
@@ -785,12 +1440,12 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
   }
   const { ip, port } = parsedDest;
 
-  // Build the vodPlaylists array by querying the recording_urls table in the DB
+  // Build the vodPlaylists array by querying the recording_urls in S3
   let vodPlaylists = [];
   try {
     vodPlaylists = await getVodPlaylists(jobId, vodStartTime, vodEndTime);
   } catch (err) {
-    console.error('Error getting vod playlists from DB:', err.message);
+    console.error('Error getting vod playlists from S3:', err);
     return [];
   }
 
@@ -839,25 +1494,74 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
 }
 
 // GET status
-agentRouter.get('/status', (req, res) => {
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+agentRouter.get('/status', async (req, res) => {
+  try {
+    // Get all agent recordings
+    const recListParams = {
+      Bucket: db.bucket,
+      Prefix: 'agent_recordings/',
+      MaxKeys: 1000
+    };
 
-  db.all(`SELECT * FROM agent_recordings`, (err, recRows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    db.all(`SELECT * FROM agent_playbacks`, (err2, pbRows) => {
-      if (err2) return res.status(500).json({ error: err2.message });
-      res.json({
-        agentId: 'agent-001',
-        status: 'healthy',
-        activeRecordings: recRows,
-        activePlaybacks: pbRows
-      });
+    const recResponse = await db.s3Client.send(new ListObjectsV2Command(recListParams));
+    const recRows = [];
+
+    if (recResponse.Contents) {
+      for (const obj of recResponse.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+          recRows.push(data);
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+
+    // Get all agent playbacks
+    const pbListParams = {
+      Bucket: db.bucket,
+      Prefix: 'agent_playbacks/',
+      MaxKeys: 1000
+    };
+
+    const pbResponse = await db.s3Client.send(new ListObjectsV2Command(pbListParams));
+    const pbRows = [];
+
+    if (pbResponse.Contents) {
+      for (const obj of pbResponse.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+          pbRows.push(data);
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+
+    res.json({
+      agentId: 'agent-001',
+      status: 'healthy',
+      activeRecordings: recRows,
+      activePlaybacks: pbRows
     });
-  });
+  } catch (err) {
+    console.error('Error getting agent status:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Start a recording job
@@ -866,89 +1570,130 @@ agentRouter.post('/jobs/recordings', (req, res) => {
   if (!jobId || !sourceUrl) {
     return res.status(400).json({ error: 'Missing jobId or sourceUrl' });
   }
+
   let child;
   try {
     child = spawnUdpToHls(jobId, sourceUrl, duration, destinationProfile);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
+
   const pid = child.pid;
   const now = new Date();
 
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+  // Store in S3
+  const recordingData = {
+    jobId,
+    sourceUrl,
+    duration,
+    destinationProfile,
+    status: 'running',
+    processPid: pid,
+    startTime: now.toISOString()
+  };
 
-  // Insert into DB
-  db.run(
-    `INSERT INTO agent_recordings (jobId, sourceUrl, duration, destinationProfile, status, processPid, startTime)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [jobId, sourceUrl, duration, destinationProfile, 'running', pid, now.toISOString()],
-    err => {
-      if (err) {
-        try { process.kill(pid, 'SIGTERM'); } catch { }
-        return res.status(500).json({ error: err.message });
-      }
+  db.s3Client.send(new PutObjectCommand({
+    Bucket: db.bucket,
+    Key: `agent_recordings/${jobId}.json`,
+    Body: JSON.stringify(recordingData)
+  })).then(() => {
+    // If duration > 0, auto-stop after duration
+    if (duration && duration > 0) {
+      let max_duration = duration * 1.2;
+      const timer = setTimeout(async () => {
+        console.log(`Auto-stopping recording jobId=${jobId} of duration=${duration} after max_duration=${max_duration}`);
+        // Stop the process
+        try {
+          process.kill(pid, 'SIGTERM');
+          console.log(`Killed recording jobId=${jobId} of duration ${duration}`);
+        } catch (err) {
+          console.error(`Error killing recording jobId=${jobId} of duration ${duration}: ${err}`);
+        }
 
-      // If duration > 0, auto-stop after duration
-      if (duration && duration > 0) {
-        let max_duration = duration * 1.2;
-        const timer = setTimeout(() => {
-          console.log(`Auto-stopping recording jobId=${jobId} of duration=${duration} after max_duration=${max_duration}`);
-          // Stop the process
-          try {
-            process.kill(pid, 'SIGTERM');
-            console.log(`Killed recording jobId=${jobId} of duration ${duration}`);
-          } catch (err) {
-            console.error(`Error killing recording jobId=${jobId} of duration ${duration}: ${err}`);
-          }
-          db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
-          activeTimers.recordings.delete(jobId);
-        }, (max_duration) * 1000); // Add up to 60s buffer for GOP alignment or other delays
-        activeTimers.recordings.set(jobId, timer);
-      }
+        // Delete from S3
+        try {
+          await db.s3Client.send(new DeleteObjectCommand({
+            Bucket: db.bucket,
+            Key: `agent_recordings/${jobId}.json`
+          }));
+        } catch (err) {
+          console.error(`Error deleting recording from S3:`, err);
+        }
 
-      child.on('close', code => {
-        console.log(`Recording jobId=${jobId} ended with code=${code} after duration=${duration}`);
-        // Store the recording URLs in DB from the hourly_urls index.txt file
-        storeRecordingUrls(jobId);
-        db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
-        activeTimers.recordings.delete
-          (jobId);
-      });
-      res.status(201).json({ message: 'Recording job accepted', pid });
+        activeTimers.recordings.delete(jobId);
+      }, (max_duration) * 1000); // Add up to 20% buffer for GOP alignment or other delays
+
+      activeTimers.recordings.set(jobId, timer);
     }
-  );
+
+    child.on('close', async code => {
+      console.log(`Recording jobId=${jobId} ended with code=${code} after duration=${duration}`);
+
+      try {
+        await storeRecordingUrls(jobId);
+        // Delete from S3
+        await db.s3Client.send(new DeleteObjectCommand({
+          Bucket: db.bucket,
+          Key: `agent_recordings/${jobId}.json`
+        }));
+      } catch (err) {
+        console.error(`Error deleting recording from S3:`, err);
+      }
+
+      activeTimers.recordings.delete(jobId);
+    });
+
+    res.status(201).json({ message: 'Recording job accepted', pid });
+  }).catch(err => {
+    console.error('Error storing recording job in S3:', err);
+    try { process.kill(pid, 'SIGTERM'); } catch { }
+    res.status(500).json({ error: err.message });
+  });
 });
 
 // Stop a recording job
-agentRouter.delete('/recordings/:jobId', (req, res) => {
+agentRouter.delete('/recordings/:jobId', async (req, res) => {
   const { jobId } = req.params;
 
-  /* check if we have the db file available */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+  try {
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `agent_recordings/${jobId}.json`
+    };
 
-  db.get(`SELECT * FROM agent_recordings WHERE jobId=?`, [jobId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ message: 'Not found' });
-    if (row.processPid) {
-      try {
-        process.kill(row.processPid, 'SIGTERM');
-      } catch { }
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const data = JSON.parse(dataStr);
+
+      if (data.processPid) {
+        try {
+          process.kill(data.processPid, 'SIGTERM');
+        } catch { }
+      }
+
+      await db.s3Client.send(new DeleteObjectCommand({
+        Bucket: db.bucket,
+        Key: `agent_recordings/${jobId}.json`
+      }));
+
+      // Clear any setTimeout
+      if (activeTimers.recordings.has(jobId)) {
+        clearTimeout(activeTimers.recordings.get(jobId));
+        activeTimers.recordings.delete(jobId);
+      }
+
+      res.sendStatus(204);
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        return res.status(404).json({ message: 'Not found' });
+      }
+      throw err;
     }
-    db.run(`DELETE FROM agent_recordings WHERE jobId=?`, [jobId]);
-    // Clear any setTimeout
-    if (activeTimers.recordings.has(jobId)) {
-      clearTimeout(activeTimers.recordings.get(jobId));
-      activeTimers.recordings.delete(jobId);
-    }
-    res.sendStatus(204);
-  });
+  } catch (err) {
+    console.error('Error deleting recording job:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Start a playback job
@@ -957,181 +1702,235 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
   if (!jobId || !destinationUrl) {
     return res.status(400).json({ error: 'Missing jobId or destinationUrl' });
   }
+
   let childArray;
   try {
     childArray = await spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
+
   if (!childArray || childArray.length === 0) {
     return res.status(400).json({ error: 'Invalid spawn' });
   }
-  /* check if empty */
-  if (childArray.length == 0) {
-    return res.status(400).json({ error: 'Invalid spawn' });
-  }
+
   const now = new Date();
   let completedInserts = 0;
   const pids = [];
   let errors = 0;
 
-  // check if we have the db file availble
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
+  // Check if the jobId is already playing back
+  try {
+    const listParams = {
+      Bucket: db.bucket,
+      Prefix: `agent_playbacks/`,
+      MaxKeys: 1000
+    };
+
+    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+
+          if (data.jobId === jobId && data.status === 'running') {
+            // Confirm the process is still running
+            try {
+              console.warn('Playback job marked already running: jobId=', jobId, 'pid=', data.processPid, ' checking if still running');
+              // Check if PID is still running
+              process.kill(data.processPid, 0);
+
+              // Kill the process
+              console.warn('Killing existing playback:', data.processPid);
+              try {
+                process.kill(data.processPid, 'SIGTERM');
+              } catch (killErr) {
+                console.log('Error killing existing playback:', killErr);
+              }
+
+              // Delete from S3
+              await db.s3Client.send(new DeleteObjectCommand({
+                Bucket: db.bucket,
+                Key: obj.Key
+              }));
+
+              console.warn('Deleted existing playback:', jobId);
+            } catch {
+              // Process not running, delete the record
+              console.log('Playback job already running but process not found: jobId=', jobId);
+              await db.s3Client.send(new DeleteObjectCommand({
+                Bucket: db.bucket,
+                Key: obj.Key
+              }));
+            }
+          }
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error checking for existing playbacks:', err);
   }
 
-  // Insert each child of the array into the DB
+  // Insert each child process
   for (const child of childArray) {
     const pid = child.pid;
     pids.push(pid);
 
-    // Check if the jobId is already playing back. Silently proceed if not found.
-    db.get(`SELECT * FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
-      if (err) {
-        // see if the jobid is not int the db, if so then just let us process and don't return
-        console.error('Error checking for existing playback:', err);
-        try { process.kill(pid, 'SIGTERM'); }
-        catch { }
-        errors++;
-        return;
-      }
-      if (row) {
-        if (row.status === 'running') {
-          // confirm the pid really exists and is still running, if so then return
-          try {
-            console.warn('Playback job marked already running: jobId=', jobId, 'pid=', row.processPid, ' checking if still running');
-            // check if pid is running still
-            process.kill(row.processPid, 0);
-            // kill the process
-            console.warn('Killing existing playback:', row.processPid);
-            try {
-              process.kill(row.processPid, 'SIGTERM');
-            } catch (err) {
-              console.log('Error killing existing playback:', err);
-            }
-            db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
-            console.warn('Deleted existing playback:', jobId);
-          } catch {
-            // if the process is not running, then delete the row and proceed
-            console.log('Playback job already running but not found: jobId=', jobId);
-            db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
-          }
-        } else {
-          db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId], (deleteErr) => {
-            if (deleteErr) {
-              console.error('Error deleting existing playback:', deleteErr);
-              try { process.kill(pid, 'SIGTERM'); }
-              catch { }
-              errors++;
-              return;
-            }
-            // Deletion successful; proceed silently.
-          });
-        }
-      }
-    });
+    // Create a unique ID for this playback instance
+    const playbackInstanceId = `${jobId}_${uuidv4()}`;
 
-    db.run(
-      `INSERT INTO agent_playbacks (jobId, sourceProfile, destinationUrl, duration, status, processPid, startTime)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [jobId, sourceProfile, destinationUrl, duration, 'running', pid, now.toISOString()],
-      err => {
-        if (err) {
-          try { process.kill(pid, 'SIGTERM'); } catch { }
-          console.error('Error inserting playback:', err);
-        }
+    const playbackData = {
+      playbackInstanceId,
+      jobId,
+      sourceProfile,
+      destinationUrl,
+      duration,
+      status: 'running',
+      processPid: pid,
+      startTime: now.toISOString()
+    };
 
+    try {
+      await db.s3Client.send(new PutObjectCommand({
+        Bucket: db.bucket,
+        Key: `agent_playbacks/${playbackInstanceId}.json`,
+        Body: JSON.stringify(playbackData)
+      }));
+
+      completedInserts++;
+
+      // Set up auto-stop timer if duration > 0
+      if (duration && duration > 0) {
         let max_duration = duration * 1.2;
+        const timer = setTimeout(async () => {
+          console.log(`Auto-stopping playback jobId=${jobId} after duration ${duration}`);
+          try {
+            process.kill(pid, 'SIGTERM');
+          } catch { }
 
-        // If duration > 0, auto-stop
-        if (duration && duration > 0) {
-          const timer = setTimeout(() => {
-            console.log(`Auto-stopping playback jobId=${jobId} after duration`);
-            try { process.kill(pid, 'SIGTERM'); } catch { }
-            db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
-            activeTimers.playbacks.delete(jobId);
-          }, (max_duration) * 1000);
-          activeTimers.playbacks.set(jobId, timer);
-        } else {
-          /* get the duration from the db */
-          db.get(`SELECT duration FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
-            if (err) {
-              console.error('Error getting duration from db:', err);
-              return;
-            }
-            if (!row) {
-              console.error('No row with duration found in db for jobId:', jobId);
-              return;
-            }
-            const durationFull = row.duration;
-            if (durationFull && durationFull > 0) {
-              const timer = setTimeout(() => {
-                console.log(`Auto-stopping playback jobId=${jobId} after duration ${durationFull}`);
-                try { process.kill(pid, 'SIGTERM'); } catch { }
-                db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
-                activeTimers.playbacks.delete(jobId);
-              }, (max_duration) * 1000);
-              activeTimers.playbacks.set(jobId, timer);
-            } else {
-              console.log('No duration found in db for jobId:', jobId);
-              // just play it forever, no cleanup setup
-            }
-          });
-        }
-        completedInserts++;
-        // Once we've inserted them all, we can respond
-        if (completedInserts === childArray.length) {
-          if (completedInserts > 0) {
-            child.on('close', code => {
-              console.log(`Playback jobId=${jobId} ended with code=${code}`);
-              try { process.kill(pid, 'SIGTERM'); }
-              catch { }
-              db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
-              activeTimers.playbacks.delete(jobId);
-            }
-            );
-            console.error('Inserted all child processes:', completedInserts, ' of ', childArray.length, ' with ', errors, ' errors');
-            return res.status(201).json({
-              message: 'Playback job accepted',
-              childCount: childArray.length,
-              pids
-            });
-          } else {
-            return res.status(400).json({ error: ('Only ', completedInserts, ' child processes inserted of ', childArray.length, ' with ', errors, ' errors') });
+          try {
+            await db.s3Client.send(new DeleteObjectCommand({
+              Bucket: db.bucket,
+              Key: `agent_playbacks/${playbackInstanceId}.json`
+            }));
+          } catch (err) {
+            console.error('Error deleting playback from S3:', err);
           }
-        }
+
+          activeTimers.playbacks.delete(playbackInstanceId);
+        }, (max_duration) * 1000);
+
+        activeTimers.playbacks.set(playbackInstanceId, timer);
       }
-    );
+
+      // Set up process end handler
+      child.on('close', async code => {
+        console.log(`Playback jobId=${jobId} ended with code=${code}`);
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch { }
+
+        try {
+          await db.s3Client.send(new DeleteObjectCommand({
+            Bucket: db.bucket,
+            Key: `agent_playbacks/${playbackInstanceId}.json`
+          }));
+        } catch (err) {
+          console.error('Error deleting playback from S3:', err);
+        }
+
+        activeTimers.playbacks.delete(playbackInstanceId);
+      });
+    } catch (err) {
+      console.error('Error storing playback in S3:', err);
+      try { process.kill(pid, 'SIGTERM'); } catch { }
+      errors++;
+    }
+  }
+
+  if (completedInserts > 0) {
+    console.log('Inserted all child processes:', completedInserts, ' of ', childArray.length, ' with ', errors, ' errors');
+    return res.status(201).json({
+      message: 'Playback job accepted',
+      childCount: childArray.length,
+      pids
+    });
+  } else {
+    return res.status(400).json({ error: `Only ${completedInserts} child processes inserted of ${childArray.length} with ${errors} errors` });
   }
 });
 
 // Stop a playback job
-agentRouter.delete('/playbacks/:jobId', (req, res) => {
+agentRouter.delete('/playbacks/:jobId', async (req, res) => {
   const { jobId } = req.params;
 
-  /* check if we have the db file availble */
-  if (!fs.existsSync(db_file)) {
-    console.error('Database file does not exist:', db_file);
-    return res.status(500).json({ error: 'Database file not found' });
-  }
+  try {
+    const listParams = {
+      Bucket: db.bucket,
+      Prefix: 'agent_playbacks/',
+      MaxKeys: 1000
+    };
 
-  db.get(`SELECT * FROM agent_playbacks WHERE jobId=?`, [jobId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ message: 'Not found' });
-    if (row.processPid) {
-      try {
-        process.kill(row.processPid, 'SIGTERM');
-      } catch { }
+    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    let found = false;
+
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        const getParams = {
+          Bucket: db.bucket,
+          Key: obj.Key
+        };
+
+        try {
+          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
+          const dataStr = await streamToString(itemResponse.Body);
+          const data = JSON.parse(dataStr);
+
+          if (data.jobId === jobId) {
+            found = true;
+
+            if (data.processPid) {
+              try {
+                process.kill(data.processPid, 'SIGTERM');
+              } catch { }
+            }
+
+            await db.s3Client.send(new DeleteObjectCommand({
+              Bucket: db.bucket,
+              Key: obj.Key
+            }));
+
+            // Clear any setTimeout
+            if (activeTimers.playbacks.has(data.id)) {
+              clearTimeout(activeTimers.playbacks.get(data.id));
+              activeTimers.playbacks.delete(data.id);
+            }
+          }
+        } catch (err) {
+          console.error(`Error reading ${obj.Key}:`, err);
+        }
+      }
     }
-    db.run(`DELETE FROM agent_playbacks WHERE jobId=?`, [jobId]);
-    // clear any setTimeout
-    if (activeTimers.playbacks.has(jobId)) {
-      clearTimeout(activeTimers.playbacks.get(jobId));
-      activeTimers.playbacks.delete(jobId);
+
+    if (!found) {
+      return res.status(404).json({ message: 'Not found' });
     }
+
     res.sendStatus(204);
-  });
+  } catch (err) {
+    console.error('Error deleting playback job:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Bind agentRouter under /v1/agent
