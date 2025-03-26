@@ -18,32 +18,40 @@ jobs:
         with:
           submodules: recursive
 
-      # 2) Build your Docker image (temporary tag)
-      - name: Build Docker Image
+      # 2a) Build your Docker image (temporary tag)
+      - name: Build Agent Docker Image
         run: |
           # We'll just use 'latest' as the ephemeral local tag
           docker build --file Dockerfile.agent \
                        --tag groovybits/agent:localbuild .
 
-          docker build --file Docker.manager \
+      # 2b) Build your Docker image (temporary tag)
+      - name: Build Manager Docker Image
+        run: |
+          # We'll just use 'latest' as the ephemeral local tag
+          docker build --file Dockerfile.manager \
                        --tag groovybits/manager:localbuild .
 
       # 3) Log in to Docker Hub (use your DOCKER_USERNAME / DOCKER_PASSWORD secrets)
       - name: Docker Hub Login
         run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
-      # 4) If pushing to main, tag & push 'latest'
-      - name: Tag & Push 'latest' (main branch)
+      # 4a) If pushing to main, tag & push 'latest'
+      - name: Tag & Push Agent 'latest' (main branch)
         if: github.ref == 'refs/heads/main'
         run: |
           docker tag groovybits/agent:localbuild groovybits/agent:latest
           docker push groovybits/agent:latest
 
+      # 4b) If pushing to main, tag & push 'latest'
+      - name: Tag & Push Manager 'latest' (main branch)
+        if: github.ref == 'refs/heads/main'
+        run: |
           docker tag groovybits/manager:localbuild groovybits/manager:latest
           docker push groovybits/manager:latest
 
       # 5) If pushing a Git tag, push the image as that tag
-      - name: Tag & Push Release from Git Tag
+      - name: Tag & Push Manager/Agent Release from Git Tag
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           # Extract the version from the ref. (e.g., 'refs/tags/v1.2.3' -> 'v1.2.3')
