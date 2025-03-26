@@ -1,6 +1,6 @@
 {
   "name": "recording-playback-api",
-  "version": "1.2.0",
+  "version": "1.1.1",
   "scripts": {
     "start:agent": "node agent.js",
     "start:manager": "node manager.js",
