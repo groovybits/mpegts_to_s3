@@ -1,5 +1,5 @@
 /****************************************************
- * server.js — Recording/Playback API Server
+ * agent.js — Recording/Playback API Agent
  * 
  * Environment Variables:
  * - SERVER_PORT: Port for the server to listen on (default: 3000)
@@ -54,7 +54,6 @@ const swaggerUi = require('swagger-ui-express');
 const yaml = require('js-yaml');
 
 // For fetch
-const fetch = require('node-fetch');
 const { env } = require('process');
 
 /*
@@ -78,9 +77,9 @@ const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
 // S3 endpoint for the MinIO server
 const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
 const s3Region = process.env.AWS_REGION || 'us-east-1';
-const s3AccessKey = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
-const s3SecretKey = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
-const s3Bucket = process.env.AWS_S3_BUCKET || 'hls';
+const s3AccessKeyDB = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
+const s3SecretKeyDB = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
+const s3BucketDB = process.env.AWS_S3_BUCKET || 'hls';
 
 // Runtime verbosity levels of Rust programs, 0-4: error, warn, info, debug, trace
 const PLAYBACK_VERBOSE = process.env.PLAYBACK_VERBOSE || 2;
@@ -91,7 +90,7 @@ const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 500;
 const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 1316;
 
 // setup directorie paths and locations of files
-const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger.yaml';
+const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_agent.yaml';
 const ORIGINAL_DIR = process.cwd() + '/';
 const HLS_DIR = process.env.HLS_DIR || '';
 
@@ -122,95 +121,6 @@ class S3Database {
 
     // Track tables that have been initialized
     this.tables = new Set();
-  }
-
-  /**
-   * Initialize table structure if needed (similar to CREATE TABLE IF NOT EXISTS)
-   * @param {string} tableName - Name of the table
-   * @param {object} schema - Optional schema definition
-   */
-  async serialize(callback) {
-    // Initialize standard tables
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS recordings (
-        id TEXT PRIMARY KEY,
-        sourceUrl TEXT,
-        duration INTEGER,
-        destinationProfile TEXT,
-        startTime TEXT,
-        endTime TEXT,
-        status TEXT,
-        processPid INTEGER
-      )
-    `);
-
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS playbacks (
-        id TEXT PRIMARY KEY,
-        sourceProfile TEXT,
-        destinationUrl TEXT,
-        duration INTEGER,
-        startTime TEXT,
-        endTime TEXT,
-        status TEXT,
-        processPid INTEGER
-      )
-    `);
-
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS pools (
-        id TEXT PRIMARY KEY,
-        bucketName TEXT,
-        accessKey TEXT,
-        secretKey TEXT
-      )
-    `);
-
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS assets (
-        id TEXT PRIMARY KEY,
-        poolId TEXT,
-        metadata TEXT
-      )
-    `);
-
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS recording_urls (
-        jobId TEXT,
-        hour TEXT,
-        url TEXT,
-        PRIMARY KEY (jobId, hour)
-      )
-    `);
-
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS agent_recordings (
-        jobId TEXT PRIMARY KEY,
-        sourceUrl TEXT,
-        duration INTEGER,
-        destinationProfile TEXT,
-        status TEXT,
-        processPid INTEGER,
-        startTime TEXT
-      )
-    `);
-
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS agent_playbacks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        jobId TEXT,
-        sourceProfile TEXT,
-        destinationUrl TEXT,
-        duration INTEGER,
-        status TEXT,
-        processPid INTEGER,
-        startTime TEXT
-      )
-    `);
-
-    if (callback) {
-      callback();
-    }
   }
 
   /**
@@ -246,186 +156,6 @@ class S3Database {
     } catch (err) {
       console.error(`Error ensuring table ${tableName}:`, err);
       throw err;
-    }
-  }
-
-  /**
-   * Execute a "CREATE TABLE" statement (creates the table metadata in S3)
-   * @param {string} sql - SQL-like CREATE TABLE statement (parsed for table name only)
-   */
-  async run(sql, params = [], callback) {
-    try {
-      // Extract table name from CREATE TABLE statement
-      if (typeof sql === 'string' && sql.trim().toUpperCase().startsWith('CREATE TABLE')) {
-        const match = sql.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i);
-        if (match && match[1]) {
-          const tableName = match[1];
-          await this.ensureTable(tableName);
-          if (callback) callback();
-          return;
-        }
-      }
-
-      // For non-CREATE TABLE statements, handle INSERT, UPDATE, DELETE
-      if (typeof sql === 'string') {
-        // INSERT
-        if (sql.trim().toUpperCase().startsWith('INSERT INTO')) {
-          const match = sql.match(/INSERT\s+INTO\s+(\w+)/i);
-          if (match && match[1]) {
-            const tableName = match[1];
-            await this.ensureTable(tableName);
-
-            // For simplicity, assume params contains the full object to insert
-            const id = params[0]; // Assuming first param is ID
-            const data = {};
-
-            // Parse the columns and values from the SQL
-            const colMatch = sql.match(/\(([^)]+)\)/);
-            if (colMatch && colMatch[1]) {
-              const columns = colMatch[1].split(',').map(c => c.trim());
-
-              // Combine columns with params to create data object
-              for (let i = 0; i < columns.length; i++) {
-                data[columns[i]] = params[i];
-              }
-
-              // Store in S3
-              const putParams = {
-                Bucket: this.bucket,
-                Key: `${tableName}/${id}.json`,
-                Body: JSON.stringify(data)
-              };
-
-              await this.s3Client.send(new PutObjectCommand(putParams));
-              if (callback) callback();
-              return;
-            }
-          }
-        }
-
-        // UPDATE
-        if (sql.trim().toUpperCase().startsWith('UPDATE')) {
-          const match = sql.match(/UPDATE\s+(\w+)\s+SET/i);
-          if (match && match[1]) {
-            const tableName = match[1];
-            await this.ensureTable(tableName);
-
-            // Extract ID from WHERE clause (e.g., "WHERE id=?")
-            const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
-            if (whereMatch && whereMatch[1]) {
-              const idField = whereMatch[1];
-              const id = params[params.length - 1]; // Assuming ID is the last param
-
-              // Get existing item
-              const getParams = {
-                Bucket: this.bucket,
-                Key: `${tableName}/${id}.json`
-              };
-
-              try {
-                const response = await this.s3Client.send(new GetObjectCommand(getParams));
-                const dataStr = await streamToString(response.Body);
-                const existingData = JSON.parse(dataStr);
-
-                // Parse SET clause to determine updates
-                const setMatch = sql.match(/SET\s+([^WHERE]+)/i);
-                if (setMatch && setMatch[1]) {
-                  const setParts = setMatch[1].split(',').map(p => p.trim());
-                  const updates = {};
-
-                  for (let i = 0; i < setParts.length; i++) {
-                    const fieldMatch = setParts[i].match(/(\w+)\s*=\s*\?/);
-                    if (fieldMatch && fieldMatch[1]) {
-                      const field = fieldMatch[1];
-                      updates[field] = params[i];
-                    }
-                  }
-
-                  // Merge updates with existing data
-                  const updatedData = { ...existingData, ...updates };
-
-                  // Store updated data
-                  const putParams = {
-                    Bucket: this.bucket,
-                    Key: `${tableName}/${id}.json`,
-                    Body: JSON.stringify(updatedData)
-                  };
-
-                  await this.s3Client.send(new PutObjectCommand(putParams));
-                  if (callback) callback();
-                  return;
-                }
-              } catch (err) {
-                console.error(`Error updating item in ${tableName}:`, err);
-                if (callback) callback(err);
-                return;
-              }
-            }
-          }
-        }
-
-        // DELETE
-        if (sql.trim().toUpperCase().startsWith('DELETE FROM')) {
-          const match = sql.match(/DELETE\s+FROM\s+(\w+)/i);
-          if (match && match[1]) {
-            const tableName = match[1];
-            await this.ensureTable(tableName);
-
-            // Extract ID from WHERE clause
-            const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
-            if (whereMatch && whereMatch[1]) {
-              const idField = whereMatch[1];
-              const id = params[0]; // Assuming ID is the first param
-
-              // Delete from S3
-              const deleteParams = {
-                Bucket: this.bucket,
-                Key: `${tableName}/${id}.json`
-              };
-
-              try {
-                await this.s3Client.send(new DeleteObjectCommand(deleteParams));
-                if (callback) callback();
-                return;
-              } catch (err) {
-                console.error(`Error deleting from ${tableName}:`, err);
-                if (callback) callback(err);
-                return;
-              }
-            }
-          }
-        }
-      }
-
-      // Handle direct object inserts (for simplified API)
-      if (typeof sql === 'object' && params && params.length >= 2) {
-        const tableName = sql.table;
-        const data = sql.data;
-        const id = data.id || uuidv4();
-
-        // Ensure ID is set
-        data.id = id;
-
-        await this.ensureTable(tableName);
-
-        // Store in S3
-        const putParams = {
-          Bucket: this.bucket,
-          Key: `${tableName}/${id}.json`,
-          Body: JSON.stringify(data)
-        };
-
-        await this.s3Client.send(new PutObjectCommand(putParams));
-        if (callback) callback(null, { id });
-        return;
-      }
-
-      // If we get here, the operation wasn't recognized
-      console.error('Unrecognized operation:', sql);
-      if (callback) callback(new Error('Unrecognized operation'));
-    } catch (err) {
-      console.error('Error in run operation:', err);
-      if (callback) callback(err);
     }
   }
 
@@ -573,11 +303,63 @@ async function streamToString(stream) {
   });
 }
 
-// ----------------------------------------------------
-// Swagger YAML read in and parsed
-// ----------------------------------------------------
-const swaggerYaml = fs.readFileSync(SWAGGER_FILE, 'utf8');
-const swaggerDoc = yaml.load(swaggerYaml);
+/**
+ * Looks up pool credentials by profile name/ID
+ * @param {string} profileId - The pool ID or profile name to look up
+ * @returns {Promise<{bucketName: string, accessKey: string, secretKey: string}|null>}
+ */
+async function getPoolCredentials(profileId) {
+  if (!profileId || profileId === 'default') {
+    // Return default credentials
+    return {
+      bucketName: s3BucketDB,
+      accessKey: s3AccessKeyDB,
+      secretKey: s3SecretKeyDB
+    };
+  }
+
+  try {
+    // Lookup the pool in S3
+    const getParams = {
+      Bucket: db.bucket,
+      Key: `pools/${profileId}.json`
+    };
+
+    console.log('getPoolCredentials: Looking up pool:', profileId);
+
+    try {
+      const response = await db.s3Client.send(new GetObjectCommand(getParams));
+      const dataStr = await streamToString(response.Body);
+      const poolData = JSON.parse(dataStr);
+
+      if (!poolData || !poolData.bucketName || !poolData.accessKey || !poolData.secretKey) {
+        if (poolData) {
+          console.error(`getPoolCredentials: Pool ${profileId} has missing credentials:`, poolData);
+        } else {
+          if (!poolData.bucketName) console.error(`getPoolCredentials: Pool ${profileId} missing bucketName`);
+          if (!poolData.accessKey) console.error(`getPoolCredentials: Pool ${profileId} missing accessKey`);
+          if (!poolData.secretKey) console.error(`getPoolCredentials: Pool ${profileId} missing secretKey`);
+        }
+        return null;
+      }
+
+      return {
+        bucketName: poolData.bucketName || s3BucketDB,
+        accessKey: poolData.accessKey || s3AccessKeyDB,
+        secretKey: poolData.secretKey || s3SecretKeyDB
+      };
+    } catch (err) {
+      if (err.name === 'NoSuchKey') {
+        console.error(`getPoolCredentials: Error with Pool ${profileId} not found with error:`, err.name, err.message);
+        return null;
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.error(`getPoolCredentials: Error getting pool credentials for ${profileId}:`, err);
+    return null;
+  }
+}
 
 // ----------------------------------------------------
 // Helper: parse "udp://224.0.0.200:10001?interface=net1"
@@ -603,7 +385,7 @@ function parseUdpUrl(urlString) {
  */
 async function storeRecordingUrls(jobId) {
   // Read from the index.txt file, as in the original implementation
-  const hourly_urls = ORIGINAL_DIR + HLS_DIR + 'index.txt';
+  const hourly_urls = env.HOURLY_URLS_LOG ? env.HOURLY_URLS_LOG :  ORIGINAL_DIR + HLS_DIR + 'index.txt';
 
   /* check if hourly_urls file exists */
   if (!fs.existsSync(hourly_urls)) {
@@ -658,10 +440,7 @@ async function storeRecordingUrls(jobId) {
 // S3 Database initialization
 // ----------------------------------------------------
 console.log('Using S3 endpoint:', s3endPoint);
-const db = new S3Database(s3endPoint, s3Bucket, s3Region, s3AccessKey, s3SecretKey);
-db.serialize(() => {
-  console.log('Initializing S3 database tables...');
-});
+const db = new S3Database(s3endPoint, s3BucketDB, s3Region, s3AccessKeyDB, s3SecretKeyDB);
 
 // Keep track of setTimeout handles in memory so we can auto-stop
 // after the given durations. In production, consider a more robust
@@ -678,605 +457,27 @@ const activeTimers = {
 const app = express();
 app.use(express.json());
 
-// Serve the Swagger UI at /api-docs
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDoc));
-
-// ===============================
-// MANAGER ENDPOINTS (/v1)
-// ===============================
-const managerRouter = express.Router();
-
-// --------------- RECORDINGS ---------------
-managerRouter.post('/recordings', async (req, res) => {
-  const { sourceUrl, duration, destinationProfile } = req.body;
-  const recordingId = `rec-${uuidv4()}`;
-  const now = new Date();
-  const endTime = new Date(now.getTime() + duration * 1000);
-
+app.use('/api-docs', swaggerUi.serve, (req, res, next) => {
   try {
-    const recordingData = {
-      recordingId,
-      sourceUrl,
-      duration,
-      destinationProfile,
-      startTime: now.toISOString(),
-      endTime: endTime.toISOString(),
-      status: 'active',
-      processPid: null
-    };
+    const swaggerYaml = fs.readFileSync(SWAGGER_FILE, 'utf8');
+    const swaggerDoc = yaml.load(swaggerYaml);
 
-    // Store in S3
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`,
-      Body: JSON.stringify(recordingData)
-    }));
+    // Dynamically set default values of the server variables
+    swaggerDoc.servers[0].variables.protocol.default = req.protocol;
+    swaggerDoc.servers[0].variables.host.default = req.hostname;
 
-    let fetchUrl = agentUrl + "/v1/agent/jobs/recordings";
-    console.log('About to call Agent with fetch, recordingId=', recordingId, ' Url=', sourceUrl, ' Duration=', duration, ' DestinationProfile=', destinationProfile, ' FetchUrl=', fetchUrl);
+    // Extract port from host header
+    const hostHeader = req.get('host');
+    const port = hostHeader.includes(':') ? hostHeader.split(':')[1] : (req.protocol === 'https' ? '443' : '80');
+    swaggerDoc.servers[0].variables.port.default = port;
 
-    try {
-      const agentResp = await fetch(fetchUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobId: recordingId,
-          sourceUrl,
-          duration,
-          destinationProfile
-        })
-      });
-
-      const agentData = await agentResp.json().catch(() => ({}));
-      return res.status(201).json({ recordingId });
-    } catch (err2) {
-      console.error('Error calling Agent endpoint:', err2);
-      return res.status(201).json({
-        recordingId,
-        warning: 'Recorded in Manager S3, but Agent spawn failed. Check logs.'
-      });
-    }
+    // Now serve the dynamically adjusted swaggerDoc
+    swaggerUi.setup(swaggerDoc)(req, res, next);
   } catch (err) {
-    console.error('Error creating recording:', err);
-    return res.status(500).json({ error: err.message });
+    console.error('Failed to load Swagger file:', err);
+    res.status(500).send('Internal Server Error');
   }
 });
-
-managerRouter.get('/recordings', async (req, res) => {
-  try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'recordings/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    res.json(items);
-  } catch (err) {
-    console.error('Error getting recordings:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.get('/recordings/:recordingId', async (req, res) => {
-  const { recordingId } = req.params;
-
-  try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-      res.json(data);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Not found' });
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error('Error getting recording:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.delete('/recordings/:recordingId', async (req, res) => {
-  const { recordingId } = req.params;
-
-  try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-
-      // Update status to canceled
-      data.status = 'canceled';
-
-      await db.s3Client.send(new PutObjectCommand({
-        Bucket: db.bucket,
-        Key: `recordings/${recordingId}.json`,
-        Body: JSON.stringify(data)
-      }));
-
-      // Kill process if any
-      if (data.processPid) {
-        try {
-          process.kill(data.processPid, 'SIGTERM');
-        } catch { }
-      }
-
-      return res.sendStatus(204);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Not found' });
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error('Error deleting recording:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --------------- POOLS ---------------
-managerRouter.post('/pools', async (req, res) => {
-  const { bucketName, credentials } = req.body;
-  if (!credentials) return res.status(400).json({ error: 'Missing credentials' });
-
-  const poolId = `pool-${uuidv4()}`;
-
-  try {
-    const poolData = {
-      poolId,
-      bucketName,
-      accessKey: credentials.accessKey,
-      secretKey: credentials.secretKey
-    };
-
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `pools/${poolId}.json`,
-      Body: JSON.stringify(poolData)
-    }));
-
-    res.status(201).json({ poolId, bucketName });
-  } catch (err) {
-    console.error('Error creating pool:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.get('/pools', async (req, res) => {
-  try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'pools/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    res.json(items);
-  } catch (err) {
-    console.error('Error getting pools:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --------------- ASSETS ---------------
-managerRouter.get('/pools/:poolId/assets', async (req, res) => {
-  const { poolId } = req.params;
-
-  try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'assets/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.poolId === poolId) {
-            items.push(data);
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    res.json(items);
-  } catch (err) {
-    console.error('Error getting assets:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.delete('/pools/:poolId/assets', async (req, res) => {
-  const { poolId } = req.params;
-  const { assetId } = req.query;
-
-  try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `assets/${assetId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-
-      if (data.poolId !== poolId) {
-        return res.status(404).json({ message: 'Asset not found in this pool' });
-      }
-
-      await db.s3Client.send(new DeleteObjectCommand({
-        Bucket: db.bucket,
-        Key: `assets/${assetId}.json`
-      }));
-
-      res.sendStatus(204);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Asset not found' });
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error('Error deleting asset:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.get('/assets/:assetId', async (req, res) => {
-  const { assetId } = req.params;
-
-  try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `assets/${assetId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-
-      const result = {
-        assetId: data.id,
-        poolId: data.poolId,
-        metadata: JSON.parse(data.metadata || '{}')
-      };
-
-      res.json(result);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Asset not found' });
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error('Error getting asset:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --------------- PLAYBACKS ---------------
-managerRouter.post('/playbacks', async (req, res) => {
-  const { sourceProfile, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
-  const playbackId = `play-${uuidv4()}`;
-  const startTime = vodStartTime;
-  const endTime = vodEndTime; // TODO: improve how this works for offset to endpoint, store starttime and endtime in DB
-
-  try {
-    const playbackData = {
-      playbackId,
-      sourceProfile,
-      destinationUrl,
-      duration,
-      startTime: (startTime && startTime !== "") ? startTime : "",
-      endTime: (endTime && endTime !== "") ? endTime : "",
-      status: 'active',
-      processPid: null
-    };
-
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`,
-      Body: JSON.stringify(playbackData)
-    }));
-
-    // Call the agent to start the playback
-    let fetchUrl = agentUrl + "/v1/agent/jobs/playbacks";
-    console.log('About to call Agent with fetch, playbackId=', playbackId, ' SourceProfile=', sourceProfile, ' DestinationUrl=', destinationUrl, ' Duration=', duration, ' FetchUrl=', fetchUrl);
-
-    try {
-      const agentResp = await fetch(fetchUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobId: sourceProfile,
-          playbackId,
-          destinationUrl,
-          duration
-        })
-      });
-
-      const agentData = await agentResp.json().catch(() => ({}));
-      return res.status(201).json({ playbackId });
-    } catch (err) {
-      console.error('Error calling Agent endpoint:', err);
-      return res.status(201).json({
-        playbackId,
-        warning: 'Recorded in Manager S3, but Agent spawn failed. Check logs.'
-      });
-    }
-  } catch (err) {
-    console.error('Error creating playback:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.get('/playbacks', async (req, res) => {
-  try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'playbacks/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    res.json(items);
-  } catch (err) {
-    console.error('Error getting playbacks:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.get('/playbacks/:playbackId', async (req, res) => {
-  const { playbackId } = req.params;
-
-  try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-      res.json(data);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Playback not found' });
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error('Error getting playback:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-managerRouter.delete('/playbacks/:playbackId', async (req, res) => {
-  const { playbackId } = req.params;
-
-  try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-
-      // Update status to canceled
-      data.status = 'canceled';
-
-      await db.s3Client.send(new PutObjectCommand({
-        Bucket: db.bucket,
-        Key: `playbacks/${playbackId}.json`,
-        Body: JSON.stringify(data)
-      }));
-
-      // Kill process if any
-      if (data.processPid) {
-        try {
-          process.kill(data.processPid, 'SIGTERM');
-        } catch { }
-      }
-
-      res.sendStatus(204);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Playback not found' });
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error('Error deleting playback:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --------------- ADMIN ---------------
-managerRouter.get('/admin/stats', async (req, res) => {
-  try {
-    // Count active recordings
-    const recListParams = {
-      Bucket: db.bucket,
-      Prefix: 'recordings/',
-      MaxKeys: 1000
-    };
-
-    const recResponse = await db.s3Client.send(new ListObjectsV2Command(recListParams));
-    let concurrentRecordings = 0;
-
-    if (recResponse.Contents) {
-      for (const obj of recResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.status === 'active') {
-            concurrentRecordings++;
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    // Count active playbacks
-    const pbListParams = {
-      Bucket: db.bucket,
-      Prefix: 'playbacks/',
-      MaxKeys: 1000
-    };
-
-    const pbResponse = await db.s3Client.send(new ListObjectsV2Command(pbListParams));
-    let concurrentPlaybacks = 0;
-
-    if (pbResponse.Contents) {
-      for (const obj of pbResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.status === 'active') {
-            concurrentPlaybacks++;
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    // Count total assets
-    const asListParams = {
-      Bucket: db.bucket,
-      Prefix: 'assets/',
-      MaxKeys: 1000
-    };
-
-    const asResponse = await db.s3Client.send(new ListObjectsV2Command(asListParams));
-    const totalAssets = asResponse.Contents ? asResponse.Contents.length : 0;
-
-    const systemLoad = 0.2;
-    const clusterUsage = { agentCount: 1 };
-
-    res.json({
-      concurrentRecordings,
-      concurrentPlaybacks,
-      totalAssets,
-      systemLoad,
-      clusterUsage
-    });
-  } catch (err) {
-    console.error('Error getting admin stats:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Bind the managerRouter under /v1
-app.use('/v1', managerRouter);
 
 // ===============================
 // AGENT ENDPOINTS (/v1/agent)
@@ -1287,7 +488,7 @@ const agentRouter = express.Router();
  * Helper to spawn udp-to-hls with appropriate args
  * Returns: childProcess
  */
-function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
+async function spawnUdpToHls(jobId, sourceUrl, duration, destinationProfile) {
   // Attempt to parse the sourceUrl as a UDP URL
   const parsed = parseUdpUrl(sourceUrl);
   if (!parsed) {
@@ -1296,24 +497,39 @@ function spawnUdpToHls(jobId, sourceUrl, duration, s3bucketName) {
     throw new Error(`Invalid or non-UDP sourceUrl: ${sourceUrl}`);
   }
 
+  // Get pool credentials for the specified profile
+  const poolCredentials = await getPoolCredentials(destinationProfile);
+  if (!poolCredentials) {
+    throw new Error(`Invalid destination profile: ${destinationProfile}`);
+  }
+
   const { ip, port, iface } = parsed;
-  // Example invocation, adjust arguments as needed.
-  // We'll store segments in a subdirectory named by jobId.
+  const { bucketName, accessKey, secretKey } = poolCredentials;
+
+  const env = {
+    ...process.env,
+    MINIO_ROOT_USER: accessKey,
+    MINIO_ROOT_PASSWORD: secretKey
+  }
+
+  // Build command arguments with credentials
   const args = [
     '-n', iface,
     '-v', `${RECORDING_VERBOSE}`,
     '-e', s3endPoint,
-    '-b', s3bucketName,
-    //'--duration', duration,
-    '--hls_keep_segments', '0', // Keep all segments
+    '-b', bucketName,
+    //'--duration', duration + 1, // Add 1 second to duration
+    '--hls_keep_segments', '0',     // Keep all segments
     '-i', ip,
     '-p', port,
     '-o', jobId  // acts as the "channel name"/local output folder
   ];
 
   console.log(`Spawning => udp-to-hls ${args.join(' ')}`);
+
   const child = spawn('udp-to-hls', args, {
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: env
   });
 
   // Attach listeners for stdout and stderr
@@ -1427,7 +643,7 @@ async function getVodPlaylists(jobId, vodStartTime, vodEndTime) {
  * If multiple playlists exist, it waits for only the first process to finish before returning.
  * Returns: Promise resolving to an array of spawned child processes.
  */
-async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime) {
+async function spawnHlsToUdp(jobId, destinationUrl, vodStartTime, vodEndTime) {
   if (!jobId) {
     console.log('Invalid jobId:', jobId);
     return [];
@@ -1448,6 +664,11 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
     console.error('Error getting vod playlists from S3:', err);
     return [];
   }
+ 
+  // Set the environment variables for the hls-to-udp process
+  const env = {
+    ...process.env
+  }
 
   let childArray = [];
   // Spawn each hls-to-udp process.
@@ -1464,7 +685,8 @@ async function spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime,
 
     console.log(`Spawning hls-to-udp => ${baseArgs.join(' ')}`);
     const child = spawn('hls-to-udp', baseArgs, {
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: env
     });
     childArray.push(child);
 
@@ -1565,7 +787,7 @@ agentRouter.get('/status', async (req, res) => {
 });
 
 // Start a recording job
-agentRouter.post('/jobs/recordings', (req, res) => {
+agentRouter.post('/jobs/recordings', async (req, res) => {
   const { jobId, sourceUrl, duration, destinationProfile } = req.body;
   if (!jobId || !sourceUrl) {
     return res.status(400).json({ error: 'Missing jobId or sourceUrl' });
@@ -1573,7 +795,7 @@ agentRouter.post('/jobs/recordings', (req, res) => {
 
   let child;
   try {
-    child = spawnUdpToHls(jobId, sourceUrl, duration, destinationProfile);
+    child = await spawnUdpToHls(jobId, sourceUrl, duration, destinationProfile);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
@@ -1698,14 +920,14 @@ agentRouter.delete('/recordings/:jobId', async (req, res) => {
 
 // Start a playback job
 agentRouter.post('/jobs/playbacks', async (req, res) => {
-  const { jobId, sourceProfile, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
+  const { jobId, destinationUrl, duration, vodStartTime, vodEndTime } = req.body;
   if (!jobId || !destinationUrl) {
     return res.status(400).json({ error: 'Missing jobId or destinationUrl' });
   }
 
   let childArray;
   try {
-    childArray = await spawnHlsToUdp(jobId, sourceProfile, destinationUrl, vodStartTime, vodEndTime);
+    childArray = await spawnHlsToUdp(jobId, destinationUrl, vodStartTime, vodEndTime);
   } catch (spawnErr) {
     return res.status(400).json({ error: spawnErr.message });
   }
@@ -1792,7 +1014,6 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
     const playbackData = {
       playbackInstanceId,
       jobId,
-      sourceProfile,
       destinationUrl,
       duration,
       status: 'running',
@@ -1955,14 +1176,15 @@ Environment Variables:
   - SERVER_HOST: Host for the Node server to listen on as a Manager or Agent (default: ` + SERVER_HOST + `)
   - AGENT_PORT: Port for the Agent server used by the Manager (default: ` + AGENT_PORT + `)
   - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
-  - AWS_S3_ENDPOINT: Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
+  - AWS_S3_ENDPOINT: Default Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
+  - AWS_S3_REGION: Default Region for the S3 storage pool server (default: ` + s3Region + `)
   - SMOOTHER_LATENCY: Smoother latency for hls-to-udp output (default: ` + SMOOTHER_LATENCY + `)
   - PLAYBACK_VERBOSE: Verbosity level for hls-to-udp (default: ` + PLAYBACK_VERBOSE + `)
   - RECORDING_VERBOSE: Verbosity level for udp-to-hls (default: ` + RECORDING_VERBOSE + `)
   - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: ` + UDP_BUFFER_BYTES + `)
   - CAPTURE_BUFFER_SIZE: Buffer size for udp-to-hls (default: ` + capture_buffer_size + `)
-  - MINIO_ROOT_USER: S3 Access Key (default: ` + minio_root_user + `)
-  - MINIO_ROOT_PASSWORD: S3 Secret Key (default: ` + minio_root_password + `)
+  - MINIO_ROOT_USER: Default S3 Access Key (default: ` + minio_root_user + `)
+  - MINIO_ROOT_PASSWORD: Default S3 Secret Key (default: ` + minio_root_password + `)
   - URL_SIGNING_SECONDS: S3 URL Signing time duration (default: ` + url_signing_seconds + `)
   - SEGMENT_DURATION_MS: ~Duration (estimate) of each segment in milliseconds (default: ` + segment_duration_ms + `)
   - MAX_SEGMENT_SIZE_BYTES: Maximum size of each segment in bytes (default: ` + max_segment_size_bytes + `)
@@ -1971,7 +1193,7 @@ Environment Variables:
   - ORIGINAL_DIR: Original directory before changing to HLS_DIR (default: ` + ORIGINAL_DIR + `)
   - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
-  console.log('\nRecord/Playback API Server Manager URL:', serverUrl, ' Agent URL:', agentUrl);
+  console.log('\nRecord/Playback API Agent URL:', agentUrl);
   console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');
@@ -1985,5 +1207,5 @@ Environment Variables:
     console.log('Hourly URLs log file defined and not found, creating it:', env.HOURLY_URLS_LOG);
     fs.writeFileSync(env.HOURLY_URLS_LOG, '');
   }
-  console.log(`\nRecord/Playback Server started at: ${new Date().toISOString()}\n- Listening for connections...\n`);
+  console.log(`\nRecord/Playback Agent started at: ${new Date().toISOString()}\n- Listening for connections...\n`);
 });

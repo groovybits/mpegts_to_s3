@@ -1,4 +1,4 @@
-# HLS VOD to MPEG-TS UDP Re-cast
+# HLS to UDP Rebroadcast MpegTS Multicast
 
 This Rust-based client reads from an HLS M3U8 playlist and rebroadcasts it as MPEG-TS over UDP. It is designed to handle the HLS produced by https://github.com/groovybits/mpegts_to_s3.git and is intended to be used as a relay for replaying that content.
 
@@ -13,8 +13,8 @@ To smooth the output using the LTN TS Tools Bitrate Smoother Rust Bindings [http
 
 - Rust (latest stable version)
 - Cargo (Rust package manager)
-- LibPcap
-- LibRdKafka development package for your OS
+- LibPcap (capture library for packet capture)
+- LibRdKafka development package for your OS (Needed by libltntstools, not used by hls-to-udp)
 - LibLTNTSTools (optional) Use the `smoother` feature flag to enable the Bitrate Smoother `--features=smoother`
 
 ## Installation

@@ -1,4 +1,4 @@
-.PHONY: all clean setup install build container
+.PHONY: all clean setup install build manager_image agent_image compose_build compose run
 
 CARGO_FEATURES = smoother
 
@@ -20,13 +20,20 @@ clean:
 	cd hls-to-udp && cargo clean
 	rm -rf bin
 	rm -rf recording-playback-server/node_modules
-	rm -f recording-playback-server/package-lock.json
 
 distclean: clean
-	rm -f recording-playback-server/media_jobs.db
-	rm -f recording-playback-server/hourly_urls.log
+	rm -f recording-playback-server/hls
+	rm -f hls/*
+	rm -rf data/* data/.minio.sys
 
-container: clean
-	podman-compose build
+run: build
+	podman-compose -f docker-compose_api_server.yaml up -d
 
+compose_build: clean manager_image agent_image
+	podman-compose -f docker-compose_api_server.yaml build
 
+manager_image: clean
+	podman build -t localhost/manager:latest -f Dockerfile.manager .
+
+agent_image: clean
+	podman build -t localhost/agent:latest -f Dockerfile.agent .

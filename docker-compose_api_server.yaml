@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  ######################################
+  # Manager Recording Playback Javascript API Service
+  ######################################
+  manager:
+    network_mode: "host"
+    hostname: "manager"
+    image: localhost/manager:latest # replace with groovybits/manager:latest for official release
+    container_name: "manager"
+    env_file: # Change this to a unique config file for this manager
+      - "./configs/manager.env"
+    restart: unless-stopped
+    entrypoint: ["/app/entrypoint_manager.sh"]
+
+  ######################################
+  # Manager Recording Playback Javascript API Service
+  ######################################
+  agent:
+    network_mode: "host"
+    hostname: "agent"
+    image: localhost/agent:latest # replace with groovybits/agent:latest for official release
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_ADMIN
+      - BPF
+    privileged: true
+    container_name: "agent"
+    env_file: # Change this to a unique config file for this agent
+      - "./configs/agent.env"
+    volumes:
+      - "./hls:/app/hls:rw"
+    restart: unless-stopped
+    entrypoint: ["/app/entrypoint_agent.sh"]
+    
+
+
