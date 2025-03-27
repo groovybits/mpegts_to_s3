@@ -1,7 +1,7 @@
-## MPegTS to S3 TODO
+## Record / Playback Manager and Agent API TODO
 
 ### CRITICAL BUGS
-- [ ] Smoother can have some bursts every few minutes potentially 
+- [ ] Smoother can have some bursts every few minutes potentially (WIP)
 
 ### NON-CRITICAL BUGS
 - [ ] Timing output could be given higher accuracy
@@ -17,15 +17,20 @@
 - [ ] fix to allow  ?.. arg flags to m3u8 urls
 
 ### Swagger API Implementation recording-playback-server TASKS
-- [ ] Add start/end time support for playback in HLS
+- [ ] Add start/end time functionality support for playback in HLS
 - [ ] Add Authentication Bearers handling to API for outh2 etc.
-- [ ] Implement attaching Pools of S3 bucket/creds to each API call properly
+- [X] Implement attaching Pools of S3 bucket/creds to each API call properly
 - [ ] Implement filling a Pool with Assets as they are created.
-- [ ] Implement a way to get a list of all assets in a pool
+- [ ] Implement getting a list of all assets in a pool
 - [ ] Add to and advance the stats and admin API endpoints.
 - [ ] Work out and test Manager/Agent configurations separated across servers.
 - [ ] Implement multiple Agents per Manager and general scaling, queueing, etc.
 - [ ] Add Unit Tests for each API endpoint and all the above features.
+- [X] Merge m3u8's into a single m3u8 for HLS and serve the m3u8 as a single file.
+- [ ] Pagination for S3 listing on assets and pools
+- [ ] Split out common s3 code into a shared library for both manager and agent.
+- [ ] Fix capture duration to be exact and avoid losing time in the capture. (may be smoother issue)
+- [ ] AWS Region and Endpoint settings for S3 stored per pool to allow multiple s3 region buckets and endpoints.
 
 ---
 January 2025 - @bitbytebit 

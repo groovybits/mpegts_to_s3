@@ -2,9 +2,12 @@
  * agent.js — Recording/Playback API Agent
  * 
  * Environment Variables:
- * - SERVER_PORT: Port for the server to listen on (default: 3000)
+ * - AGENT_ID: Unique identifier for this agent (default: agent-001)
+ * - SERVER_PORT: Port for the server to listen on (default: 3001)
  * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
  * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
+ * - AWS_REGION: AWS region for S3 (default: us-east-1)
+ * - AWS_ACCESS_KEY_ID: Access key for S3 (default: minioadmin)
  * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
  * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
  * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
@@ -13,12 +16,6 @@
  * - Start the server with `node server.js`
  * - Access the Swagger UI at http://localhost:3000/api-docs
  * - Use the API to create recordings and playbacks
- * - The server will spawn the appropriate agents to handle the jobs
- * - The agents will spawn the appropriate processes to handle the jobs
- * - The server will store the job status in S3 as JSON files
- * - The server will auto-stop the jobs after the given durations
- * - The server will store the recording URLs in S3
- * - The server will serve the recording URLs to the clients
  * 
  * URL parameters for UDP MpegTS:
  * - udp://multicast_ip:port?interface=net1
@@ -35,19 +32,23 @@
  * - Install Node.js and npm version greater than 18 ideally
  * - Run `npm install` to install dependencies
  * - Build the udp-to-hls and hls-to-udp in ../ one directory down using `make && make install`
- * - Run `node server.js` to start the server
+ * - Run `npm run start:manager && npm run start:agent` to start the API Manager and Agent
  * 
  * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
  * 
  ****************************************************/
 
-const serverVersion = '1.1.0';
+const serverVersion = '1.1.1';
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const { spawn } = require('child_process');
 const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const fs = require('fs');
+
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
 
 // For Swagger
 const swaggerUi = require('swagger-ui-express');
@@ -56,23 +57,13 @@ const yaml = require('js-yaml');
 // For fetch
 const { env } = require('process');
 
-/*
- * The SERVER_HOST and SERVER_PORT are the host and port of the recording-playback-server which can be a Manager or Agent role.
- * The AGENT_HOST and AGENT_PORT are the host and port of the recording-playback-server which can be remotely called by a Manager role.
- * Agents are basically nodes that run the heavier processes of recording and playback.
- * Managers are nodes that manage the Agents and the recording and playback processes.
- */
-
+// Agent ID
+const AGENT_ID = process.env.AGENT_ID || 'agent-001';
 // Server Manager and Agent URL Bases used for fetch calls (same server in this case)
 const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
-const SERVER_PORT = process.env.SERVER_PORT || 3000;
+const SERVER_PORT = process.env.SERVER_PORT || 3001;
 const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // Manager and local Agents base server
 const serverUrl = SERVER_PROTOCOL + '://' + SERVER_HOST + ':' + SERVER_PORT;
-
-const AGENT_PROTOCOL = process.env.AGENT_PROTOCOL || 'http';
-const AGENT_PORT = process.env.AGENT_PORT || 3000;
-const AGENT_HOST = process.env.AGENT_HOST || "127.0.0.1"; // Agent is running on the same server as Manager (us)
-const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
 
 // S3 endpoint for the MinIO server
 const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
@@ -385,7 +376,7 @@ function parseUdpUrl(urlString) {
  */
 async function storeRecordingUrls(jobId) {
   // Read from the index.txt file, as in the original implementation
-  const hourly_urls = env.HOURLY_URLS_LOG ? env.HOURLY_URLS_LOG :  ORIGINAL_DIR + HLS_DIR + 'index.txt';
+  const hourly_urls = env.HOURLY_URLS_LOG ? env.HOURLY_URLS_LOG : ORIGINAL_DIR + HLS_DIR + 'index.txt';
 
   /* check if hourly_urls file exists */
   if (!fs.existsSync(hourly_urls)) {
@@ -639,14 +630,193 @@ async function getVodPlaylists(jobId, vodStartTime, vodEndTime) {
 }
 
 /**
- * Helper to spawn hls-to-udp in VOD or live mode
- * If multiple playlists exist, it waits for only the first process to finish before returning.
- * Returns: Promise resolving to an array of spawned child processes.
+ * Playlist combiner and HTTP server for serving a single merged playlist
+ * that references the original segment URLs directly.
  */
-async function spawnHlsToUdp(jobId, destinationUrl, vodStartTime, vodEndTime) {
+
+/**
+ * Fetches and parses an m3u8 playlist
+ */
+async function fetchPlaylist(playlistUrl) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(playlistUrl);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET'
+    };
+
+    const req = protocol.request(options, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`Failed to fetch playlist: ${res.statusCode}`));
+        return;
+      }
+
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          const lines = data.trim().split('\n');
+          const segments = [];
+
+          let currentSegment = null;
+          let absoluteTime = null;
+
+          for (const line of lines) {
+            if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+              absoluteTime = new Date(line.substring(25).trim());
+            }
+            else if (line.startsWith('#EXTINF:')) {
+              const durationMatch = line.match(/#EXTINF:([\d.]+)/);
+              if (durationMatch) {
+                currentSegment = {
+                  duration: parseFloat(durationMatch[1]),
+                  extinf: line,
+                  absoluteTime: absoluteTime ? new Date(absoluteTime) : null
+                };
+                if (absoluteTime) {
+                  absoluteTime = new Date(absoluteTime.getTime() +
+                    (parseFloat(durationMatch[1]) * 1000));
+                }
+              }
+            }
+            else if (line.trim() !== '' && !line.startsWith('#') && currentSegment) {
+              // Resolve relative URLs to absolute
+              let segmentUrl = line.trim();
+              if (!segmentUrl.startsWith('http')) {
+                const baseUrl = new URL(playlistUrl);
+                if (segmentUrl.startsWith('/')) {
+                  segmentUrl = `${baseUrl.protocol}//${baseUrl.host}${segmentUrl}`;
+                } else {
+                  const urlDir = playlistUrl.substring(0, playlistUrl.lastIndexOf('/') + 1);
+                  segmentUrl = `${urlDir}${segmentUrl}`;
+                }
+              }
+
+              currentSegment.uri = segmentUrl;
+              segments.push(currentSegment);
+              currentSegment = null;
+            }
+          }
+
+          resolve(segments);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    req.on('error', (error) => reject(error));
+    req.end();
+  });
+}
+
+/**
+ * Combines multiple playlists and optionally trims by time range
+ */
+async function combineAndTrimPlaylists(playlistUrls, startTime, endTime) {
+  try {
+    // Fetch all playlists
+    const segmentArrays = await Promise.all(
+      playlistUrls.map(url => fetchPlaylist(url))
+    );
+
+    // Combine all segments
+    let allSegments = [];
+    for (const segments of segmentArrays) {
+      allSegments = allSegments.concat(segments);
+    }
+
+    // Sort segments by absolute time if available
+    allSegments.sort((a, b) => {
+      if (a.absoluteTime && b.absoluteTime) {
+        return a.absoluteTime.getTime() - b.absoluteTime.getTime();
+      }
+      return 0;
+    });
+
+    // Filter segments by time range if specified
+    if (startTime && endTime) {
+      const startTimeDate = new Date(startTime);
+      const endTimeDate = new Date(endTime);
+
+      allSegments = allSegments.filter(segment => {
+        if (!segment.absoluteTime) return true;
+        return segment.absoluteTime >= startTimeDate && segment.absoluteTime <= endTimeDate;
+      });
+    }
+
+    // Calculate max duration for EXT-X-TARGETDURATION
+    const maxDuration = Math.ceil(
+      Math.max(...allSegments.map(s => s.duration), 6)
+    );
+
+    // Build the combined playlist
+    let combinedContent = '#EXTM3U\n';
+    combinedContent += '#EXT-X-VERSION:3\n';
+    combinedContent += `#EXT-X-TARGETDURATION:${maxDuration}\n`;
+    combinedContent += '#EXT-X-MEDIA-SEQUENCE:0\n';
+
+    for (const segment of allSegments) {
+      if (segment.absoluteTime) {
+        combinedContent += `#EXT-X-PROGRAM-DATE-TIME:${segment.absoluteTime.toISOString()}\n`;
+      }
+      combinedContent += `${segment.extinf}\n`;
+      combinedContent += `${segment.uri}\n`;
+    }
+
+    combinedContent += '#EXT-X-ENDLIST\n';
+
+    return combinedContent;
+  } catch (error) {
+    console.error('Error combining playlists:', error);
+    throw error;
+  }
+}
+
+/**
+ * Creates a simple HTTP server to serve the combined playlist
+ */
+function createPlaylistServer(playlistContent, port = 0) {
+  return new Promise((resolve, reject) => {
+    try {
+      const server = http.createServer((req, res) => {
+        if (req.url === '/playlist.m3u8') {
+          res.writeHead(200, {
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-cache'
+          });
+          res.end(playlistContent);
+        } else {
+          res.writeHead(404);
+          res.end('Not Found');
+        }
+      });
+
+      server.listen(port, () => {
+        const addressInfo = server.address();
+        const serverUrl = `http://localhost:${addressInfo.port}/playlist.m3u8`;
+        resolve({ server, url: serverUrl });
+      });
+
+      server.on('error', (error) => reject(error));
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+/**
+ * Helper to spawn hls-to-udp with a combined playlist
+ */
+async function spawnHlsToUdpWithCombinedPlaylist(jobId, destinationUrl, vodStartTime, vodEndTime) {
   if (!jobId) {
     console.log('Invalid jobId:', jobId);
-    return [];
+    return null;
   }
 
   // Parse the destinationUrl to get IP and port
@@ -656,63 +826,94 @@ async function spawnHlsToUdp(jobId, destinationUrl, vodStartTime, vodEndTime) {
   }
   const { ip, port } = parsedDest;
 
-  // Build the vodPlaylists array by querying the recording_urls in S3
+  // Get playlist URLs
   let vodPlaylists = [];
   try {
     vodPlaylists = await getVodPlaylists(jobId, vodStartTime, vodEndTime);
   } catch (err) {
     console.error('Error getting vod playlists from S3:', err);
+    return null;
+  }
+
+  if (vodPlaylists.length === 0) {
+    console.log('No playlists found for the specified criteria');
+    return null;
+  }
+
+  console.log(`Found ${vodPlaylists.length} playlists for job ${jobId}`);
+
+  // Combine and trim playlists
+  console.log('Combining and trimming playlists...');
+  const combinedPlaylist = await combineAndTrimPlaylists(
+    vodPlaylists,
+    vodStartTime,
+    vodEndTime
+  );
+
+  // Create HTTP server to serve the combined playlist
+  console.log('Starting playlist server...');
+  const { server, url: playlistUrl } = await createPlaylistServer(combinedPlaylist);
+
+  console.log(`Serving combined playlist at: ${playlistUrl}`);
+
+  // Build arguments for hls-to-udp
+  const baseArgs = [
+    '--vod',
+    '--use-smoother',
+    '-l', `${SMOOTHER_LATENCY}`,
+    '-b', `${UDP_BUFFER_BYTES}`,
+    '-v', `${PLAYBACK_VERBOSE}`,
+    '-u', playlistUrl,
+    '-o', `${ip}:${port}`
+  ];
+
+  console.log(`Spawning hls-to-udp with combined playlist => ${baseArgs.join(' ')}`);
+  const child = spawn('hls-to-udp', baseArgs, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env }
+  });
+
+  // Attach listeners for stdout and stderr
+  child.stdout.on('data', data => {
+    console.log(`hls-to-udp stdout: ${data.toString().trim()}`);
+  });
+  child.stderr.on('data', data => {
+    console.error(`hls-to-udp stderr: ${data.toString().trim()}`);
+  });
+
+  // Clean up the server when the process exits
+  child.on('close', code => {
+    console.log(`hls-to-udp process ended with code=${code}, stopping playlist server`);
+    server.close();
+  });
+
+  child.on('error', err => {
+    console.error('Error in hls-to-udp process:', err);
+    server.close();
+  });
+
+  // Store the server reference on the child so we can close it if needed
+  child.server = server;
+
+  return child;
+}
+
+/**
+ * Helper to spawn hls-to-udp in VOD mode with a combined playlist
+ * Returns: Promise resolving to an array containing a single spawned child process.
+ */
+async function spawnHlsToUdp(jobId, destinationUrl, vodStartTime, vodEndTime) {
+  try {
+    const child = await spawnHlsToUdpWithCombinedPlaylist(jobId, destinationUrl, vodStartTime, vodEndTime);
+    if (!child) {
+      console.error('Failed to spawn hls-to-udp process');
+      return [];
+    }
+    return [child]; // Return as array for backward compatibility
+  } catch (err) {
+    console.error('Error in spawnHlsToUdp:', err);
     return [];
   }
- 
-  // Set the environment variables for the hls-to-udp process
-  const env = {
-    ...process.env
-  }
-
-  let childArray = [];
-  // Spawn each hls-to-udp process.
-  // Wait only for the first process if there is more than one playlist.
-  for (let i = 0; i < vodPlaylists.length; i++) {
-    let baseArgs = [];
-    baseArgs.push('--vod');
-    baseArgs.push('--use-smoother');
-    baseArgs.push('-l', `${SMOOTHER_LATENCY}`);
-    baseArgs.push('-b', `${UDP_BUFFER_BYTES}`);
-    baseArgs.push('-v', `${PLAYBACK_VERBOSE}`);
-    baseArgs.push('-u', `${vodPlaylists[i]}`);
-    baseArgs.push('-o', `${ip}:${port}`);
-
-    console.log(`Spawning hls-to-udp => ${baseArgs.join(' ')}`);
-    const child = spawn('hls-to-udp', baseArgs, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: env
-    });
-    childArray.push(child);
-
-    // Attach listeners for stdout and stderr
-    child.stdout.on('data', data => {
-      console.log(`hls-to-udp stdout: ${data.toString().trim()}`);
-    });
-    child.stderr.on('data', data => {
-      console.error(`hls-to-udp stderr: ${data.toString().trim()}`);
-    });
-
-    // Only wait for the first process if there is more than one playlist
-    if (i === 0 && vodPlaylists.length > 1) {
-      await new Promise((resolve, reject) => {
-        child.on('close', code => {
-          console.log(`First hls-to-udp process ended with code=${code}`);
-          resolve();
-        });
-        child.on('error', err => {
-          reject(err);
-        });
-      });
-    }
-  }
-  console.log('vodPlaylist: Launched', childArray.length, 'hls-to-udp processes (first one waited for)');
-  return childArray;
 }
 
 // GET status
@@ -775,7 +976,7 @@ agentRouter.get('/status', async (req, res) => {
     }
 
     res.json({
-      agentId: 'agent-001',
+      agentId: AGENT_ID,
       status: 'healthy',
       activeRecordings: recRows,
       activePlaybacks: pbRows
@@ -1161,7 +1362,7 @@ app.use('/v1/agent', agentRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
-  console.log(`Manager/Agent API Server version ${serverVersion} Manager@${serverUrl} AgentUrl@${agentUrl}.`);
+  console.log(`Recording / Playback Agent API Server AgentID: [${AGENT_ID}] Version: ${serverVersion} AgentURL: ${serverUrl}`);
   let capture_buffer_size = env.CAPTURE_BUFFER_SIZE || `4193904`;
   let segment_duration_ms = env.SEGMENT_DURATION_MS || `2000`;
   let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
@@ -1174,8 +1375,6 @@ app.listen(SERVER_PORT, () => {
 Environment Variables:
   - SERVER_PORT: Port for the Node server to listen on as a Manager or Agent (default: ` + SERVER_PORT + `)
   - SERVER_HOST: Host for the Node server to listen on as a Manager or Agent (default: ` + SERVER_HOST + `)
-  - AGENT_PORT: Port for the Agent server used by the Manager (default: ` + AGENT_PORT + `)
-  - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
   - AWS_S3_ENDPOINT: Default Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
   - AWS_S3_REGION: Default Region for the S3 storage pool server (default: ` + s3Region + `)
   - SMOOTHER_LATENCY: Smoother latency for hls-to-udp output (default: ` + SMOOTHER_LATENCY + `)
@@ -1193,7 +1392,6 @@ Environment Variables:
   - ORIGINAL_DIR: Original directory before changing to HLS_DIR (default: ` + ORIGINAL_DIR + `)
   - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
-  console.log('\nRecord/Playback API Agent URL:', agentUrl);
   console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');

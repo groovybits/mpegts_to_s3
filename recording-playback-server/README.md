@@ -1,4 +1,4 @@
-# Recording and Playback API Server
+# Record / Playback Manager and Agent API Server
 
 This project includes an API server written in Node.js consisting of a Manager and Agent(s) that handle recording and playback jobs using udp-to-hls and hls-to-udp. The Manager/Agent Servers use Express and provides a comprehensive Swagger UI for API documentation.
 

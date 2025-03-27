@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   ######################################
-  # Manager Recording Playback Javascript API Service
+  # Manager Recording / Playback Javascript API Service
   ######################################
   manager:
     network_mode: "host"
@@ -15,7 +15,7 @@ services:
     entrypoint: ["/app/entrypoint_manager.sh"]
 
   ######################################
-  # Manager Recording Playback Javascript API Service
+  # Agent Recording / Playback Javascript API Service
   ######################################
   agent:
     network_mode: "host"

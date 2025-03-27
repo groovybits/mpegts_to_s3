@@ -1,4 +1,4 @@
-# UDP to HLS Capture and Upload MpegTS to S3/MinIO
+# UDP to HLS MpegTS Capture to Cloud Storage
 
 UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can be signed for secure playback. It runs diskless and doesn't store segments locally, only in memory and upload to S3/MinIO. 
 
