@@ -13,12 +13,6 @@
  * - Start the server with `node server.js`
  * - Access the Swagger UI at http://localhost:3000/api-docs
  * - Use the API to create recordings and playbacks
- * - The server will spawn the appropriate agents to handle the jobs
- * - The agents will spawn the appropriate processes to handle the jobs
- * - The server will store the job status in S3 as JSON files
- * - The server will auto-stop the jobs after the given durations
- * - The server will store the recording URLs in S3
- * - The server will serve the recording URLs to the clients
  * 
  * URL parameters for UDP MpegTS:
  * - udp://multicast_ip:port?interface=net1
@@ -35,7 +29,7 @@
  * - Install Node.js and npm version greater than 18 ideally
  * - Run `npm install` to install dependencies
  * - Build the udp-to-hls and hls-to-udp in ../ one directory down using `make && make install`
- * - Run `node server.js` to start the server
+ * - Run `npm run start:manager && npm run start:agent` to start the API Manager and Agent
  * 
  * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
  * 
@@ -70,7 +64,7 @@ const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // Manager and local
 const serverUrl = SERVER_PROTOCOL + '://' + SERVER_HOST + ':' + SERVER_PORT;
 
 const AGENT_PROTOCOL = process.env.AGENT_PROTOCOL || 'http';
-const AGENT_PORT = process.env.AGENT_PORT || 3000;
+const AGENT_PORT = process.env.AGENT_PORT || 3001;
 const AGENT_HOST = process.env.AGENT_HOST || "127.0.0.1"; // Agent is running on the same server as Manager (us)
 const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
 
@@ -998,7 +992,7 @@ app.use('/v1', managerRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
-  console.log(`Manager/Agent API Server version ${serverVersion} Manager@${serverUrl} AgentUrl@${agentUrl}.`);
+  console.log(`Recording / Playback Manager API Server version ${serverVersion} ManagerURL@${serverUrl} AgentURL@${agentUrl}.`);
   let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
   let minio_root_password = env.MINIO_ROOT_PASSWORD || `minioadmin`;
 
@@ -1014,7 +1008,6 @@ Environment Variables:
   - MINIO_ROOT_PASSWORD: Default S3 Secret Key (default: ` + minio_root_password + `)
   - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
-  console.log('\nRecord/Playback API Manager URL:', serverUrl, ' Agent URL:', agentUrl);
   console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');

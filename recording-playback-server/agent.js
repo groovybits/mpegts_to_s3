@@ -2,7 +2,7 @@
  * agent.js — Recording/Playback API Agent
  * 
  * Environment Variables:
- * - SERVER_PORT: Port for the server to listen on (default: 3000)
+ * - SERVER_PORT: Port for the server to listen on (default: 3001)
  * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
  * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
  * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
@@ -13,12 +13,6 @@
  * - Start the server with `node server.js`
  * - Access the Swagger UI at http://localhost:3000/api-docs
  * - Use the API to create recordings and playbacks
- * - The server will spawn the appropriate agents to handle the jobs
- * - The agents will spawn the appropriate processes to handle the jobs
- * - The server will store the job status in S3 as JSON files
- * - The server will auto-stop the jobs after the given durations
- * - The server will store the recording URLs in S3
- * - The server will serve the recording URLs to the clients
  * 
  * URL parameters for UDP MpegTS:
  * - udp://multicast_ip:port?interface=net1
@@ -35,7 +29,7 @@
  * - Install Node.js and npm version greater than 18 ideally
  * - Run `npm install` to install dependencies
  * - Build the udp-to-hls and hls-to-udp in ../ one directory down using `make && make install`
- * - Run `node server.js` to start the server
+ * - Run `npm run start:manager && npm run start:agent` to start the API Manager and Agent
  * 
  * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
  * 
@@ -56,23 +50,11 @@ const yaml = require('js-yaml');
 // For fetch
 const { env } = require('process');
 
-/*
- * The SERVER_HOST and SERVER_PORT are the host and port of the recording-playback-server which can be a Manager or Agent role.
- * The AGENT_HOST and AGENT_PORT are the host and port of the recording-playback-server which can be remotely called by a Manager role.
- * Agents are basically nodes that run the heavier processes of recording and playback.
- * Managers are nodes that manage the Agents and the recording and playback processes.
- */
-
 // Server Manager and Agent URL Bases used for fetch calls (same server in this case)
 const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
-const SERVER_PORT = process.env.SERVER_PORT || 3000;
+const SERVER_PORT = process.env.SERVER_PORT || 3001;
 const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // Manager and local Agents base server
 const serverUrl = SERVER_PROTOCOL + '://' + SERVER_HOST + ':' + SERVER_PORT;
-
-const AGENT_PROTOCOL = process.env.AGENT_PROTOCOL || 'http';
-const AGENT_PORT = process.env.AGENT_PORT || 3000;
-const AGENT_HOST = process.env.AGENT_HOST || "127.0.0.1"; // Agent is running on the same server as Manager (us)
-const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
 
 // S3 endpoint for the MinIO server
 const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
@@ -1161,7 +1143,7 @@ app.use('/v1/agent', agentRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
-  console.log(`Manager/Agent API Server version ${serverVersion} Manager@${serverUrl} AgentUrl@${agentUrl}.`);
+  console.log(`Recording / Playback Agent API Server version ${serverVersion} AgentURL@${serverUrl}.`);
   let capture_buffer_size = env.CAPTURE_BUFFER_SIZE || `4193904`;
   let segment_duration_ms = env.SEGMENT_DURATION_MS || `2000`;
   let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
@@ -1174,8 +1156,6 @@ app.listen(SERVER_PORT, () => {
 Environment Variables:
   - SERVER_PORT: Port for the Node server to listen on as a Manager or Agent (default: ` + SERVER_PORT + `)
   - SERVER_HOST: Host for the Node server to listen on as a Manager or Agent (default: ` + SERVER_HOST + `)
-  - AGENT_PORT: Port for the Agent server used by the Manager (default: ` + AGENT_PORT + `)
-  - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
   - AWS_S3_ENDPOINT: Default Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
   - AWS_S3_REGION: Default Region for the S3 storage pool server (default: ` + s3Region + `)
   - SMOOTHER_LATENCY: Smoother latency for hls-to-udp output (default: ` + SMOOTHER_LATENCY + `)
@@ -1193,7 +1173,6 @@ Environment Variables:
   - ORIGINAL_DIR: Original directory before changing to HLS_DIR (default: ` + ORIGINAL_DIR + `)
   - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
-  console.log('\nRecord/Playback API Agent URL:', agentUrl);
   console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');
