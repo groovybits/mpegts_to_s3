@@ -77,8 +77,8 @@ const PLAYBACK_VERBOSE = process.env.PLAYBACK_VERBOSE || 2;
 const RECORDING_VERBOSE = process.env.RECORDING_VERBOSE || 2;
 
 // check env and set the values for the baseargs, else set to defaults, use vars below
-const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 500;
-const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 1316;
+const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 300;
+const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 0;
 
 // setup directorie paths and locations of files
 const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_agent.yaml';
