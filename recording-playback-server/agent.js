@@ -851,7 +851,7 @@ async function spawnHlsToUdpWithCombinedPlaylist(jobId, destinationUrl, vodStart
   );
 
   // Create HTTP server to serve the combined playlist
-  console.log('Starting playlist server...');
+  console.log('Starting playlist server for ', vodPlaylists.length, ' playlists spanning ', vodStartTime, ' to ', vodEndTime);
   const { server, url: playlistUrl } = await createPlaylistServer(combinedPlaylist);
 
   console.log(`Serving combined playlist at: ${playlistUrl}`);

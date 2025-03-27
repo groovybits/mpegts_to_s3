@@ -624,9 +624,14 @@ fn receiver_thread(
                     return;
                 }
                 if vod {
-                    thread::sleep(Duration::from_millis(
-                        ((seg.duration * 1000.0) * 0.80) as u64,
-                    ));
+                    if seg.duration > 0.0 {
+                        thread::sleep(Duration::from_millis(
+                            ((seg.duration * 1000.0) * 0.80) as u64,
+                        ));
+                    } else {
+                        log::warn!("HLStoUDP: ReceiverThread VOD mode: segment duration is 0, sleeping minimally.");
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
                 next_seg_id += 1;
             }
@@ -839,7 +844,8 @@ fn sender_thread(
                                     log::info!("HLStoUDP: UDPThread Sent {} bytes in {} micros, rate {} bps.", chunk.as_ref().len(), elapsed_micros, sent_bps);
                                     if sent_bps > 0 {
                                         frame_time_micros =
-                                            (chunk.as_ref().len() as u64 * 8 * 1000000) / sent_bps as u64;
+                                            (chunk.as_ref().len() as u64 * 8 * 1000000)
+                                                / sent_bps as u64;
                                     }
                                 }
                                 let sleep_time_micros: u64 = (chunk.as_ref().len() / TS_PACKET_SIZE)
@@ -878,7 +884,8 @@ fn sender_thread(
                                             }
                                             total_bytes_sent += chunk.as_ref().len();
                                             let elapsed = last_packet_send_time.elapsed();
-                                            if !vod && elapsed
+                                            if !vod
+                                                && elapsed
                                                     < Duration::from_micros(sleep_time_micros)
                                             {
                                                 let sleep_time =
