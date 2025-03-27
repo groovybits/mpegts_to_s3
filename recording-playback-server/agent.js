@@ -2,9 +2,12 @@
  * agent.js — Recording/Playback API Agent
  * 
  * Environment Variables:
+ * - AGENT_ID: Unique identifier for this agent (default: agent-001)
  * - SERVER_PORT: Port for the server to listen on (default: 3001)
  * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
  * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
+ * - AWS_REGION: AWS region for S3 (default: us-east-1)
+ * - AWS_ACCESS_KEY_ID: Access key for S3 (default: minioadmin)
  * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
  * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
  * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
@@ -50,6 +53,8 @@ const yaml = require('js-yaml');
 // For fetch
 const { env } = require('process');
 
+// Agent ID
+const AGENT_ID = process.env.AGENT_ID || 'agent-001';
 // Server Manager and Agent URL Bases used for fetch calls (same server in this case)
 const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
 const SERVER_PORT = process.env.SERVER_PORT || 3001;
@@ -757,7 +762,7 @@ agentRouter.get('/status', async (req, res) => {
     }
 
     res.json({
-      agentId: 'agent-001',
+      agentId: AGENT_ID,
       status: 'healthy',
       activeRecordings: recRows,
       activePlaybacks: pbRows
@@ -1143,7 +1148,7 @@ app.use('/v1/agent', agentRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
-  console.log(`Recording / Playback Agent API Server version ${serverVersion} AgentURL@${serverUrl}.`);
+  console.log(`Recording / Playback Agent API Server AgentID: [${AGENT_ID}] Version: ${serverVersion} AgentURL: ${serverUrl}`);
   let capture_buffer_size = env.CAPTURE_BUFFER_SIZE || `4193904`;
   let segment_duration_ms = env.SEGMENT_DURATION_MS || `2000`;
   let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;

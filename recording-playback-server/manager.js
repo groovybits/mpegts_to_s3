@@ -2,9 +2,19 @@
  * manager.js — Recording/Playback API Manager
  * 
  * Environment Variables:
+ * - MANAGER_ID: Unique ID for the Manager (default: manager-001)
+ * - SERVER_PROTOCOL: Protocol for the server (default: http)
  * - SERVER_PORT: Port for the server to listen on (default: 3000)
  * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
  * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
+ * - AWS_REGION: Region for the S3 server (default: us-east-1)
+ * - AWS_ACCESS_KEY_ID: Access key for the S3 server (default: minioadmin)
+ * - AWS_SECRET_ACCESS_KEY: Secret key for the S3 server (default: minioadmin)
+ * - AWS_S3_BUCKET: Bucket name for the S3 server (default: hls)
+ * - SWAGGER_FILE: Path to the Swagger file (default: swagger_manager.yaml)
+ * - AGENT_PROTOCOL: Protocol for the Agent server (default: http)
+ * - AGENT_PORT: Port for the Agent server (default: 3001)
+ * - AGENT_HOST: Host for the Agent server (default: 127.0.0.1)
  * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
  * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
  * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
@@ -56,6 +66,9 @@ const { env } = require('process');
  * Agents are basically nodes that run the heavier processes of recording and playback.
  * Managers are nodes that manage the Agents and the recording and playback processes.
  */
+
+// Manager ID
+const MANAGER_ID = process.env.MANAGER_ID || 'manager-001';
 
 // Server Manager and Agent URL Bases used for fetch calls (same server in this case)
 const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
@@ -992,7 +1005,7 @@ app.use('/v1', managerRouter);
 // Start the server
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
-  console.log(`Recording / Playback Manager API Server version ${serverVersion} ManagerURL@${serverUrl} AgentURL@${agentUrl}.`);
+  console.log(`Recording / Playback Manager API Server ManagerID: [${MANAGER_ID}] Version: ${serverVersion} ManagerURL: ${serverUrl} AgentURL: ${agentUrl}`);
   let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
   let minio_root_password = env.MINIO_ROOT_PASSWORD || `minioadmin`;
 
