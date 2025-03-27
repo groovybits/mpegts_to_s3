@@ -1,6 +1,6 @@
-# Recorder and Playback API Server & Process Management (server.js)
+# Recording and Playback API Server
 
-This project includes an API server written in Node.js that manages recording and playback jobs. It uses Express and provides a comprehensive Swagger UI for API documentation.
+This project includes an API server written in Node.js consisting of a Manager and Agent(s) that handle recording and playback jobs using udp-to-hls and hls-to-udp. The Manager/Agent Servers use Express and provides a comprehensive Swagger UI for API documentation.
 
 ## Features
 
@@ -13,43 +13,30 @@ This project includes an API server written in Node.js that manages recording an
 3. **Swagger Documentation**  
 	- Interactive API documentation is available at `/api-docs`.
 
-4. **SQLite Integration**  
-	- Job metadata, including process IDs, is stored in `media_jobs.db` for tracking both active and completed jobs.
+4. **S3 Integration**  
+	- Job metadata, including process IDs, are stored in an S3 bucket for tracking both active and completed jobs.
 
 5. **Containerization**  
-	- The server can be containerized using Docker for easy deployment.
+	- The server is containerized using for easy deployment.
 
-## Setup and Running (Docker without compose file, not recommended)
+## Setup and Running (Container Image without compose file, not recommended)
 
-1. **Build the Docker Image**  
+1. **Build the Images**
+	You need podman and podman-compose installed or substitute with docker and docker-compose. (requires more manual w/out make, read Makefile for commands)
+
 	From the project root, run:
 	```bash
-	docker build -t recording-playback-server .
+	make manager_image && \
+	make agent_image
 	```
 
 2. **Run the Docker Container**  
 	```bash
-	docker run -d -p 3000:3000 --env-file recording-playback-server/.env.example recording-playback-server
+	make compose_build && make run
 	```
 
 3. **Access Swagger UI**
-	Open your browser and navigate to [http://localhost:3000/api-docs](http://localhost:3000/api-docs) to view and test API endpoints.
-
-## Setup and Running (Docker with compose file)
-
-1. **Build the Docker Image**  
-	From the project root, run:
-	```bash
-	docker-compose -f docker-compose_recording_playback_server.yml build
-	```
-
-2. **Run the Docker Container**  
-	```bash
-	docker-compose -f docker-compose_recording_playback_server.yml up -d
-	```
-
-3. **Access Swagger UI**
-	Open your browser and navigate to [http://localhost:3000/api-docs](http://localhost:3000/api-docs) to view and test API endpoints.
+	Open your browser and navigate to [http://localhost:3000/api-docs](http://localhost:3000/api-docs) and [http://localhost:3001/api-docs](http://localhost:3001/api-docs) to view and test API endpoints.
 
 ## Setup and Running (Native Linux/Mac)
 
@@ -81,12 +68,12 @@ This project includes an API server written in Node.js that manages recording an
 	```
 	Launch the API server with:
 	```bash
-	sudo node server.js # Must be root for pcap capture (Linux/Mac) permissions
+	npm run start:manager && npm run start:agent # Must be root for pcap capture (Linux/Mac) permissions
 	```
-	The server listens on port 3000 by default.
+	The manager and agent listen on port 3000 and 3001 by default.
 
 3. **Access Swagger UI**  
-	Open your browser and navigate to [http://localhost:3000/api-docs](http://localhost:3000/api-docs) to view and test API endpoints.
+	Open your browser and navigate to [http://localhost:3000/api-docs](http://localhost:3000/api-docs) or [http://localhost:3001/api-docs](http://localhost:3001/api-docs) to view and test API endpoints.
 
 ## API Endpoints Overview
 
@@ -125,7 +112,7 @@ This project includes an API server written in Node.js that manages recording an
   Jobs with a specified duration are automatically stopped using timeouts, with updates recorded in the SQLite database.
 
 - **Job Tracking:**  
-  Job metadata (including process IDs) is stored in `media_jobs.db` for both manager and agent operations.
+  Job metadata (including process IDs) is stored in S3 for both manager and agent operations.
 
 ---
 
@@ -136,8 +123,8 @@ This project includes an API server written in Node.js that manages recording an
   - Install libpcap for packet capture.
   - build ../bin/udp-to-hls and ../bin/hls-to-udp binaries for recording and playback.
 - **Ports:**  
-  - Open ports 3000 (API server) and 9000 (MinIO/S3).
+  - Open ports 3000, 3001 (API server) and 9000 (MinIO/S3).
 - **Node.js:**  
-  - Required for running the API server (`server.js`).
+  - Required for running the API server (`manager.js and agent.js`).
 
 ---

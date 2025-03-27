@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  ######################################
+  # MinIO S3-Compatible Service
+  ######################################
+  s3minio:
+    image: "quay.io/minio/minio:latest"
+    network_mode: "host"
+    hostname: "s3minio"
+    container_name: "s3minio"
+    env_file: # Change this to your own .env file
+      - "configs/minio.env" # Copy minio.env to minio_custom.env and fill in the values
+    volumes:
+      - "./data:/data:rw"
+    command: >
+      server /data
+      --console-address ":9001"
+      --anonymous --json --quiet
+      --certs-dir /root/.minio/certs
+    # This ensures the Rust app does not start
+    # before MinIO is ready (simple dependency).
+    healthcheck:
+      test: ["CMD", "curl", "-f", "127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+

@@ -1,8 +1,7 @@
 ## MPegTS to S3 TODO
 
 ### CRITICAL BUGS
-- [ ] Smoother has IAT spikes and sometimes CC errors
-- [ ] Smoother can eat ram over time beyond reasonable amounts
+- [ ] Smoother can have some bursts every few minutes potentially 
 
 ### NON-CRITICAL BUGS
 - [ ] Timing output could be given higher accuracy
@@ -14,8 +13,19 @@
 - [ ] Add more testing and wiki documentation
 - [X] Live mode vs. VOD mode for input/output buffering expectations
 - [X] Give start/stop in/out edit points against walltime for retreival
-- [ ] inner playlists for HLS style multi-stream urls
+- [X] inner playlists for HLS style multi-stream urls
 - [ ] fix to allow  ?.. arg flags to m3u8 urls
+
+### Swagger API Implementation recording-playback-server TASKS
+- [ ] Add start/end time support for playback in HLS
+- [ ] Add Authentication Bearers handling to API for outh2 etc.
+- [ ] Implement attaching Pools of S3 bucket/creds to each API call properly
+- [ ] Implement filling a Pool with Assets as they are created.
+- [ ] Implement a way to get a list of all assets in a pool
+- [ ] Add to and advance the stats and admin API endpoints.
+- [ ] Work out and test Manager/Agent configurations separated across servers.
+- [ ] Implement multiple Agents per Manager and general scaling, queueing, etc.
+- [ ] Add Unit Tests for each API endpoint and all the above features.
 
 ---
 January 2025 - @bitbytebit 

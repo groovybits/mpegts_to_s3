@@ -1,23 +1,25 @@
 {
-  "name": "recording-playback-mock",
-  "version": "1.0.0",
-  "main": "index.js",
+  "name": "recording-playback-api",
+  "version": "1.1.0",
   "scripts": {
+    "start:agent": "node agent.js",
+    "start:manager": "node manager.js",
+    "start": " echo \"Error: you must specify either start:agent or start:manager\" && exit 1",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": ["recording", "playback", "agent", "manager"],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "System for recording and playback with agent and manager components",
   "dependencies": {
-    "child_process": "^1.0.2",
+    "@aws-sdk/client-s3": "^3.775.0",
     "express": "^4.21.2",
-    "fetch": "^1.1.0",
-    "fs": "^0.0.1-security",
     "js-yaml": "^4.1.0",
     "node-fetch": "^2.7.0",
     "sqlite3": "^5.1.7",
     "swagger-ui-express": "^5.0.1",
     "uuid": "^11.1.0"
+  },
+  "devDependencies": {
   }
 }
