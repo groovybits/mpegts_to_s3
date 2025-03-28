@@ -1,31 +1,73 @@
 # UDP to HLS MpegTS Capture to Cloud Storage
 
-UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can be signed for secure playback. It runs diskless and doesn't store segments locally, only in memory and upload to S3/MinIO. 
+UDP to HLS enables capturing of MPEG-TS UDP multicast streams, segmenting them into time-based HLS segments, creating `.m3u8` playlists, and uploading them to MinIO or S3 storage. The segments and playlists can be signed for secure playback. It runs diskless and doesn't store segments locally, only in memory and upload to S3/MinIO. It has an [API](recording-playback-server/API.md) for Recording, Playback and Storage Pool management. The API server is a Node.js application that manages the recording and playback jobs, storage pools, and assets. It communicates with the agent to start and stop recording/playback jobs.
 
 There are container image build and compose options using Podman/Docker + *-Compose that set up a local MinIO server and an API Server consisting of a Manager and an Agent that runs the udp-to-hls and hls-to-udp when requested. See  [hls-to-udp](hls-to-udp/README.md) and the API Server in Node.js [recording-playback-server](recording-playback-server).
 
 ```mermaid
 graph LR
-    A["UDP<br/>Multicast<br/>Stream"] -->|"Captured via libpcap"| B["Capture<br/>Module"]
-    B -->|"MPEG-TS"| C["Segmentation<br/>Process"]
-    C -->|"Segment"| D["HLS Segments<br/>and Playlist"]
-    D -->|"Upload"| E["S3/MinIO<br/>Upload"]
-    E -->|"URLs"| F["HLS<br/>Playlist"]
-    F -->|"HTTP HLS Server"| G["HTTP<br/>Download"]
-    G -->|"MpegTS UDP"| H["MpegTS UDP<br/>Multicast<br/>Stream"]
-    H ~~~ Z1[" "]
-    Z1 ~~~ Z2[" "]
+    subgraph "Input/Output"
+        UDPIN["UDP<br/>Multicast<br/>Source"]
+        UDPOUT["UDP<br/>Multicast<br/>Output"]
+    end
 
-    style A fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
-    style B fill:#b3ffb3,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
-    style C fill:#ffb3ff,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
-    style D fill:#ffcc80,stroke:#995200,stroke-width:2px,color:#663300,font-weight:bold
-    style E fill:#ff99cc,stroke:#cc0066,stroke-width:2px,color:#660033,font-weight:bold
-    style F fill:#e6b3e6,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
-    style G fill:#b3b3e6,stroke:#000066,stroke-width:2px,color:#000033,font-weight:bold
-    style H fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
-    style Z1 fill:none,stroke:none,color:transparent
-    style Z2 fill:none,stroke:none,color:transparent
+    subgraph "Manager API (Port 3000)"
+        MAPI["Manager API<br/>Server"]
+        REC["Recording<br/>Jobs"]
+        PB["Playback<br/>Jobs"]
+        POOL["Storage<br/>Pools"]
+        ASSET["Assets<br/>(Recordings)"]
+        
+        MAPI --> |"Creates/Manages"| REC
+        MAPI --> |"Creates/Manages"| PB
+        MAPI --> |"Manages"| POOL
+        POOL --> |"Contains"| ASSET
+    end
+
+    subgraph "Storage"
+        S3["S3/MinIO<br/>Buckets"]
+        META["Job Metadata<br/>(JSON in S3)"]
+    end
+
+    subgraph "Agent API (Port 3001)"
+        AAPI["Agent API<br/>Server"]
+        UHL["udp-to-hls<br/>Process"]
+        HLU["hls-to-udp<br/>Process"]
+        
+        AAPI --> |"Spawns/Monitors"| UHL
+        AAPI --> |"Spawns/Monitors"| HLU
+    end
+
+    %% Recording Flow
+    UDPIN --> |"Captured via libpcap"| UHL
+    UHL --> |"MPEG-TS Segments & m3u8"| S3
+    
+    %% Playback Flow
+    S3 --> |"Retrieves Segments & Playlist"| HLU
+    HLU --> |"Timed Playback"| UDPOUT
+    
+    %% Job Control
+    MAPI --> |"Forwards Requests"| AAPI
+    MAPI --> |"Stores Job Info"| META
+    AAPI --> |"Reports Status"| MAPI
+    AAPI --> |"Stores Process IDs"| META
+    
+    REC -.- |"Initiates"| MAPI
+    PB -.- |"Initiates"| MAPI
+    ASSET -.- |"Used by"| PB
+    
+    style UDPIN fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
+    style UDPOUT fill:#b3e0ff,stroke:#0066cc,stroke-width:2px,color:#003366,font-weight:bold
+    style UHL fill:#b3ffb3,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
+    style HLU fill:#b3b3e6,stroke:#000066,stroke-width:2px,color:#000033,font-weight:bold
+    style S3 fill:#ff99cc,stroke:#cc0066,stroke-width:2px,color:#660033,font-weight:bold
+    style META fill:#e6ccff,stroke:#3300cc,stroke-width:2px,color:#1a0066,font-weight:bold
+    style MAPI fill:#e6b3e6,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
+    style AAPI fill:#ffb3ff,stroke:#660066,stroke-width:2px,color:#330033,font-weight:bold
+    style REC fill:#ccffcc,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
+    style PB fill:#ccffcc,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
+    style POOL fill:#ccffcc,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
+    style ASSET fill:#ccffcc,stroke:#006600,stroke-width:2px,color:#003300,font-weight:bold
 ```
 
 ---
