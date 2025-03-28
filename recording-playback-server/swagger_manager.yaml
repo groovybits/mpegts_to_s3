@@ -426,6 +426,12 @@ paths:
                     assetId:
                       type: string
                       description: "Globally unique asset identifier (e.g., POOLID-ASSETID)"
+                    recordingId:
+                      type: string
+                      description: "Unique identifier of the recording job"
+                    destinationProfile:
+                      type: string
+                      description: "Unique identifier of the storage pool"
                     metadata:
                       type: object
                       description: "Arbitrary metadata associated with the asset"
@@ -496,14 +502,19 @@ paths:
                 properties:
                   assetId:
                     type: string
-                  poolId:
+                  recordingId:
                     type: string
+                    description: "Unique identifier of the recording job"
+                  destinationProfile:
+                    type: string
+                    description: "Unique identifier of the storage pool"
                   metadata:
                     type: object
                     description: "Additional asset details (e.g., bitrate, size)"
                 example:
                   assetId: "pool-67890-asset-001"
-                  poolId: "pool-67890"
+                  recordingId: "rec-12345"
+                  sourceProfile: "pool-67890"
                   metadata:
                     bitrate: 1500
                     size: 10485760

@@ -36,9 +36,9 @@ use tokio::sync::Mutex;
 
 fn get_segment_duration_ms() -> f64 {
     std::env::var("SEGMENT_DURATION_MS")
-        .unwrap_or_else(|_| "2000.0".to_string())
+        .unwrap_or_else(|_| "500.0".to_string())
         .parse()
-        .unwrap_or(2000.0)
+        .unwrap_or(500.0)
 }
 
 fn get_max_segment_size_bytes() -> usize {
@@ -95,9 +95,9 @@ fn get_snaplen() -> i32 {
 
 fn get_buffer_size() -> i32 {
     std::env::var("CAPTURE_BUFFER_SIZE")
-        .unwrap_or_else(|_| "4193904".to_string())
+        .unwrap_or_else(|_| "8387808".to_string())
         .parse()
-        .unwrap_or(4193904)
+        .unwrap_or(8387808)
 }
 
 fn get_use_estimated_duration() -> bool {
@@ -201,7 +201,7 @@ impl HourlyIndexCreator {
             writeln!(file, "#EXTM3U")?;
             writeln!(file, "#EXT-X-VERSION:3")?;
 
-            let target_duration_secs = if let Some(vec) = entries {
+            let mut target_duration_secs = if let Some(vec) = entries {
                 let max_seg = vec
                     .iter()
                     .map(|e| e.duration.ceil() as u64)
@@ -211,6 +211,10 @@ impl HourlyIndexCreator {
             } else {
                 get_segment_duration_ms() as u64 / 1000
             };
+            if target_duration_secs < 1 {
+                warn!("Target duration is less than 1 second, setting to 1 second");
+                target_duration_secs = 1;
+            }
             writeln!(file, "#EXT-X-TARGETDURATION:{}", target_duration_secs)?;
 
             let media_seq = if let Some(vec) = entries {
@@ -227,7 +231,12 @@ impl HourlyIndexCreator {
                     for line in &entry.custom_lines {
                         writeln!(file, "{}", line)?;
                     }
-                    writeln!(file, "#EXTINF:{:.6},", entry.duration)?;
+                    let segment_duration = if entry.duration < 0.1 {
+                        0.1
+                    } else {
+                        entry.duration
+                    };
+                    writeln!(file, "#EXTINF:{:.6},", segment_duration)?;
                     writeln!(file, "{}", entry.signed_url)?;
                 }
             }
@@ -588,7 +597,7 @@ impl ManualSegmenter {
             }
         }
 
-        let fallback_time_expired = elapsed_wall >= desired_secs * 1.5;
+        let fallback_time_expired = elapsed_wall >= desired_secs * 1.2;
 
         if elapsed_wall >= desired_secs || enough_bytes_based_on_bitrate || fallback_time_expired {
             info!(
@@ -605,7 +614,7 @@ impl ManualSegmenter {
     }
 
     async fn close_current_segment_file(&mut self) -> std::io::Result<()> {
-        let mut real_elapsed = if get_use_estimated_duration() {
+        let real_elapsed = if get_use_estimated_duration() {
             self.segment_open_time
                 .map(|st| Instant::now().duration_since(st).as_secs_f64())
                 .unwrap_or(0.0)
@@ -613,8 +622,6 @@ impl ManualSegmenter {
             let d = get_segment_duration_ms() as f64;
             d / 1000.0
         };
-
-        real_elapsed = real_elapsed.ceil();
 
         debug!(
             "Closing segment {}, measured wall-clock duration={:.3}s",
@@ -1172,7 +1179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .with_hourly_index_creator(Some(hourly_index_creator.clone())),
     );
 
-    // Diskless consumer thread (if needed)
+    // Diskless consumer thread
     let diskless_consumer = {
         if let Some(_seg_ref) = &manual_segmenter {
             let buffer_ref = _seg_ref.diskless_buffer.clone();

@@ -38,7 +38,7 @@
  * 
  ****************************************************/
 
-const serverVersion = '1.1.1';
+const serverVersion = '1.1.2';
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
@@ -70,20 +70,26 @@ const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
 const s3Region = process.env.AWS_REGION || 'us-east-1';
 const s3AccessKeyDB = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
 const s3SecretKeyDB = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
-const s3BucketDB = process.env.AWS_S3_BUCKET || 'hls';
+const s3BucketDB = process.env.AWS_S3_BUCKET || 'media';
 
 // Runtime verbosity levels of Rust programs, 0-4: error, warn, info, debug, trace
 const PLAYBACK_VERBOSE = process.env.PLAYBACK_VERBOSE || 2;
 const RECORDING_VERBOSE = process.env.RECORDING_VERBOSE || 2;
 
 // check env and set the values for the baseargs, else set to defaults, use vars below
-const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 500;
-const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 1316;
+const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 100;
+const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 0;
 
 // setup directorie paths and locations of files
 const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_agent.yaml';
 const ORIGINAL_DIR = process.cwd() + '/';
 const HLS_DIR = process.env.HLS_DIR || '';
+
+const RECIEVER_POLL_MS = process.env.RECIEVER_POLL_MS || 10; // Polling interval for hls-to-udp
+
+// Queue sizes for hls-to-udp
+const SEGMENT_QUEUE_SIZE = process.env.SEGMENT_QUEUE_SIZE || 1;
+const UDP_QUEUE_SIZE = process.env.UDP_QUEUE_SIZE || 1;
 
 // Add ../bin/ to PATH env variable if it exists
 if (fs.existsSync('../bin/')) {
@@ -670,16 +676,22 @@ async function fetchPlaylist(playlistUrl) {
               absoluteTime = new Date(line.substring(25).trim());
             }
             else if (line.startsWith('#EXTINF:')) {
-              const durationMatch = line.match(/#EXTINF:([\d.]+)/);
+              // format #EXTINF:0.285717,
+              const durationMatch = line.match(/#EXTINF:([\d.]+),/);
               if (durationMatch) {
-                currentSegment = {
-                  duration: parseFloat(durationMatch[1]),
-                  extinf: line,
-                  absoluteTime: absoluteTime ? new Date(absoluteTime) : null
-                };
-                if (absoluteTime) {
-                  absoluteTime = new Date(absoluteTime.getTime() +
-                    (parseFloat(durationMatch[1]) * 1000));
+                const duration = parseFloat(durationMatch[1]);
+                if (isNaN(duration)) {
+                  console.warn(`Invalid duration found: ${line}`);
+                } else {
+                  currentSegment = {
+                    duration,
+                    extinf: line,
+                    absoluteTime: absoluteTime ? new Date(absoluteTime) : null
+                  };
+                  if (absoluteTime) {
+                    absoluteTime = new Date(absoluteTime.getTime() +
+                      (duration * 1000));
+                  }
                 }
               }
             }
@@ -749,10 +761,17 @@ async function combineAndTrimPlaylists(playlistUrls, startTime, endTime) {
       });
     }
 
-    // Calculate max duration for EXT-X-TARGETDURATION
-    const maxDuration = Math.ceil(
-      Math.max(...allSegments.map(s => s.duration), 6)
-    );
+    // Max duration calculation
+    let maxDuration = 1; // default safe fallback
+    for (let i = 0, len = allSegments.length; i < len; i++) {
+      const duration = Number(allSegments[i].duration);
+      if (!isNaN(duration) && duration > maxDuration) {
+        maxDuration = duration;
+      }
+    }
+    maxDuration = Math.ceil(maxDuration);
+
+    console.log('Found Playlist Max duration:', maxDuration);
 
     // Build the combined playlist
     let combinedContent = '#EXTM3U\n';
@@ -851,7 +870,7 @@ async function spawnHlsToUdpWithCombinedPlaylist(jobId, destinationUrl, vodStart
   );
 
   // Create HTTP server to serve the combined playlist
-  console.log('Starting playlist server...');
+  console.log('Starting playlist server for ', vodPlaylists.length, ' playlists spanning ', vodStartTime, ' to ', vodEndTime);
   const { server, url: playlistUrl } = await createPlaylistServer(combinedPlaylist);
 
   console.log(`Serving combined playlist at: ${playlistUrl}`);
@@ -862,9 +881,12 @@ async function spawnHlsToUdpWithCombinedPlaylist(jobId, destinationUrl, vodStart
     '--use-smoother',
     '-l', `${SMOOTHER_LATENCY}`,
     '-b', `${UDP_BUFFER_BYTES}`,
+    '-p', `${RECIEVER_POLL_MS}`,
     '-v', `${PLAYBACK_VERBOSE}`,
     '-u', playlistUrl,
-    '-o', `${ip}:${port}`
+    '-o', `${ip}:${port}`,
+    '-q', `${SEGMENT_QUEUE_SIZE}`,
+    '-z', `${UDP_QUEUE_SIZE}`
   ];
 
   console.log(`Spawning hls-to-udp with combined playlist => ${baseArgs.join(' ')}`);
