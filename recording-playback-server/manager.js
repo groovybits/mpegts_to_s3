@@ -446,7 +446,28 @@ managerRouter.post('/recordings', async (req, res) => {
         })
       });
 
-      const agentData = await agentResp.json().catch(() => ({}));
+      await agentResp.json().catch(() => ({}));
+
+      const assetId = `asset-${uuidv4()}`;
+
+      try {
+        const assetData = {
+          assetId,
+          recordingId,
+          destinationProfile,
+          metadata: JSON.stringify(recordingData || {})
+        };
+
+        await db.s3Client.send(new PutObjectCommand({
+          Bucket: db.bucket,
+          Key: `assets/${assetId}.json`,
+          Body: JSON.stringify(assetData)
+        }));
+      } catch (err) {
+        console.error('Error creating asset:', err);
+        res.status(500).json({ error: err.message });
+      }
+
       return res.status(201).json({ recordingId });
     } catch (err2) {
       console.error('Error calling Agent endpoint:', err2);
@@ -635,6 +656,7 @@ managerRouter.get('/pools/:poolId/assets', async (req, res) => {
   const { poolId } = req.params;
 
   try {
+    // List all objects for this table
     const listParams = {
       Bucket: db.bucket,
       Prefix: 'assets/',
@@ -656,7 +678,7 @@ managerRouter.get('/pools/:poolId/assets', async (req, res) => {
           const dataStr = await streamToString(itemResponse.Body);
           const data = JSON.parse(dataStr);
 
-          if (data.poolId === poolId) {
+          if (data.destinationProfile === poolId) {
             items.push(data);
           }
         } catch (err) {
@@ -687,7 +709,7 @@ managerRouter.delete('/pools/:poolId/assets', async (req, res) => {
       const dataStr = await streamToString(response.Body);
       const data = JSON.parse(dataStr);
 
-      if (data.poolId !== poolId) {
+      if (data.destinationProfile !== poolId) {
         return res.status(404).json({ message: 'Asset not found in this pool' });
       }
 
