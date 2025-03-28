@@ -1321,7 +1321,7 @@ fn main() -> Result<()> {
             Arg::new("poll_ms")
                 .short('p')
                 .long("poll-ms")
-                .default_value("500")
+                .default_value("50")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -1488,7 +1488,7 @@ fn main() -> Result<()> {
         .get_one::<String>("poll_ms")
         .unwrap()
         .parse::<u64>()
-        .unwrap_or(500);
+        .unwrap_or(50);
     let hist_cap = matches
         .get_one::<String>("history_size")
         .unwrap()
