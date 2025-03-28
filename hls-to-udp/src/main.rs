@@ -664,7 +664,7 @@ fn receiver_thread(
 }
 
 fn get_max_buffer_bytes() -> usize {
-    let max_buffer_bytes = std::env::var("MAX_BUFFER_BYTES")
+    let max_buffer_bytes = std::env::var("MAX_BUFFER_MBYTES")
         .unwrap_or_else(|_| "32".to_string())
         .parse()
         .unwrap_or(32);
@@ -778,7 +778,7 @@ fn sender_thread(
         let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         let max_block_ms = 10000;
-        let timeout_interval = Duration::from_millis(3000);
+        let timeout_interval = Duration::from_millis(300000);
         let mut buffer: VecDeque<u8> = VecDeque::with_capacity(1024 * 1024 * 10);
         let min_packet_size = min_pkt_size as usize;
         let max_packet_size = pkt_size as usize;
@@ -800,7 +800,7 @@ fn sender_thread(
                             break;
                         }
                         if buffer.len() + data.len() > buffer.capacity() {
-                            log::warn!("HLStoUDP: UDPThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)", buffer.len(), data.len());
+                            log::error!("HLStoUDP: UDPThread Buffer full, dropping data. (buffer={} bytes, data={} bytes)", buffer.len(), data.len());
                             continue;
                         }
                         buffer.extend(data.iter().copied());
