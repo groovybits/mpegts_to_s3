@@ -1179,7 +1179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .with_hourly_index_creator(Some(hourly_index_creator.clone())),
     );
 
-    // Diskless consumer thread (if needed)
+    // Diskless consumer thread
     let diskless_consumer = {
         if let Some(_seg_ref) = &manual_segmenter {
             let buffer_ref = _seg_ref.diskless_buffer.clone();

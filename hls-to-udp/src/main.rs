@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
@@ -21,6 +21,13 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 use chrono::NaiveDateTime;
+
+fn get_segment_buffer_percentage() -> f64 {
+    std::env::var("SEGMENT_BUFFER_PERCENTAGE")
+        .unwrap_or_else(|_| "1.0".to_string())
+        .parse()
+        .unwrap_or(1.0)
+}
 
 #[derive(Debug)]
 struct DownloadedSegment {
@@ -84,6 +91,7 @@ fn receiver_thread(
     tx: SyncSender<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
+    buffer_bytes: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let client = Client::new();
@@ -167,6 +175,11 @@ fn receiver_thread(
                             };
                             // For each segment in the hourly playlist, extract the offset.
                             for seg in media_pl.segments {
+                                while buffer_bytes.load(Ordering::SeqCst) >= get_max_buffer_bytes()
+                                {
+                                    log::warn!("Receiver buffer full. Throttling fetch...");
+                                    thread::sleep(Duration::from_millis(100));
+                                }
                                 if let Some(filename) = seg.uri.split('/').last() {
                                     if filename.starts_with("segment_") {
                                         // Expected format: "segment_YYYYMMDD-HHMMSS__INDEX.ts"
@@ -300,7 +313,7 @@ fn receiver_thread(
                     return;
                 }
                 thread::sleep(Duration::from_millis(
-                    ((seg_duration * 1000.0) * 0.90) as u64,
+                    ((seg_duration as f64 * 1000.0) * get_segment_buffer_percentage()) as u64,
                 ));
             }
             log::warn!(
@@ -626,7 +639,8 @@ fn receiver_thread(
                 if vod {
                     if seg.duration > 0.0 {
                         thread::sleep(Duration::from_millis(
-                            ((seg.duration * 1000.0) * 0.80) as u64,
+                            ((seg.duration as f64 * 1000.0) * get_segment_buffer_percentage())
+                                as u64,
                         ));
                     } else {
                         log::warn!("HLStoUDP: ReceiverThread VOD mode: segment duration is 0, sleeping minimally.");
@@ -649,6 +663,14 @@ fn receiver_thread(
     })
 }
 
+fn get_max_buffer_bytes() -> usize {
+    let max_buffer_bytes = std::env::var("MAX_BUFFER_BYTES")
+        .unwrap_or_else(|_| "32".to_string())
+        .parse()
+        .unwrap_or(32);
+    max_buffer_bytes * 1024 * 1024 // default is 32 MB
+}
+
 fn sender_thread(
     udp_addr: String,
     latency: i32,
@@ -666,6 +688,7 @@ fn sender_thread(
     rx: mpsc::Receiver<DownloadedSegment>,
     shutdown_flag: Arc<AtomicBool>,
     tx_shutdown: SyncSender<()>,
+    buffer_bytes: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         #[cfg(not(feature = "smoother"))]
@@ -882,6 +905,7 @@ fn sender_thread(
                                                     }
                                                 }
                                             }
+                                            last_packet_send_time = Instant::now();
                                             total_bytes_sent += chunk.as_ref().len();
                                             let elapsed = last_packet_send_time.elapsed();
                                             if !vod
@@ -893,19 +917,8 @@ fn sender_thread(
                                                         - elapsed;
                                                 thread::sleep(sleep_time);
                                             }
-                                            last_packet_send_time = Instant::now();
                                             break;
                                         }
-                                        total_bytes_sent += chunk.as_ref().len();
-                                        let elapsed = last_packet_send_time.elapsed();
-                                        if !vod
-                                            && elapsed < Duration::from_micros(sleep_time_micros)
-                                        {
-                                            let sleep_time =
-                                                Duration::from_micros(sleep_time_micros) - elapsed;
-                                            thread::sleep(sleep_time);
-                                        }
-                                        last_packet_send_time = Instant::now();
                                         break;
                                     }
                                     Err(e) => {
@@ -1014,10 +1027,8 @@ fn sender_thread(
                 seg.duration,
                 seg.uri
             );
-            if shutdown_flag.load(Ordering::SeqCst) {
-                log::warn!("HLStoUDP: SenderThread Shutdown flag set, exiting.");
-                break;
-            }
+            let segment_size = seg.data.len();
+            buffer_bytes.fetch_add(segment_size, Ordering::SeqCst); // increment immediately
 
             #[cfg(feature = "smoother")]
             if pcr_pid == 0 && use_smoother {
@@ -1059,12 +1070,41 @@ fn sender_thread(
             let bytes_seg = Bytes::from(seg.data);
             buffer.push_back((bytes_seg, 0));
 
+            // New explicit buffer control:
+            while total_available(&buffer) >= get_max_buffer_bytes() {
+                log::warn!(
+                    "HLStoUDP: SenderThread buffer exceeds {} MB. Throttling receiver...",
+                    get_max_buffer_bytes() / 1024 / 1024
+                );
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    log::warn!("HLStoUDP: SenderThread Shutdown flag set, exiting.");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            if shutdown_flag.load(Ordering::SeqCst) {
+                log::warn!("HLStoUDP: SenderThread Shutdown flag set, exiting.");
+                break;
+            }
+
             while (pcr_pid > 0 || !use_smoother) && total_available(&buffer) >= min_packet_size {
-                if let Some((first_seg, ref mut offset)) = buffer.front_mut() {
-                    if first_seg.len() - *offset >= min_packet_size {
+                // Determine if the first segment has enough bytes.
+                let has_enough = {
+                    if let Some((first_seg, ref mut offset)) = buffer.front_mut() {
+                        first_seg.len() - *offset >= min_packet_size
+                    } else {
+                        false
+                    }
+                };
+                if has_enough {
+                    // Reborrow for branch 1.
+                    if let Some((first_seg, ref mut offset)) = buffer.front_mut() {
                         let ts_packet = first_seg.slice(*offset..*offset + min_packet_size);
                         *offset += min_packet_size;
                         if *offset == first_seg.len() {
+                            let bytes_available = first_seg.len() - *offset;
+                            let send_bytes = bytes_available.min(min_packet_size);
+                            buffer_bytes.fetch_sub(send_bytes, Ordering::SeqCst); // decrement after sending
                             buffer.pop_front();
                         }
                         if !use_smoother {
@@ -1099,53 +1139,58 @@ fn sender_thread(
                                 }
                             }
                         }
-                    } else {
-                        let mut temp = Vec::with_capacity(min_packet_size);
-                        let mut remaining = min_packet_size;
-                        while remaining > 0 {
-                            if let Some((seg, ref mut seg_offset)) = buffer.front_mut() {
-                                let available = seg.len() - *seg_offset;
-                                let to_take = available.min(remaining);
-                                temp.extend_from_slice(&seg[*seg_offset..*seg_offset + to_take]);
-                                *seg_offset += to_take;
-                                remaining -= to_take;
-                                if *seg_offset == seg.len() {
-                                    buffer.pop_front();
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        let ts_packet = Bytes::from(temp);
-                        if !use_smoother {
-                            if let Err(e) = udp_tx.send(ts_packet.clone()) {
-                                log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
+                    }
+                } else {
+                    // Outer borrow dropped here before entering the accumulation loop.
+                    let mut temp = Vec::with_capacity(min_packet_size);
+                    let mut remaining = min_packet_size;
+                    while remaining > 0 {
+                        if let Some((seg, ref mut seg_offset)) = buffer.front_mut() {
+                            let available = seg.len() - *seg_offset;
+                            let to_take = available.min(remaining);
+                            temp.extend_from_slice(&seg[*seg_offset..*seg_offset + to_take]);
+                            *seg_offset += to_take;
+                            remaining -= to_take;
+                            if *seg_offset == seg.len() {
+                                // Changed: Use inner borrow variables instead of outer ones.
+                                let bytes_available = seg.len() - *seg_offset;
+                                let send_bytes = bytes_available.min(min_packet_size);
+                                buffer_bytes.fetch_sub(send_bytes, Ordering::SeqCst); // decrement after sending
+                                buffer.pop_front();
                             }
                         } else {
-                            #[cfg(feature = "smoother")]
-                            {
-                                if smoother.is_none() {
-                                    let smoother_callback = {
-                                        let cb = udp_callback_arc.clone();
-                                        move |v: Vec<u8>| {
-                                            (cb)(v);
-                                        }
-                                    };
-                                    smoother = Some(PcrSmoother::new(
-                                        pcr_pid,
-                                        smoother_buffers,
-                                        max_packet_size as i32,
-                                        latency,
-                                        Box::new(smoother_callback),
-                                    ));
-                                }
-                                if let Some(ref mut s) = smoother {
-                                    if let Err(e) = s.write(ts_packet.as_ref()) {
-                                        log::error!(
-                                            "HLStoUDP: SenderThread Smoother write error: {}",
-                                            e
-                                        );
+                            break;
+                        }
+                    }
+                    let ts_packet = Bytes::from(temp);
+                    if !use_smoother {
+                        if let Err(e) = udp_tx.send(ts_packet.clone()) {
+                            log::error!("HLStoUDP: SenderThread UDP send error: {}", e);
+                        }
+                    } else {
+                        #[cfg(feature = "smoother")]
+                        {
+                            if smoother.is_none() {
+                                let smoother_callback = {
+                                    let cb = udp_callback_arc.clone();
+                                    move |v: Vec<u8>| {
+                                        (cb)(v);
                                     }
+                                };
+                                smoother = Some(PcrSmoother::new(
+                                    pcr_pid,
+                                    smoother_buffers,
+                                    max_packet_size as i32,
+                                    latency,
+                                    Box::new(smoother_callback),
+                                ));
+                            }
+                            if let Some(ref mut s) = smoother {
+                                if let Err(e) = s.write(ts_packet.as_ref()) {
+                                    log::error!(
+                                        "HLStoUDP: SenderThread Smoother write error: {}",
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -1180,6 +1225,8 @@ fn get_version() -> &'static str {
 }
 
 fn main() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let buffer_bytes = Arc::new(AtomicUsize::new(0));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let mut ctrl_counter = 0;
     ctrlc::set_handler({
@@ -1523,6 +1570,7 @@ fn main() -> Result<()> {
         tx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
+        buffer_bytes.clone(),
     );
     let sender_handle = sender_thread(
         udp_out,
@@ -1541,6 +1589,7 @@ fn main() -> Result<()> {
         rx,
         shutdown_flag.clone(),
         tx_shutdown.clone(),
+        buffer_bytes.clone(),
     );
 
     loop {

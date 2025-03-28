@@ -86,7 +86,7 @@ const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
 const s3Region = process.env.AWS_REGION || 'us-east-1';
 const s3AccessKeyDB = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
 const s3SecretKeyDB = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
-const s3BucketDB = process.env.AWS_S3_BUCKET || 'hls';
+const s3BucketDB = process.env.AWS_S3_BUCKET || 'media';
 
 // setup directorie paths and locations of files
 const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_manager.yaml';
