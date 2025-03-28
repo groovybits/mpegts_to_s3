@@ -85,6 +85,8 @@ const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_agent.yaml';
 const ORIGINAL_DIR = process.cwd() + '/';
 const HLS_DIR = process.env.HLS_DIR || '';
 
+const RECIEVER_POLL_MS = process.env.RECIEVER_POLL_MS || 10; // Polling interval for hls-to-udp
+
 // Queue sizes for hls-to-udp
 const SEGMENT_QUEUE_SIZE = process.env.SEGMENT_QUEUE_SIZE || 1;
 const UDP_QUEUE_SIZE = process.env.UDP_QUEUE_SIZE || 1;
@@ -879,6 +881,7 @@ async function spawnHlsToUdpWithCombinedPlaylist(jobId, destinationUrl, vodStart
     '--use-smoother',
     '-l', `${SMOOTHER_LATENCY}`,
     '-b', `${UDP_BUFFER_BYTES}`,
+    '-p', `${RECIEVER_POLL_MS}`,
     '-v', `${PLAYBACK_VERBOSE}`,
     '-u', playlistUrl,
     '-o', `${ip}:${port}`,
