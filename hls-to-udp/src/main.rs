@@ -678,7 +678,6 @@ fn sender_thread(
     pkt_size: i32,
     min_pkt_size: i32,
     smoother_buffers: i32,
-    smoother_max_bytes: usize,
     udp_queue_size: usize,
     udp_send_buffer: usize,
     use_smoother: bool,
@@ -699,8 +698,8 @@ fn sender_thread(
         let mut total_bytes_sent = 0usize;
 
         log::info!(
-            "SenderThread: Starting UDP sender thread with input values vod={} udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, smoother_max_bytes={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
-            vod, udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, smoother_max_bytes, udp_queue_size, udp_send_buffer, use_smoother
+            "SenderThread: Starting UDP sender thread with input values vod={} udp_addr={}, latency={}, pcr_pid={}, pkt_size={}, smoother_buffers={}, udp_queue_size={}, udp_send_buffer={}, use_smoother={}",
+            vod, udp_addr, latency, pcr_pid, pkt_size, smoother_buffers, udp_queue_size, udp_send_buffer, use_smoother
         );
 
         let socket = match socket2::Socket::new(
@@ -1393,12 +1392,6 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("max_bytes_threshold")
-                .long("max-bytes-threshold")
-                .help("Maximum bytes in smoother queue before reset")
-                .default_value("500_000_000"),
-        )
-        .arg(
             Arg::new("quiet")
                 .long("quiet")
                 .help("Suppress all non error output")
@@ -1433,11 +1426,6 @@ fn main() -> Result<()> {
     let mut use_smoother = matches.get_flag("use_smoother");
     #[cfg(feature = "smoother")]
     let use_smoother = matches.get_flag("use_smoother");
-    let max_bytes_threshold = matches
-        .get_one::<String>("max_bytes_threshold")
-        .unwrap()
-        .parse::<usize>()
-        .unwrap_or(500_000_000);
     let udp_queue_size = matches
         .get_one::<String>("udp_queue_size")
         .unwrap()
@@ -1579,7 +1567,6 @@ fn main() -> Result<()> {
         pkt_size,
         min_pkt_size,
         smoother_buffers,
-        max_bytes_threshold,
         udp_queue_size,
         udp_send_buffer,
         use_smoother,
