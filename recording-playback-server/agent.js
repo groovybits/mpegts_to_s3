@@ -57,7 +57,7 @@ import swaggerUi from 'swagger-ui-express';
 import yaml from 'js-yaml';
 import { env } from 'process';
 
-import S3Database from './S3Database.js'; // Import the S3Database class
+import S3Database, { getPoolCredentials, streamToString } from './S3Database.js'; // Import the S3Database class
 
 // Agent ID
 const AGENT_ID = process.env.AGENT_ID || 'agent-001';
@@ -96,74 +96,6 @@ const UDP_QUEUE_SIZE = process.env.UDP_QUEUE_SIZE || 1;
 // Add ../bin/ to PATH env variable if it exists
 if (fs.existsSync('../bin/')) {
   process.env.PATH = process.env.PATH + ':../bin';
-}
-
-// Helper to convert a stream to a string
-async function streamToString(stream) {
-  const chunks = [];
-  return new Promise((resolve, reject) => {
-    stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-    stream.on('error', (err) => reject(err));
-    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-  });
-}
-
-/**
- * Looks up pool credentials by profile name/ID
- * @param {string} profileId - The pool ID or profile name to look up
- * @returns {Promise<{bucketName: string, accessKey: string, secretKey: string}|null>}
- */
-async function getPoolCredentials(profileId) {
-  if (!profileId || profileId === 'default') {
-    // Return default credentials
-    return {
-      bucketName: s3BucketDB,
-      accessKey: s3AccessKeyDB,
-      secretKey: s3SecretKeyDB
-    };
-  }
-
-  try {
-    // Lookup the pool in S3
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `pools/${profileId}.json`
-    };
-
-    console.log('getPoolCredentials: Looking up pool:', profileId);
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const poolData = JSON.parse(dataStr);
-
-      if (!poolData || !poolData.bucketName || !poolData.accessKey || !poolData.secretKey) {
-        if (poolData) {
-          console.error(`getPoolCredentials: Pool ${profileId} has missing credentials:`, poolData);
-        } else {
-          if (!poolData.bucketName) console.error(`getPoolCredentials: Pool ${profileId} missing bucketName`);
-          if (!poolData.accessKey) console.error(`getPoolCredentials: Pool ${profileId} missing accessKey`);
-          if (!poolData.secretKey) console.error(`getPoolCredentials: Pool ${profileId} missing secretKey`);
-        }
-        return null;
-      }
-
-      return {
-        bucketName: poolData.bucketName || s3BucketDB,
-        accessKey: poolData.accessKey || s3AccessKeyDB,
-        secretKey: poolData.secretKey || s3SecretKeyDB
-      };
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        console.error(`getPoolCredentials: Error with Pool ${profileId} not found with error:`, err.name, err.message);
-        return null;
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error(`getPoolCredentials: Error getting pool credentials for ${profileId}:`, err);
-    return null;
-  }
 }
 
 // ----------------------------------------------------
