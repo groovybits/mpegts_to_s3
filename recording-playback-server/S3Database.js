@@ -1,23 +1,22 @@
+/****************************************************
+ * S3Database.js — Recording/Playback API S3 Database Class
+ * 
+ * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
+ ****************************************************/
+import config from './config.js';
+
 import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
-import fs from 'fs';
-import { URL } from 'url';
-import { env } from 'process';
 
-// S3 endpoint for the MinIO server
-const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
-const s3Region = process.env.AWS_REGION || 'us-east-1';
-const s3AccessKeyDB = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
-const s3SecretKeyDB = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
-const s3BucketDB = process.env.AWS_S3_BUCKET || 'media';
-
-const ORIGINAL_DIR = process.cwd() + '/';
-const HLS_DIR = process.env.HLS_DIR || '';
-
+const s3endPoint = config.s3endPoint;
+const s3Region = config.s3Region;
+const s3AccessKeyDB = config.s3AccessKeyDB;
+const s3SecretKeyDB = config.s3SecretKeyDB;
+const s3BucketDB = config.s3BucketDB;
 /**
  * S3Database - A class to handle database operations using S3 and JSON files
  * Each table is stored as a collection of JSON files in an S3 bucket

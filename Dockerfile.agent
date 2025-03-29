@@ -96,6 +96,7 @@ COPY recording-playback-server/package-lock.json /app/package-lock.json
 
 COPY recording-playback-server/agent.js /app/agent.js
 COPY recording-playback-server/S3Database.js /app/S3Database.js
+COPY recording-playback-server/config.js /app/config.js
 
 ## Install recording-playback-server dependencies
 RUN npm install

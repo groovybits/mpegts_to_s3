@@ -1,44 +1,9 @@
 /****************************************************
  * agent.js — Recording/Playback API Agent
  * 
- * Environment Variables:
- * - AGENT_ID: Unique identifier for this agent (default: agent-001)
- * - SERVER_PORT: Port for the server to listen on (default: 3001)
- * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
- * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
- * - AWS_REGION: AWS region for S3 (default: us-east-1)
- * - AWS_ACCESS_KEY_ID: Access key for S3 (default: minioadmin)
- * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
- * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
- * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
- * 
- * Usage:
- * - Start the server with `node server.js`
- * - Access the Swagger UI at http://localhost:3000/api-docs
- * - Use the API to create recordings and playbacks
- * 
- * URL parameters for UDP MpegTS:
- * - udp://multicast_ip:port?interface=net1
- * 
- * Dependencies:
- * - express: Web server framework
- * - @aws-sdk/client-s3: AWS SDK for S3
- * - udp-to-hls: UDP to HLS converter
- * - hls-to-udp: HLS to UDP converter
- * - MinIO: S3-compatible server
- * - node-fetch: Fetch API for Node.js
- * 
- * Build Instructions:
- * - Install Node.js and npm version greater than 18 ideally
- * - Run `npm install` to install dependencies
- * - Build the udp-to-hls and hls-to-udp in ../ one directory down using `make && make install`
- * - Run `npm run start:manager && npm run start:agent` to start the API Manager and Agent
- * 
  * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
- * 
  ****************************************************/
-
-const serverVersion = '1.1.4';
+import config from './config.js';
 
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
@@ -59,44 +24,37 @@ import { env } from 'process';
 
 import S3Database, { getPoolCredentials, streamToString } from './S3Database.js'; // Import the S3Database class
 
-// Agent ID
-const AGENT_ID = process.env.AGENT_ID || 'agent-001';
-// Server Manager and Agent URL Bases used for fetch calls (same server in this case)
-const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
-const SERVER_PORT = process.env.SERVER_PORT || 3001;
-const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // Manager and local Agents base server
-const serverUrl = SERVER_PROTOCOL + '://' + SERVER_HOST + ':' + SERVER_PORT;
+const serverVersion = config.serverVersion;
+const AGENT_ID = config.AGENT_ID;
 
-// S3 endpoint for the MinIO server
-const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
-const s3Region = process.env.AWS_REGION || 'us-east-1';
-const s3AccessKeyDB = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
-const s3SecretKeyDB = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
-const s3BucketDB = process.env.AWS_S3_BUCKET || 'media';
+const SERVER_PORT = config.AGENT_PORT;
+const SERVER_HOST = config.AGENT_HOST;
+const serverUrl = config.agentUrl;
+
+const s3endPoint = config.s3endPoint;
+const s3Region = config.s3Region;
+const s3AccessKeyDB = config.s3AccessKeyDB;
+const s3SecretKeyDB = config.s3SecretKeyDB;
+const s3BucketDB = config.s3BucketDB;
 
 // Runtime verbosity levels of Rust programs, 0-4: error, warn, info, debug, trace
-const PLAYBACK_VERBOSE = process.env.PLAYBACK_VERBOSE || 2;
-const RECORDING_VERBOSE = process.env.RECORDING_VERBOSE || 2;
+const PLAYBACK_VERBOSE = config.PLAYBACK_VERBOSE;
+const RECORDING_VERBOSE = config.RECORDING_VERBOSE;
 
 // check env and set the values for the baseargs, else set to defaults, use vars below
-const SMOOTHER_LATENCY = process.env.SMOOTHER_LATENCY || 100;
-const UDP_BUFFER_BYTES = process.env.UDP_BUFFER_BYTES || 0;
+const SMOOTHER_LATENCY = config.SMOOTHER_LATENCY;
+const UDP_BUFFER_BYTES = config.UDP_BUFFER_BYTES;
 
 // setup directorie paths and locations of files
-const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_agent.yaml';
-const ORIGINAL_DIR = process.cwd() + '/';
-const HLS_DIR = process.env.HLS_DIR || '';
+const SWAGGER_FILE = config.AGENT_SWAGGER_FILE;
+const ORIGINAL_DIR = config.ORIGINAL_DIR;
+const HLS_DIR = config.HLS_DIR;
 
-const RECIEVER_POLL_MS = process.env.RECIEVER_POLL_MS || 10; // Polling interval for hls-to-udp
+const RECIEVER_POLL_MS = config.RECIEVER_POLL_MS;
 
 // Queue sizes for hls-to-udp
-const SEGMENT_QUEUE_SIZE = process.env.SEGMENT_QUEUE_SIZE || 1;
-const UDP_QUEUE_SIZE = process.env.UDP_QUEUE_SIZE || 1;
-
-// Add ../bin/ to PATH env variable if it exists
-if (fs.existsSync('../bin/')) {
-  process.env.PATH = process.env.PATH + ':../bin';
-}
+const SEGMENT_QUEUE_SIZE = config.SEGMENT_QUEUE_SIZE;
+const UDP_QUEUE_SIZE = config.UDP_QUEUE_SIZE;
 
 // ----------------------------------------------------
 // Helper: parse "udp://224.0.0.200:10001?interface=net1"
@@ -122,7 +80,7 @@ function parseUdpUrl(urlString) {
  */
 async function storeRecordingUrls(jobId) {
   // Read from the index.txt file, as in the original implementation
-  const hourly_urls = env.HOURLY_URLS_LOG ? env.HOURLY_URLS_LOG : ORIGINAL_DIR + HLS_DIR + 'index.txt';
+  const hourly_urls = config.HOURLY_URLS_INDEX;
 
   /* check if hourly_urls file exists */
   if (!fs.existsSync(hourly_urls)) {
@@ -1125,13 +1083,12 @@ app.use('/v1/agent', agentRouter);
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
   console.log(`Recording / Playback Agent API Server AgentID: [${AGENT_ID}] Version: ${serverVersion} AgentURL: ${serverUrl}`);
-  let capture_buffer_size = env.CAPTURE_BUFFER_SIZE || `4193904`;
-  let segment_duration_ms = env.SEGMENT_DURATION_MS || `2000`;
-  let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
-  let minio_root_password = env.MINIO_ROOT_PASSWORD || `minioadmin`;
-  let url_signing_seconds = env.URL_SIGNING_SECONDS || `604800`;
-  let use_estimated_duration = env.USE_ESTIMATED_DURATION || `true`;
-  let max_segment_size_bytes = env.MAX_SEGMENT_SIZE_BYTES || `5242756`;
+  let capture_buffer_size = config.CAPTURE_BUFFER_SIZE;
+  let segment_duration_ms = config.SEGMENT_DURATION_MS;
+  let url_signing_seconds = config.URL_SIGNING_SECONDS;
+  let use_estimated_duration = config.USE_ESTIMATED_DURATION;
+  let max_segment_size_bytes = config.MAX_SEGMENT_SIZE_BYTES;
+  let hourly_urls_index = config.HOURLY_URLS_INDEX;
 
   const help_msg = `
 Environment Variables:
@@ -1144,8 +1101,6 @@ Environment Variables:
   - RECORDING_VERBOSE: Verbosity level for udp-to-hls (default: ` + RECORDING_VERBOSE + `)
   - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: ` + UDP_BUFFER_BYTES + `)
   - CAPTURE_BUFFER_SIZE: Buffer size for udp-to-hls (default: ` + capture_buffer_size + `)
-  - MINIO_ROOT_USER: Default S3 Access Key (default: ` + minio_root_user + `)
-  - MINIO_ROOT_PASSWORD: Default S3 Secret Key (default: ` + minio_root_password + `)
   - URL_SIGNING_SECONDS: S3 URL Signing time duration (default: ` + url_signing_seconds + `)
   - SEGMENT_DURATION_MS: ~Duration (estimate) of each segment in milliseconds (default: ` + segment_duration_ms + `)
   - MAX_SEGMENT_SIZE_BYTES: Maximum size of each segment in bytes (default: ` + max_segment_size_bytes + `)
@@ -1158,14 +1113,14 @@ Environment Variables:
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');
   console.log(help_msg);
-  /* check if env.HOURLY_URLS_LOG is defined, not empty and is a valid file, if not touch it and create it */
-  if (env.HOURLY_URLS_LOG && env.HOURLY_URLS_LOG !== ""
-    && fs.existsSync(env.HOURLY_URLS_LOG) && fs.lstatSync(env.HOURLY_URLS_LOG).isFile()) {
-    console.log('Hourly URLs log file:', env.HOURLY_URLS_LOG);
+  /* check if hourly log url index is defined, not empty and is a valid file, if not touch it and create it */
+  if (hourly_urls_index && hourly_urls_index !== ""
+    && fs.existsSync(hourly_urls_index) && fs.lstatSync(hourly_urls_index).isFile()) {
+    console.log('Hourly URLs log file:', hourly_urls_index);
   }
-  else if (env.HOURLY_URLS_LOG && env.HOURLY_URLS_LOG !== "") {
-    console.log('Hourly URLs log file defined and not found, creating it:', env.HOURLY_URLS_LOG);
-    fs.writeFileSync(env.HOURLY_URLS_LOG, '');
+  else if (hourly_urls_index && hourly_urls_index !== "") {
+    console.log('Hourly URLs log file defined and not found, creating it:', hourly_urls_index);
+    fs.writeFileSync(hourly_urls_index, '');
   }
   console.log(`\nRecord/Playback Agent started at: ${new Date().toISOString()}\n- Listening for connections...\n`);
 });

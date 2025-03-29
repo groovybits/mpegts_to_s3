@@ -1,51 +1,9 @@
 /****************************************************
  * manager.js — Recording/Playback API Manager
  * 
- * Environment Variables:
- * - MANAGER_ID: Unique ID for the Manager (default: manager-001)
- * - SERVER_PROTOCOL: Protocol for the server (default: http)
- * - SERVER_PORT: Port for the server to listen on (default: 3000)
- * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
- * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
- * - AWS_REGION: Region for the S3 server (default: us-east-1)
- * - AWS_ACCESS_KEY_ID: Access key for the S3 server (default: minioadmin)
- * - AWS_SECRET_ACCESS_KEY: Secret key for the S3 server (default: minioadmin)
- * - AWS_S3_BUCKET: Bucket name for the S3 server (default: hls)
- * - SWAGGER_FILE: Path to the Swagger file (default: swagger_manager.yaml)
- * - AGENT_PROTOCOL: Protocol for the Agent server (default: http)
- * - AGENT_PORT: Port for the Agent server (default: 3001)
- * - AGENT_HOST: Host for the Agent server (default: 127.0.0.1)
- * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
- * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
- * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
- * 
- * Usage:
- * - Start the server with `node server.js`
- * - Access the Swagger UI at http://localhost:3000/api-docs
- * - Use the API to create recordings and playbacks
- * 
- * URL parameters for UDP MpegTS:
- * - udp://multicast_ip:port?interface=net1
- * 
- * Dependencies:
- * - express: Web server framework
- * - @aws-sdk/client-s3: AWS SDK for S3
- * - udp-to-hls: UDP to HLS converter
- * - hls-to-udp: HLS to UDP converter
- * - MinIO: S3-compatible server
- * - node-fetch: Fetch API for Node.js
- * 
- * Build Instructions:
- * - Install Node.js and npm version greater than 18 ideally
- * - Run `npm install` to install dependencies
- * - Build the udp-to-hls and hls-to-udp in ../ one directory down using `make && make install`
- * - Run `npm run start:manager && npm run start:agent` to start the API Manager and Agent
- * 
  * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
- * 
  ****************************************************/
-
-const serverVersion = '1.1.4';
+import config from './config.js';
 
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
@@ -63,36 +21,25 @@ import fetch from 'node-fetch';
 
 import S3Database, { getPoolCredentials, streamToString } from './S3Database.js';
 
-/*
- * The SERVER_HOST and SERVER_PORT are the host and port of the recording-playback-server which can be a Manager or Agent role.
- * The AGENT_HOST and AGENT_PORT are the host and port of the recording-playback-server which can be remotely called by a Manager role.
- * Agents are basically nodes that run the heavier processes of recording and playback.
- * Managers are nodes that manage the Agents and the recording and playback processes.
- */
+const serverVersion = config.serverVersion;
+const MANAGER_ID = config.MANAGER_ID;
 
-// Manager ID
-const MANAGER_ID = process.env.MANAGER_ID || 'manager-001';
+const SERVER_PORT = config.SERVER_PORT;
+const SERVER_HOST = config.SERVER_HOST;
+const serverUrl = config.serverUrl;
 
-// Server Manager and Agent URL Bases used for fetch calls (same server in this case)
-const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
-const SERVER_PORT = process.env.SERVER_PORT || 3000;
-const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // Manager and local Agents base server
-const serverUrl = SERVER_PROTOCOL + '://' + SERVER_HOST + ':' + SERVER_PORT;
+const AGENT_PORT = config.AGENT_PORT;
+const AGENT_HOST = config.AGENT_HOST;
+const agentUrl = config.agentUrl;
 
-const AGENT_PROTOCOL = process.env.AGENT_PROTOCOL || 'http';
-const AGENT_PORT = process.env.AGENT_PORT || 3001;
-const AGENT_HOST = process.env.AGENT_HOST || "127.0.0.1"; // Agent is running on the same server as Manager (us)
-const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
-
-// S3 endpoint for the MinIO server
-const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
-const s3Region = process.env.AWS_REGION || 'us-east-1';
-const s3AccessKeyDB = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
-const s3SecretKeyDB = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
-const s3BucketDB = process.env.AWS_S3_BUCKET || 'media';
+const s3endPoint = config.s3endPoint;
+const s3Region = config.s3Region;
+const s3AccessKeyDB = config.s3AccessKeyDB;
+const s3SecretKeyDB = config.s3SecretKeyDB;
+const s3BucketDB = config.s3BucketDB;
 
 // setup directorie paths and locations of files
-const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_manager.yaml';
+const SWAGGER_FILE = config.MANAGER_SWAGGER_FILE;
 
 // ----------------------------------------------------
 // S3 Database initialization
@@ -769,8 +716,6 @@ app.use('/v1', managerRouter);
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
   console.log(`Recording / Playback Manager API Server ManagerID: [${MANAGER_ID}] Version: ${serverVersion} ManagerURL: ${serverUrl} AgentURL: ${agentUrl}`);
-  let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
-  let minio_root_password = env.MINIO_ROOT_PASSWORD || `minioadmin`;
 
   const help_msg = `
 Environment Variables:
@@ -780,8 +725,6 @@ Environment Variables:
   - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
   - AWS_S3_ENDPOINT: Default Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
   - AWS_S3_REGION: Default Region for the S3 storage pool server (default: ` + s3Region + `)
-  - MINIO_ROOT_USER: Default S3 Access Key (default: ` + minio_root_user + `)
-  - MINIO_ROOT_PASSWORD: Default S3 Secret Key (default: ` + minio_root_password + `)
   - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
   console.log('Current Working Directory:', process.cwd());
