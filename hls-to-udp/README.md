@@ -125,7 +125,7 @@ VOD Multiple hour span using the index created by udp-to-hls to get the hour m3u
     ```sh
     # The Dockerfile and docker-compose_*.yaml's are in the directory below this one in the base ../ git repo.
     cd ../
-    podman-compose -f docker-compose_recording-playback-server.yaml up --build
+    podman-compose -f docker-compose_recording-playback-api.yaml up --build
     ```
 
 2. Optionally you can build a container per service without the recording and playback API server: (not recommended)
@@ -149,5 +149,5 @@ VOD Multiple hour span using the index created by udp-to-hls to get the hour m3u
 
 ---
 
-**Author:** wizard@groovy.org
-**Date:** January 27, 2025
+**Author:** CK
+**Date:** March 2025

@@ -19,10 +19,10 @@ clean:
 	cargo clean
 	cd hls-to-udp && cargo clean
 	rm -rf bin
-	rm -rf recording-playback-server/node_modules
+	rm -rf recording-playback-api/node_modules
 
 distclean: clean
-	rm -f recording-playback-server/hls
+	rm -f recording-playback-api/hls
 	rm -f hls/*
 	rm -rf data/* data/.minio.sys
 

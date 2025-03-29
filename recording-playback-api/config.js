@@ -25,6 +25,42 @@
  * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
  * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
  * 
+ * Config: {
+ *   "serverVersion": "1.1.6",
+ *   "AGENT_ID": "agent-001",
+ *   "MANAGER_ID": "manager001",
+ *   "SERVER_PROTOCOL": "http",
+ *   "SERVER_PORT": "3000",
+ *   "SERVER_HOST": "192.168.130.93",
+ *   "AGENT_PROTOCOL": "http",
+ *   "AGENT_PORT": "3001",
+ *   "AGENT_HOST": "192.168.130.93",
+ *   "serverUrl": "http://192.168.130.93:3000",
+ *   "agentUrl": "http://192.168.130.93:3001",
+ *   "s3endPoint": "http://192.168.130.93:9000",
+ *   "s3Region": "us-east-1",
+ *   "s3AccessKeyDB": "minioadmin",
+ *   "s3SecretKeyDB": "minioadmin",
+ *   "s3BucketDB": "media",
+ *   "PLAYBACK_VERBOSE": 2,
+ *   "RECORDING_VERBOSE": 2,
+ *   "SMOOTHER_LATENCY": 100,
+ *   "UDP_BUFFER_BYTES": 0,
+ *   "AGENT_SWAGGER_FILE": "swagger_agent.yaml",
+ *   "MANAGER_SWAGGER_FILE": "/app/swagger_manager.yaml",
+ *   "ORIGINAL_DIR": "/app/",
+ *   "HLS_DIR": "",
+ *   "RECIEVER_POLL_MS": 10,
+ *   "SEGMENT_QUEUE_SIZE": 1,
+ *   "UDP_QUEUE_SIZE": 1,
+ *   "HOURLY_URLS_INDEX": "/app/hls/index.txt",
+ *   "CAPTURE_BUFFER_SIZE": "4193904",
+ *   "SEGMENT_DURATION_MS": "2000",
+ *   "URL_SIGNING_SECONDS": "604800",
+ *   "USE_ESTIMATED_DURATION": "true",
+ *   "MAX_SEGMENT_SIZE_BYTES": "5242756"
+ * }
+ * 
  * Usage:
  * - Start the server with `node server.js`
  * - Access the Swagger UI at http://localhost:3000/api-docs
