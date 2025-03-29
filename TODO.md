@@ -2,9 +2,11 @@
 
 ### CRITICAL BUGS
 - [ ] Smoother can have some bursts every few minutes potentially (WIP)
+- [ ] Avoid losing time in the capture. (may be smoother issue)
 
 ### NON-CRITICAL BUGS
 - [ ] Timing output could be given higher accuracy
+- [X] Fix capture duration to be exact
 
 ### FEATURES
 - [ ] Improve duration derivation in segmentation, precision
@@ -16,22 +18,21 @@
 - [X] inner playlists for HLS style multi-stream urls
 - [ ] fix to allow  ?.. arg flags to m3u8 urls
 
-### Swagger API Implementation recording-playback-server TASKS
+### Swagger API Implementation recording-playback-api TASKS
 - [ ] Add start/end time functionality support for playback in HLS
 - [ ] Add Authentication Bearers handling to API for outh2 etc.
 - [X] Implement attaching Pools of S3 bucket/creds to each API call properly
-- [ ] Implement filling a Pool with Assets as they are created.
-- [ ] Implement getting a list of all assets in a pool
+- [X] Implement filling a Pool with Assets as they are created.
+- [X] Implement getting a list of all assets in a pool
 - [ ] Add to and advance the stats and admin API endpoints.
-- [ ] Work out and test Manager/Agent configurations separated across servers.
+- [X] Work out and test Manager/Agent configurations separated across servers.
 - [ ] Implement multiple Agents per Manager and general scaling, queueing, etc.
 - [ ] Add Unit Tests for each API endpoint and all the above features.
 - [X] Merge m3u8's into a single m3u8 for HLS and serve the m3u8 as a single file.
 - [ ] Pagination for S3 listing on assets and pools
-- [ ] Split out common s3 code into a shared library for both manager and agent.
-- [ ] Fix capture duration to be exact and avoid losing time in the capture. (may be smoother issue)
+- [X] Split out common s3 code into a shared library for both manager and agent.
 - [ ] AWS Region and Endpoint settings for S3 stored per pool to allow multiple s3 region buckets and endpoints.
 - [ ] Renew expired signing of URLs for playback and recording, create URL signing service for expiration handling.
 
 ---
-January 2025 - @bitbytebit 
+March 2025 - CK 
