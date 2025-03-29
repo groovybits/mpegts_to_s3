@@ -23,13 +23,8 @@ import S3Database, { getPoolCredentials, streamToString } from './S3Database.js'
 
 const serverVersion = config.serverVersion;
 const MANAGER_ID = config.MANAGER_ID;
-
 const SERVER_PORT = config.SERVER_PORT;
-const SERVER_HOST = config.SERVER_HOST;
 const serverUrl = config.serverUrl;
-
-const AGENT_PORT = config.AGENT_PORT;
-const AGENT_HOST = config.AGENT_HOST;
 const agentUrl = config.agentUrl;
 
 const s3endPoint = config.s3endPoint;
@@ -717,20 +712,12 @@ app.use('/v1', managerRouter);
 app.listen(SERVER_PORT, () => {
   console.log(`Recording / Playback Manager API Server ManagerID: [${MANAGER_ID}] Version: ${serverVersion} ManagerURL: ${serverUrl} AgentURL: ${agentUrl}`);
 
-  const help_msg = `
-Environment Variables:
-  - SERVER_PORT: Port for the Node server to listen on as a Manager or Agent (default: ` + SERVER_PORT + `)
-  - SERVER_HOST: Host for the Node server to listen on as a Manager or Agent (default: ` + SERVER_HOST + `)
-  - AGENT_PORT: Port for the Agent server used by the Manager (default: ` + AGENT_PORT + `)
-  - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
-  - AWS_S3_ENDPOINT: Default Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
-  - AWS_S3_REGION: Default Region for the S3 storage pool server (default: ` + s3Region + `)
-  - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
-`;
+  // print out config.* structure neatly
+  console.log('Config:', JSON.stringify(config, null, 2));
+
   console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
   console.log('Swagger UI at:', serverUrl + '/api-docs');
-  console.log(help_msg);
 
   console.log(`\nRecord/Playback Manager started at: ${new Date().toISOString()}\n- Listening for connections...\n`);
 });

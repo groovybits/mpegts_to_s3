@@ -10,7 +10,7 @@ ENV PATH="/app/bin:${PATH}"
 
 ## Set up environment variables
 ENV HOURLY_URLS_LOG="/app/hls/index.txt"
-ENV SWAGGER_FILE="/app/swagger_manager.yaml"
+ENV MANAGER_SWAGGER_FILE="/app/swagger_manager.yaml"
 ENV NVM_DIR="/app/.nvm"
 
 ## Update system and install dependencies needed for nvm and node
@@ -33,7 +33,7 @@ RUN node --version
 RUN npm --version
 
 COPY scripts/entrypoint_manager.sh /app/entrypoint_manager.sh
-COPY recording-playback-server/swagger_manager.yaml ${SWAGGER_FILE}
+COPY recording-playback-server/swagger_manager.yaml ${MANAGER_SWAGGER_FILE}
 
 COPY recording-playback-server/package.json /app/package.json
 COPY recording-playback-server/package-lock.json /package-lock.json

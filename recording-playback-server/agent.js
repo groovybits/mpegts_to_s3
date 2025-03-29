@@ -20,16 +20,15 @@ import https from 'https';
 import { URL } from 'url';
 import swaggerUi from 'swagger-ui-express';
 import yaml from 'js-yaml';
-import { env } from 'process';
 
 import S3Database, { getPoolCredentials, streamToString } from './S3Database.js'; // Import the S3Database class
 
 const serverVersion = config.serverVersion;
 const AGENT_ID = config.AGENT_ID;
+const AGENT_PORT = config.AGENT_PORT;
+const agentUrl = config.agentUrl;
 
-const SERVER_PORT = config.AGENT_PORT;
-const SERVER_HOST = config.AGENT_HOST;
-const serverUrl = config.agentUrl;
+const hourly_urls_index = config.HOURLY_URLS_INDEX;
 
 const s3endPoint = config.s3endPoint;
 const s3Region = config.s3Region;
@@ -47,8 +46,6 @@ const UDP_BUFFER_BYTES = config.UDP_BUFFER_BYTES;
 
 // setup directorie paths and locations of files
 const SWAGGER_FILE = config.AGENT_SWAGGER_FILE;
-const ORIGINAL_DIR = config.ORIGINAL_DIR;
-const HLS_DIR = config.HLS_DIR;
 
 const RECIEVER_POLL_MS = config.RECIEVER_POLL_MS;
 
@@ -1081,38 +1078,15 @@ app.use('/v1/agent', agentRouter);
 // ----------------------------------------------------
 // Start the server
 // ----------------------------------------------------
-app.listen(SERVER_PORT, () => {
-  console.log(`Recording / Playback Agent API Server AgentID: [${AGENT_ID}] Version: ${serverVersion} AgentURL: ${serverUrl}`);
-  let capture_buffer_size = config.CAPTURE_BUFFER_SIZE;
-  let segment_duration_ms = config.SEGMENT_DURATION_MS;
-  let url_signing_seconds = config.URL_SIGNING_SECONDS;
-  let use_estimated_duration = config.USE_ESTIMATED_DURATION;
-  let max_segment_size_bytes = config.MAX_SEGMENT_SIZE_BYTES;
-  let hourly_urls_index = config.HOURLY_URLS_INDEX;
+app.listen(AGENT_PORT, () => {
+  console.log(`Recording / Playback Agent API Server AgentID: [${AGENT_ID}] Version: ${serverVersion} AgentURL: ${agentUrl}`);
 
-  const help_msg = `
-Environment Variables:
-  - SERVER_PORT: Port for the Node server to listen on as a Manager or Agent (default: ` + SERVER_PORT + `)
-  - SERVER_HOST: Host for the Node server to listen on as a Manager or Agent (default: ` + SERVER_HOST + `)
-  - AWS_S3_ENDPOINT: Default Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
-  - AWS_S3_REGION: Default Region for the S3 storage pool server (default: ` + s3Region + `)
-  - SMOOTHER_LATENCY: Smoother latency for hls-to-udp output (default: ` + SMOOTHER_LATENCY + `)
-  - PLAYBACK_VERBOSE: Verbosity level for hls-to-udp (default: ` + PLAYBACK_VERBOSE + `)
-  - RECORDING_VERBOSE: Verbosity level for udp-to-hls (default: ` + RECORDING_VERBOSE + `)
-  - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: ` + UDP_BUFFER_BYTES + `)
-  - CAPTURE_BUFFER_SIZE: Buffer size for udp-to-hls (default: ` + capture_buffer_size + `)
-  - URL_SIGNING_SECONDS: S3 URL Signing time duration (default: ` + url_signing_seconds + `)
-  - SEGMENT_DURATION_MS: ~Duration (estimate) of each segment in milliseconds (default: ` + segment_duration_ms + `)
-  - MAX_SEGMENT_SIZE_BYTES: Maximum size of each segment in bytes (default: ` + max_segment_size_bytes + `)
-  - USE_ESTIMATED_DURATION: Use estimated duration for recording (default: ` + use_estimated_duration + `)
-  - HLS_DIR: Directory to change to before spawning hls-to-udp or udp-to-hls (default: ` + HLS_DIR + `)
-  - ORIGINAL_DIR: Original directory before changing to HLS_DIR (default: ` + ORIGINAL_DIR + `)
-  - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
-`;
+  // print out config.* structure neatly
+  console.log('Config:', JSON.stringify(config, null, 2));
+
   console.log('Current Working Directory:', process.cwd());
   console.log('Storage Pool default S3 Endpoint:', s3endPoint);
-  console.log('Swagger UI at:', serverUrl + '/api-docs');
-  console.log(help_msg);
+  console.log('Swagger UI at:', agentUrl + '/api-docs');
   /* check if hourly log url index is defined, not empty and is a valid file, if not touch it and create it */
   if (hourly_urls_index && hourly_urls_index !== ""
     && fs.existsSync(hourly_urls_index) && fs.lstatSync(hourly_urls_index).isFile()) {
