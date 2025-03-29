@@ -45,7 +45,7 @@
  * 
  ****************************************************/
 
-const serverVersion = '1.1.3';
+const serverVersion = '1.1.4';
 
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
