@@ -22,12 +22,12 @@ echo "Node version: ${NODE_VERSION}"
 CWD=$(pwd)
 echo "Current working directory: ${CWD}"
 
-if [ -z "${SWAGGER_FILE}" ]; then
-    export SWAGGER_FILE=swagger.yaml
-    echo "Swagger file not set, using default of ${SWAGGER_FILE}"
+if [ -z "${MANAGER_SWAGGER_FILE}" ]; then
+    export MANAGER_SWAGGER_FILE=swagger_manager.yaml
+    echo "Swagger file not set, using default of ${MANAGER_SWAGGER_FILE}"
 fi
-if [ ! -f "${SWAGGER_FILE}" ]; then
-    echo "WARNING: Swagger file not found: ${SWAGGER_FILE}"
+if [ ! -f "${MANAGER_SWAGGER_FILE}" ]; then
+    echo "WARNING: Swagger file not found: ${MANAGER_SWAGGER_FILE}"
     pwd
     ls -la $(pwd)
     exit 1

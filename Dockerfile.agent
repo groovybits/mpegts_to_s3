@@ -88,8 +88,8 @@ WORKDIR /app
 
 ENV HLS_DIR=""
 ENV HOURLY_URLS_LOG="/app/hls/index.txt"
-ENV SWAGGER_FILE="/app/swagger_agent.yaml"
-COPY recording-playback-server/swagger_agent.yaml ${SWAGGER_FILE}
+ENV AGENT_SWAGGER_FILE="/app/swagger_agent.yaml"
+COPY recording-playback-server/swagger_agent.yaml ${AGENT_SWAGGER_FILE}
 
 COPY recording-playback-server/package.json /app/package.json
 COPY recording-playback-server/package-lock.json /app/package-lock.json
