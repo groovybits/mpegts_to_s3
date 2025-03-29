@@ -1,357 +1,45 @@
 /****************************************************
  * manager.js — Recording/Playback API Manager
  * 
- * Environment Variables:
- * - MANAGER_ID: Unique ID for the Manager (default: manager-001)
- * - SERVER_PROTOCOL: Protocol for the server (default: http)
- * - SERVER_PORT: Port for the server to listen on (default: 3000)
- * - SERVER_HOST: Host for the server to listen on (default: 127.0.0.1)
- * - AWS_S3_ENDPOINT: Endpoint for the S3 server (default: http://127.0.0.1:9000)
- * - AWS_REGION: Region for the S3 server (default: us-east-1)
- * - AWS_ACCESS_KEY_ID: Access key for the S3 server (default: minioadmin)
- * - AWS_SECRET_ACCESS_KEY: Secret key for the S3 server (default: minioadmin)
- * - AWS_S3_BUCKET: Bucket name for the S3 server (default: hls)
- * - SWAGGER_FILE: Path to the Swagger file (default: swagger_manager.yaml)
- * - AGENT_PROTOCOL: Protocol for the Agent server (default: http)
- * - AGENT_PORT: Port for the Agent server (default: 3001)
- * - AGENT_HOST: Host for the Agent server (default: 127.0.0.1)
- * - SMOOTHER_LATENCY: Smoother latency for hls-to-udp (default: 500)
- * - VERBOSE: Verbosity level for hls-to-udp (default: 2)
- * - UDP_BUFFER_BYTES: Buffer size for hls-to-udp (default: 0)
- * 
- * Usage:
- * - Start the server with `node server.js`
- * - Access the Swagger UI at http://localhost:3000/api-docs
- * - Use the API to create recordings and playbacks
- * 
- * URL parameters for UDP MpegTS:
- * - udp://multicast_ip:port?interface=net1
- * 
- * Dependencies:
- * - express: Web server framework
- * - @aws-sdk/client-s3: AWS SDK for S3
- * - udp-to-hls: UDP to HLS converter
- * - hls-to-udp: HLS to UDP converter
- * - MinIO: S3-compatible server
- * - node-fetch: Fetch API for Node.js
- * 
- * Build Instructions:
- * - Install Node.js and npm version greater than 18 ideally
- * - Run `npm install` to install dependencies
- * - Build the udp-to-hls and hls-to-udp in ../ one directory down using `make && make install`
- * - Run `npm run start:manager && npm run start:agent` to start the API Manager and Agent
- * 
  * - Author: CK <ck@groovybits> https://github.com/groovybits/mpegts_to_s3
- * 
  ****************************************************/
+import config from './config.js';
 
-const serverVersion = '1.1.3';
+import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  PutObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectCommand
+} from '@aws-sdk/client-s3';
+import fs from 'fs';
+import swaggerUi from 'swagger-ui-express';
+import yaml from 'js-yaml';
+import { env } from 'process';
+import fetch from 'node-fetch';
 
-const express = require('express');
-const { v4: uuidv4 } = require('uuid');
-const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const fs = require('fs');
+import S3Database, { getPoolCredentials, streamToString } from './S3Database.js';
 
-// For Swagger
-const swaggerUi = require('swagger-ui-express');
-const yaml = require('js-yaml');
+const serverVersion = config.serverVersion;
+const MANAGER_ID = config.MANAGER_ID;
 
-// For fetch
-const fetch = require('node-fetch');
-const { env } = require('process');
+const SERVER_PORT = config.SERVER_PORT;
+const SERVER_HOST = config.SERVER_HOST;
+const serverUrl = config.serverUrl;
 
-/*
- * The SERVER_HOST and SERVER_PORT are the host and port of the recording-playback-server which can be a Manager or Agent role.
- * The AGENT_HOST and AGENT_PORT are the host and port of the recording-playback-server which can be remotely called by a Manager role.
- * Agents are basically nodes that run the heavier processes of recording and playback.
- * Managers are nodes that manage the Agents and the recording and playback processes.
- */
+const AGENT_PORT = config.AGENT_PORT;
+const AGENT_HOST = config.AGENT_HOST;
+const agentUrl = config.agentUrl;
 
-// Manager ID
-const MANAGER_ID = process.env.MANAGER_ID || 'manager-001';
-
-// Server Manager and Agent URL Bases used for fetch calls (same server in this case)
-const SERVER_PROTOCOL = process.env.SERVER_PROTOCOL || 'http';
-const SERVER_PORT = process.env.SERVER_PORT || 3000;
-const SERVER_HOST = process.env.SERVER_HOST || "127.0.0.1"; // Manager and local Agents base server
-const serverUrl = SERVER_PROTOCOL + '://' + SERVER_HOST + ':' + SERVER_PORT;
-
-const AGENT_PROTOCOL = process.env.AGENT_PROTOCOL || 'http';
-const AGENT_PORT = process.env.AGENT_PORT || 3001;
-const AGENT_HOST = process.env.AGENT_HOST || "127.0.0.1"; // Agent is running on the same server as Manager (us)
-const agentUrl = AGENT_PROTOCOL + '://' + AGENT_HOST + ':' + AGENT_PORT;
-
-// S3 endpoint for the MinIO server
-const s3endPoint = process.env.AWS_S3_ENDPOINT || 'http://127.0.0.1:9000';
-const s3Region = process.env.AWS_REGION || 'us-east-1';
-const s3AccessKeyDB = process.env.AWS_ACCESS_KEY_ID || 'minioadmin';
-const s3SecretKeyDB = process.env.AWS_SECRET_ACCESS_KEY || 'minioadmin';
-const s3BucketDB = process.env.AWS_S3_BUCKET || 'media';
+const s3endPoint = config.s3endPoint;
+const s3Region = config.s3Region;
+const s3AccessKeyDB = config.s3AccessKeyDB;
+const s3SecretKeyDB = config.s3SecretKeyDB;
+const s3BucketDB = config.s3BucketDB;
 
 // setup directorie paths and locations of files
-const SWAGGER_FILE = process.env.SWAGGER_FILE || 'swagger_manager.yaml';
-
-/**
- * S3Database - A class to handle database operations using S3 and JSON files
- * Each table is stored as a collection of JSON files in an S3 bucket
- */
-class S3Database {
-  constructor(endpoint, bucket, region = 'us-east-1', accessKey = null, secretKey = null) {
-    // Create S3 client
-    this.s3Client = new S3Client({
-      region,
-      endpoint,
-      credentials: accessKey && secretKey ? {
-        accessKeyId: accessKey,
-        secretAccessKey: secretKey
-      } : undefined,
-      forcePathStyle: true // Needed for MinIO and other S3-compatible servers
-    });
-
-    // Default bucket name
-    this.bucket = bucket;
-
-    // Track tables that have been initialized
-    this.tables = new Set();
-  }
-
-  /**
-   * Ensure the table exists in S3
-   * @param {string} tableName - Table name
-   */
-  async ensureTable(tableName) {
-    if (this.tables.has(tableName)) return;
-
-    try {
-      const params = {
-        Bucket: this.bucket,
-        Key: `${tableName}/_metadata.json`
-      };
-
-      try {
-        await this.s3Client.send(new GetObjectCommand(params));
-      } catch (err) {
-        // If metadata doesn't exist, create it
-        const createParams = {
-          Bucket: this.bucket,
-          Key: `${tableName}/_metadata.json`,
-          Body: JSON.stringify({
-            tableName,
-            created: new Date().toISOString()
-          })
-        };
-
-        await this.s3Client.send(new PutObjectCommand(createParams));
-      }
-
-      this.tables.add(tableName);
-    } catch (err) {
-      console.error(`Error ensuring table ${tableName}:`, err);
-      throw err;
-    }
-  }
-
-  /**
-   * Get a single record by ID
-   * @param {string} sql - SQL-like SELECT statement (parsed for table name and WHERE clause)
-   * @param {array} params - Parameters (usually just the ID)
-   * @param {function} callback - Callback function(err, row)
-   */
-  async get(sql, params, callback) {
-    try {
-      // Extract table name from SELECT statement
-      const tableMatch = sql.match(/FROM\s+(\w+)/i);
-      if (!tableMatch || !tableMatch[1]) {
-        throw new Error('Could not parse table name from SQL');
-      }
-
-      const tableName = tableMatch[1];
-      await this.ensureTable(tableName);
-
-      // Extract ID field and value from WHERE clause
-      const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
-      if (!whereMatch || !whereMatch[1]) {
-        throw new Error('Could not parse ID field from WHERE clause');
-      }
-
-      const idField = whereMatch[1];
-      const id = params[0];
-
-      // Get the item from S3
-      const getParams = {
-        Bucket: this.bucket,
-        Key: `${tableName}/${id}.json`
-      };
-
-      try {
-        const response = await this.s3Client.send(new GetObjectCommand(getParams));
-        const dataStr = await streamToString(response.Body);
-        const data = JSON.parse(dataStr);
-
-        if (callback) callback(null, data);
-        return data;
-      } catch (err) {
-        if (err.name === 'NoSuchKey') {
-          // Item not found
-          if (callback) callback(null, null);
-          return null;
-        }
-        throw err;
-      }
-    } catch (err) {
-      console.error('Error in get operation:', err);
-      if (callback) callback(err, null);
-      return null;
-    }
-  }
-
-  /**
-   * Get multiple records, optionally filtered
-   * @param {string} sql - SQL-like SELECT statement
-   * @param {array} params - Parameters for filtering
-   * @param {function} callback - Callback function(err, rows)
-   */
-  async all(sql, params = [], callback) {
-    try {
-      // Extract table name from SELECT statement
-      const tableMatch = sql.match(/FROM\s+(\w+)/i);
-      if (!tableMatch || !tableMatch[1]) {
-        throw new Error('Could not parse table name from SQL');
-      }
-
-      const tableName = tableMatch[1];
-      await this.ensureTable(tableName);
-
-      // List all objects for this table
-      const listParams = {
-        Bucket: this.bucket,
-        Prefix: `${tableName}/`,
-        MaxKeys: 1000 // Adjust as needed
-      };
-
-      const response = await this.s3Client.send(new ListObjectsV2Command(listParams));
-      const items = [];
-
-      if (response.Contents) {
-        // Extract WHERE clause if present
-        let whereClause = null;
-        let whereField = null;
-        let whereValue = null;
-
-        if (sql.includes('WHERE') && params.length > 0) {
-          const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
-          if (whereMatch && whereMatch[1]) {
-            whereField = whereMatch[1];
-            whereValue = params[0];
-          }
-        }
-
-        // Fetch and filter items
-        for (const obj of response.Contents) {
-          const key = obj.Key;
-          if (key.endsWith('_metadata.json')) continue;
-
-          const getParams = {
-            Bucket: this.bucket,
-            Key: key
-          };
-
-          try {
-            const itemResponse = await this.s3Client.send(new GetObjectCommand(getParams));
-            const dataStr = await streamToString(itemResponse.Body);
-            const data = JSON.parse(dataStr);
-
-            // Apply WHERE filter if needed
-            if (whereField && whereValue !== null) {
-              if (data[whereField] === whereValue) {
-                items.push(data);
-              }
-            } else {
-              items.push(data);
-            }
-          } catch (err) {
-            console.error(`Error reading ${key}:`, err);
-          }
-        }
-      }
-
-      if (callback) callback(null, items);
-      return items;
-    } catch (err) {
-      console.error('Error in all operation:', err);
-      if (callback) callback(err, []);
-      return [];
-    }
-  }
-}
-
-// Helper to convert a stream to a string
-async function streamToString(stream) {
-  const chunks = [];
-  return new Promise((resolve, reject) => {
-    stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-    stream.on('error', (err) => reject(err));
-    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-  });
-}
-
-/**
- * Looks up pool credentials by profile name/ID
- * @param {string} profileId - The pool ID or profile name to look up
- * @returns {Promise<{bucketName: string, accessKey: string, secretKey: string}|null>}
- */
-async function getPoolCredentials(profileId) {
-  if (!profileId || profileId === 'default') {
-    // Return default credentials
-    return {
-      bucketName: s3BucketDB,
-      accessKey: s3AccessKeyDB,
-      secretKey: s3SecretKeyDB
-    };
-  }
-
-  try {
-    // Lookup the pool in S3
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `pools/${profileId}.json`
-    };
-
-    console.log('getPoolCredentials: Looking up pool:', profileId);
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const poolData = JSON.parse(dataStr);
-
-      if (!poolData || !poolData.bucketName || !poolData.accessKey || !poolData.secretKey) {
-        if (poolData) {
-          console.error(`getPoolCredentials: Pool ${profileId} has missing credentials:`, poolData);
-        } else {
-          if (!poolData.bucketName) console.error(`getPoolCredentials: Pool ${profileId} missing bucketName`);
-          if (!poolData.accessKey) console.error(`getPoolCredentials: Pool ${profileId} missing accessKey`);
-          if (!poolData.secretKey) console.error(`getPoolCredentials: Pool ${profileId} missing secretKey`);
-        }
-        return null;
-      }
-
-      return {
-        bucketName: poolData.bucketName || s3BucketDB,
-        accessKey: poolData.accessKey || s3AccessKeyDB,
-        secretKey: poolData.secretKey || s3SecretKeyDB
-      };
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        console.error(`getPoolCredentials: Error with Pool ${profileId} not found with error:`, err.name, err.message);
-        return null;
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error(`getPoolCredentials: Error getting pool credentials for ${profileId}:`, err);
-    return null;
-  }
-}
+const SWAGGER_FILE = config.MANAGER_SWAGGER_FILE;
 
 // ----------------------------------------------------
 // S3 Database initialization
@@ -1028,8 +716,6 @@ app.use('/v1', managerRouter);
 // ----------------------------------------------------
 app.listen(SERVER_PORT, () => {
   console.log(`Recording / Playback Manager API Server ManagerID: [${MANAGER_ID}] Version: ${serverVersion} ManagerURL: ${serverUrl} AgentURL: ${agentUrl}`);
-  let minio_root_user = env.MINIO_ROOT_USER || `minioadmin`;
-  let minio_root_password = env.MINIO_ROOT_PASSWORD || `minioadmin`;
 
   const help_msg = `
 Environment Variables:
@@ -1039,8 +725,6 @@ Environment Variables:
   - AGENT_HOST: Host for the Agent server used by the Manager (default: ` + AGENT_HOST + `)
   - AWS_S3_ENDPOINT: Default Endpoint for the S3 storage pool server (default: ` + s3endPoint + `)
   - AWS_S3_REGION: Default Region for the S3 storage pool server (default: ` + s3Region + `)
-  - MINIO_ROOT_USER: Default S3 Access Key (default: ` + minio_root_user + `)
-  - MINIO_ROOT_PASSWORD: Default S3 Secret Key (default: ` + minio_root_password + `)
   - SWAGGER_FILE: Path to the Swagger file (default: ` + SWAGGER_FILE + `)
 `;
   console.log('Current Working Directory:', process.cwd());

@@ -1,6 +1,8 @@
 {
   "name": "recording-playback-api",
-  "version": "1.1.2",
+  "version": "1.1.4",
+  "author": "CK@groovybits",
+  "repository": "https://github.com/groovybits/mpegts_to_s3.git",
   "scripts": {
     "start:agent": "node agent.js",
     "start:manager": "node manager.js",
@@ -8,14 +10,14 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": ["recording", "playback", "agent", "manager"],
-  "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "description": "System for recording and playback with agent and manager components",
+  "type": "module",
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.775.0",
+    "@aws-sdk/client-s3": "^3.777.0",
     "express": "^4.21.2",
     "js-yaml": "^4.1.0",
-    "node-fetch": "^2.7.0",
+    "node-fetch": "^3.3.2",
     "swagger-ui-express": "^5.0.1",
     "uuid": "^11.1.0"
   },
