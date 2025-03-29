@@ -16,7 +16,6 @@ import {
 import fs from 'fs';
 import swaggerUi from 'swagger-ui-express';
 import yaml from 'js-yaml';
-import { env } from 'process';
 import fetch from 'node-fetch';
 
 import S3Database, { getPoolCredentials, streamToString } from './S3Database.js';
