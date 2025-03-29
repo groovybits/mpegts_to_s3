@@ -9,8 +9,9 @@
   },
   "keywords": ["recording", "playback", "agent", "manager"],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "description": "System for recording and playback with agent and manager components",
+  "type": "module",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.775.0",
     "express": "^4.21.2",

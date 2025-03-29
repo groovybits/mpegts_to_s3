@@ -38,6 +38,7 @@ COPY recording-playback-server/swagger_manager.yaml ${SWAGGER_FILE}
 COPY recording-playback-server/package.json /app/package.json
 COPY recording-playback-server/package-lock.json /package-lock.json
 COPY recording-playback-server/manager.js /app/manager.js
+COPY recording-playback-server/S3Database.js /app/S3Database.js
 
 WORKDIR /app
 
