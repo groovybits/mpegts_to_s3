@@ -7,19 +7,12 @@ import config from './config.js';
 
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import {
-  PutObjectCommand,
-  GetObjectCommand,
-  ListObjectsV2Command,
-  DeleteObjectCommand
-} from '@aws-sdk/client-s3';
 import fs from 'fs';
 import swaggerUi from 'swagger-ui-express';
 import yaml from 'js-yaml';
-import { env } from 'process';
 import fetch from 'node-fetch';
 
-import S3Database, { getPoolCredentials, streamToString } from './S3Database.js';
+import S3Database from './S3Database.js';
 
 const serverVersion = config.serverVersion;
 const MANAGER_ID = config.MANAGER_ID;
@@ -85,7 +78,7 @@ managerRouter.post('/recordings', async (req, res) => {
   // Validate the destination profile exists
   if (destinationProfile && destinationProfile !== 'default') {
     try {
-      const poolExists = await getPoolCredentials(destinationProfile);
+      const poolExists = await db.getPoolCredentials(destinationProfile);
       if (!poolExists) {
         return res.status(400).json({ error: `Destination profile '${destinationProfile}' not found` });
       }
@@ -107,12 +100,7 @@ managerRouter.post('/recordings', async (req, res) => {
       processPid: null
     };
 
-    // Store in S3
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`,
-      Body: JSON.stringify(recordingData)
-    }));
+    await db.put(`recordings/${recordingId}.json`, recordingData);
 
     let fetchUrl = agentUrl + "/v1/agent/jobs/recordings";
     console.log('About to call Agent with fetch, recordingId=', recordingId, ' Url=', sourceUrl, ' Duration=', duration, ' DestinationProfile=', destinationProfile, ' FetchUrl=', fetchUrl);
@@ -141,11 +129,7 @@ managerRouter.post('/recordings', async (req, res) => {
           metadata: JSON.stringify(recordingData || {})
         };
 
-        await db.s3Client.send(new PutObjectCommand({
-          Bucket: db.bucket,
-          Key: `assets/${assetId}.json`,
-          Body: JSON.stringify(assetData)
-        }));
+        await db.put(`assets/${assetId}.json`, assetData);
       } catch (err) {
         console.error('Error creating asset:', err);
         res.status(500).json({ error: err.message });
@@ -167,33 +151,8 @@ managerRouter.post('/recordings', async (req, res) => {
 
 managerRouter.get('/recordings', async (req, res) => {
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'recordings/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
+    // Use the S3Database class method for pagination
+    const items = await db.getS3Data('recordings/');
     res.json(items);
   } catch (err) {
     console.error('Error getting recordings:', err);
@@ -205,15 +164,11 @@ managerRouter.get('/recordings/:recordingId', async (req, res) => {
   const { recordingId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`recordings/${recordingId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Recording not found' });
+      }
       res.json(data);
     } catch (err) {
       if (err.name === 'NoSuchKey') {
@@ -231,42 +186,29 @@ managerRouter.delete('/recordings/:recordingId', async (req, res) => {
   const { recordingId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-
-      // Update status to canceled
-      data.status = 'canceled';
-
-      await db.s3Client.send(new PutObjectCommand({
-        Bucket: db.bucket,
-        Key: `recordings/${recordingId}.json`,
-        Body: JSON.stringify(data)
-      }));
-
-      // Kill process if any
-      if (data.processPid) {
-        try {
-          process.kill(data.processPid, 'SIGTERM');
-        } catch { }
-      }
-
-      return res.sendStatus(204);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Not found' });
-      }
-      throw err;
+    const data = await db.get(`recordings/${recordingId}.json`);
+    if (!data) {
+      return res.status(404).json({ message: 'Recording not found' });
     }
+
+    // Update status to canceled
+    data.status = 'canceled';
+
+    await db.put(`recordings/${recordingId}.json`, data);
+
+    // Kill process if any
+    if (data.processPid) {
+      try {
+        process.kill(data.processPid, 'SIGTERM');
+      } catch { }
+    }
+
+    return res.sendStatus(204);
   } catch (err) {
-    console.error('Error deleting recording:', err);
-    res.status(500).json({ error: err.message });
+    if (err.name === 'NoSuchKey') {
+      return res.status(404).json({ message: 'Not found' });
+    }
+    throw err;
   }
 });
 
@@ -285,11 +227,7 @@ managerRouter.post('/pools', async (req, res) => {
       secretKey: credentials.secretKey
     };
 
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `pools/${poolId}.json`,
-      Body: JSON.stringify(poolData)
-    }));
+    await db.put(`pools/${poolId}.json`, poolData);
 
     res.status(201).json({ poolId, bucketName });
   } catch (err) {
@@ -300,33 +238,7 @@ managerRouter.post('/pools', async (req, res) => {
 
 managerRouter.get('/pools', async (req, res) => {
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'pools/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
+    const items = await db.getS3Data('pools/');
     res.json(items);
   } catch (err) {
     console.error('Error getting pools:', err);
@@ -339,38 +251,9 @@ managerRouter.get('/pools/:poolId/assets', async (req, res) => {
   const { poolId } = req.params;
 
   try {
-    // List all objects for this table
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'assets/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.destinationProfile === poolId) {
-            items.push(data);
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    res.json(items);
+    const items = await db.getS3Data('assets/');
+    const filtered = items.filter(item => item.destinationProfile === poolId);
+    res.json(filtered);
   } catch (err) {
     console.error('Error getting assets:', err);
     res.status(500).json({ error: err.message });
@@ -382,24 +265,17 @@ managerRouter.delete('/pools/:poolId/assets', async (req, res) => {
   const { assetId } = req.query;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `assets/${assetId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`assets/${assetId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Asset not found' });
+      }
 
       if (data.destinationProfile !== poolId) {
         return res.status(404).json({ message: 'Asset not found in this pool' });
       }
 
-      await db.s3Client.send(new DeleteObjectCommand({
-        Bucket: db.bucket,
-        Key: `assets/${assetId}.json`
-      }));
+      await db.put(`assets/${assetId}.json`, data);
 
       res.sendStatus(204);
     } catch (err) {
@@ -418,15 +294,8 @@ managerRouter.get('/assets/:assetId', async (req, res) => {
   const { assetId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `assets/${assetId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`assets/${assetId}.json`);
 
       const result = {
         assetId: data.id,
@@ -467,15 +336,10 @@ managerRouter.post('/playbacks', async (req, res) => {
       processPid: null
     };
 
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`,
-      Body: JSON.stringify(playbackData)
-    }));
+    await db.put(`playbacks/${playbackId}.json`, playbackData);
 
     // Call the agent to start the playback
     let fetchUrl = agentUrl + "/v1/agent/jobs/playbacks";
-    console.log('About to call Agent with fetch, playbackId=', playbackId, 'RecordingId=', recordingId, ' SourceProfile=', sourceProfile, ' DestinationUrl=', destinationUrl, ' Duration=', duration, ' FetchUrl=', fetchUrl);
 
     try {
       const agentResp = await fetch(fetchUrl, {
@@ -509,33 +373,7 @@ managerRouter.post('/playbacks', async (req, res) => {
 
 managerRouter.get('/playbacks', async (req, res) => {
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'playbacks/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
+    const items = await db.getS3Data('playbacks/');
     res.json(items);
   } catch (err) {
     console.error('Error getting playbacks:', err);
@@ -547,15 +385,11 @@ managerRouter.get('/playbacks/:playbackId', async (req, res) => {
   const { playbackId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`playbacks/${playbackId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Playback not found' });
+      }
       res.json(data);
     } catch (err) {
       if (err.name === 'NoSuchKey') {
@@ -573,24 +407,16 @@ managerRouter.delete('/playbacks/:playbackId', async (req, res) => {
   const { playbackId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`playbacks/${playbackId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Playback not found' });
+      }
 
       // Update status to canceled
       data.status = 'canceled';
 
-      await db.s3Client.send(new PutObjectCommand({
-        Bucket: db.bucket,
-        Key: `playbacks/${playbackId}.json`,
-        Body: JSON.stringify(data)
-      }));
+      await db.put(`playbacks/${playbackId}.json`, data);
 
       // Kill process if any
       if (data.processPid) {
@@ -616,76 +442,22 @@ managerRouter.delete('/playbacks/:playbackId', async (req, res) => {
 managerRouter.get('/admin/stats', async (req, res) => {
   try {
     // Count active recordings
-    const recListParams = {
-      Bucket: db.bucket,
-      Prefix: 'recordings/',
-      MaxKeys: 1000
-    };
-
-    const recResponse = await db.s3Client.send(new ListObjectsV2Command(recListParams));
+    const recItems = await db.getS3Data('recordings/');
     let concurrentRecordings = 0;
-
-    if (recResponse.Contents) {
-      for (const obj of recResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.status === 'active') {
-            concurrentRecordings++;
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
+    recItems.forEach(item => {
+      if (item.status === 'active') concurrentRecordings++;
+    });
 
     // Count active playbacks
-    const pbListParams = {
-      Bucket: db.bucket,
-      Prefix: 'playbacks/',
-      MaxKeys: 1000
-    };
-
-    const pbResponse = await db.s3Client.send(new ListObjectsV2Command(pbListParams));
+    const pbItems = await db.getS3Data('playbacks/');
     let concurrentPlaybacks = 0;
-
-    if (pbResponse.Contents) {
-      for (const obj of pbResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.status === 'active') {
-            concurrentPlaybacks++;
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
+    pbItems.forEach(item => {
+      if (item.status === 'active') concurrentPlaybacks++;
+    });
 
     // Count total assets
-    const asListParams = {
-      Bucket: db.bucket,
-      Prefix: 'assets/',
-      MaxKeys: 1000
-    };
-
-    const asResponse = await db.s3Client.send(new ListObjectsV2Command(asListParams));
-    const totalAssets = asResponse.Contents ? asResponse.Contents.length : 0;
+    const asItems = await db.getS3Data('assets/');
+    const totalAssets = asItems.length;
 
     const systemLoad = 0.2;
     const clusterUsage = { agentCount: 1 };

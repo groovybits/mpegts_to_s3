@@ -1,6 +1,6 @@
 {
   "name": "recording-playback-api",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "author": "CK@groovybits",
   "repository": "https://github.com/groovybits/mpegts_to_s3.git",
   "scripts": {

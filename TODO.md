@@ -29,7 +29,7 @@
 - [ ] Implement multiple Agents per Manager and general scaling, queueing, etc.
 - [ ] Add Unit Tests for each API endpoint and all the above features.
 - [X] Merge m3u8's into a single m3u8 for HLS and serve the m3u8 as a single file.
-- [ ] Pagination for S3 listing on assets and pools
+- [X] Pagination for S3 listing on assets and pools
 - [X] Split out common s3 code into a shared library for both manager and agent.
 - [ ] AWS Region and Endpoint settings for S3 stored per pool to allow multiple s3 region buckets and endpoints.
 - [ ] Renew expired signing of URLs for playback and recording, create URL signing service for expiration handling.
