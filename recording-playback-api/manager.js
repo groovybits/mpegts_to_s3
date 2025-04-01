@@ -18,7 +18,7 @@ import swaggerUi from 'swagger-ui-express';
 import yaml from 'js-yaml';
 import fetch from 'node-fetch';
 
-import S3Database, { getPoolCredentials, streamToString } from './S3Database.js';
+import S3Database from './S3Database.js';
 
 const serverVersion = config.serverVersion;
 const MANAGER_ID = config.MANAGER_ID;
@@ -84,7 +84,7 @@ managerRouter.post('/recordings', async (req, res) => {
   // Validate the destination profile exists
   if (destinationProfile && destinationProfile !== 'default') {
     try {
-      const poolExists = await getPoolCredentials(destinationProfile);
+      const poolExists = await db.getPoolCredentials(destinationProfile);
       if (!poolExists) {
         return res.status(400).json({ error: `Destination profile '${destinationProfile}' not found` });
       }
@@ -184,7 +184,7 @@ managerRouter.get('/recordings', async (req, res) => {
 
         try {
           const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
+          const dataStr = await db.streamToString(itemResponse.Body);
           const data = JSON.parse(dataStr);
           items.push(data);
         } catch (err) {
@@ -211,7 +211,7 @@ managerRouter.get('/recordings/:recordingId', async (req, res) => {
 
     try {
       const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
+      const dataStr = await db.streamToString(response.Body);
       const data = JSON.parse(dataStr);
       res.json(data);
     } catch (err) {
@@ -237,7 +237,7 @@ managerRouter.delete('/recordings/:recordingId', async (req, res) => {
 
     try {
       const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
+      const dataStr = await db.streamToString(response.Body);
       const data = JSON.parse(dataStr);
 
       // Update status to canceled
@@ -317,7 +317,7 @@ managerRouter.get('/pools', async (req, res) => {
 
         try {
           const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
+          const dataStr = await db.streamToString(itemResponse.Body);
           const data = JSON.parse(dataStr);
           items.push(data);
         } catch (err) {
@@ -357,7 +357,7 @@ managerRouter.get('/pools/:poolId/assets', async (req, res) => {
 
         try {
           const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
+          const dataStr = await db.streamToString(itemResponse.Body);
           const data = JSON.parse(dataStr);
 
           if (data.destinationProfile === poolId) {
@@ -388,7 +388,7 @@ managerRouter.delete('/pools/:poolId/assets', async (req, res) => {
 
     try {
       const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
+      const dataStr = await db.streamToString(response.Body);
       const data = JSON.parse(dataStr);
 
       if (data.destinationProfile !== poolId) {
@@ -424,7 +424,7 @@ managerRouter.get('/assets/:assetId', async (req, res) => {
 
     try {
       const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
+      const dataStr = await db.streamToString(response.Body);
       const data = JSON.parse(dataStr);
 
       const result = {
@@ -526,7 +526,7 @@ managerRouter.get('/playbacks', async (req, res) => {
 
         try {
           const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
+          const dataStr = await db.streamToString(itemResponse.Body);
           const data = JSON.parse(dataStr);
           items.push(data);
         } catch (err) {
@@ -553,7 +553,7 @@ managerRouter.get('/playbacks/:playbackId', async (req, res) => {
 
     try {
       const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
+      const dataStr = await db.streamToString(response.Body);
       const data = JSON.parse(dataStr);
       res.json(data);
     } catch (err) {
@@ -579,7 +579,7 @@ managerRouter.delete('/playbacks/:playbackId', async (req, res) => {
 
     try {
       const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
+      const dataStr = await db.streamToString(response.Body);
       const data = JSON.parse(dataStr);
 
       // Update status to canceled
@@ -633,7 +633,7 @@ managerRouter.get('/admin/stats', async (req, res) => {
 
         try {
           const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
+          const dataStr = await db.streamToString(itemResponse.Body);
           const data = JSON.parse(dataStr);
 
           if (data.status === 'active') {
@@ -664,7 +664,7 @@ managerRouter.get('/admin/stats', async (req, res) => {
 
         try {
           const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
+          const dataStr = await db.streamToString(itemResponse.Body);
           const data = JSON.parse(dataStr);
 
           if (data.status === 'active') {

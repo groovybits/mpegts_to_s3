@@ -11,7 +11,6 @@ import { spawn } from 'child_process';
 import {
   PutObjectCommand,
   GetObjectCommand,
-  ListObjectsV2Command,
   DeleteObjectCommand
 } from '@aws-sdk/client-s3';
 import fs from 'fs';
@@ -21,7 +20,7 @@ import { URL } from 'url';
 import swaggerUi from 'swagger-ui-express';
 import yaml from 'js-yaml';
 
-import S3Database, { getPoolCredentials, streamToString } from './S3Database.js'; // Import the S3Database class
+import S3Database from './S3Database.js'; // Import the S3Database class
 
 const serverVersion = config.serverVersion;
 const AGENT_ID = config.AGENT_ID;
@@ -190,7 +189,7 @@ async function spawnUdpToHls(jobId, sourceUrl, duration, destinationProfile) {
   }
 
   // Get pool credentials for the specified profile
-  const poolCredentials = await getPoolCredentials(destinationProfile);
+  const poolCredentials = await db.getPoolCredentials(destinationProfile);
   if (!poolCredentials) {
     throw new Error(`Invalid destination profile: ${destinationProfile}`);
   }
@@ -274,52 +273,35 @@ async function spawnUdpToHls(jobId, sourceUrl, duration, destinationProfile) {
 
 async function getVodPlaylists(jobId, vodStartTime, vodEndTime) {
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'recording_urls/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    // Fetch all objects under the 'recording_urls/' prefix.
+    const items = await db.getS3DataWithKey('recording_urls/');
     const vodPlaylists = [];
 
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const key = obj.Key;
-        if (!key.startsWith(`recording_urls/${jobId}_`)) continue;
+    for (const item of items) {
+      const key = item.key;
+      if (!key.startsWith(`recording_urls/${jobId}_`)) continue;
 
-        const getParams = {
-          Bucket: db.bucket,
-          Key: key
-        };
+      const data = item.data;
+      // data.hour is expected in format "yyyy/mm/dd/hh:mm:ss"
+      const dateParts = data.hour.split('/');
+      if (dateParts.length < 4) {
+        console.log('Invalid date format in recording_urls:', data.hour);
+        continue;
+      }
 
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
+      // Construct an ISO string from the date parts.
+      const isoString = `${dateParts[0]}-${dateParts[1]}-${dateParts[2]}T${dateParts[3]}Z`;
+      const hourDate = new Date(isoString);
 
-          // data.hour is expected in format "yyyy/mm/dd/hh:mm:ss"
-          const dateParts = data.hour.split('/');
-          if (dateParts.length < 4) {
-            console.log('Invalid date format in recording_urls:', data.hour);
-            continue;
-          }
-
-          const isoString = `${dateParts[0]}-${dateParts[1]}-${dateParts[2]}T${dateParts[3]}Z`;
-          const hourDate = new Date(isoString);
-
-          if (vodStartTime && vodEndTime && (vodStartTime !== "" || vodEndTime !== "")) {
-            if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
-              console.log('Using hls playback url:', data.url);
-              vodPlaylists.push(data.url);
-            }
-          } else {
-            console.log('Using hls playback url:', data.url);
-            vodPlaylists.push(data.url);
-          }
-        } catch (err) {
-          console.error(`Error reading ${key}:`, err);
+      // If vodStartTime and vodEndTime are provided, filter by date range.
+      if (vodStartTime && vodEndTime && (vodStartTime !== "" || vodEndTime !== "")) {
+        if (hourDate >= new Date(vodStartTime) && hourDate <= new Date(vodEndTime)) {
+          console.log('Using hls playback url:', data.url);
+          vodPlaylists.push(data.url);
         }
+      } else {
+        console.log('Using hls playback url:', data.url);
+        vodPlaylists.push(data.url);
       }
     }
 
@@ -633,64 +615,13 @@ async function spawnHlsToUdp(jobId, destinationUrl, vodStartTime, vodEndTime) {
   }
 }
 
-// GET status
 agentRouter.get('/status', async (req, res) => {
   try {
-    // Get all agent recordings
-    const recListParams = {
-      Bucket: db.bucket,
-      Prefix: 'agent_recordings/',
-      MaxKeys: 1000
-    };
+    // Get all agent recordings with pagination
+    const recRows = await db.getS3Data('agent_recordings/');
 
-    const recResponse = await db.s3Client.send(new ListObjectsV2Command(recListParams));
-    const recRows = [];
-
-    if (recResponse.Contents) {
-      for (const obj of recResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          recRows.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    // Get all agent playbacks
-    const pbListParams = {
-      Bucket: db.bucket,
-      Prefix: 'agent_playbacks/',
-      MaxKeys: 1000
-    };
-
-    const pbResponse = await db.s3Client.send(new ListObjectsV2Command(pbListParams));
-    const pbRows = [];
-
-    if (pbResponse.Contents) {
-      for (const obj of pbResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          pbRows.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
+    // Get all agent playbacks with pagination
+    const pbRows = await db.getS3Data('agent_playbacks/');
 
     res.json({
       agentId: AGENT_ID,
@@ -803,7 +734,7 @@ agentRouter.delete('/recordings/:jobId', async (req, res) => {
 
     try {
       const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
+      const dataStr = await db.streamToString(response.Body);
       const data = JSON.parse(dataStr);
 
       if (data.processPid) {
@@ -859,61 +790,39 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
   const pids = [];
   let errors = 0;
 
-  // Check if the jobId is already playing back
+  // Check if the jobId is already playing back using the helper function
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: `agent_playbacks/`,
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
+    const items = await db.getS3DataWithKey('agent_playbacks/');
+    for (const item of items) {
+      const data = item.data;
+      if (data.jobId === jobId && data.status === 'running') {
         try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
+          console.warn('Playback job marked already running: jobId=', jobId, 'pid=', data.processPid, ' checking if still running');
+          // Check if the process is still running (using signal 0)
+          process.kill(data.processPid, 0);
 
-          if (data.jobId === jobId && data.status === 'running') {
-            // Confirm the process is still running
-            try {
-              console.warn('Playback job marked already running: jobId=', jobId, 'pid=', data.processPid, ' checking if still running');
-              // Check if PID is still running
-              process.kill(data.processPid, 0);
-
-              // Kill the process
-              console.warn('Killing existing playback:', data.processPid);
-              try {
-                process.kill(data.processPid, 'SIGTERM');
-              } catch (killErr) {
-                console.log('Error killing existing playback:', killErr);
-              }
-
-              // Delete from S3
-              await db.s3Client.send(new DeleteObjectCommand({
-                Bucket: db.bucket,
-                Key: obj.Key
-              }));
-
-              console.warn('Deleted existing playback:', jobId);
-            } catch {
-              // Process not running, delete the record
-              console.log('Playback job already running but process not found: jobId=', jobId);
-              await db.s3Client.send(new DeleteObjectCommand({
-                Bucket: db.bucket,
-                Key: obj.Key
-              }));
-            }
+          // Process is still running, so kill it
+          console.warn('Killing existing playback:', data.processPid);
+          try {
+            process.kill(data.processPid, 'SIGTERM');
+          } catch (killErr) {
+            console.log('Error killing existing playback:', killErr);
           }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
+
+          // Delete the S3 object for the running playback
+          await db.s3Client.send(new DeleteObjectCommand({
+            Bucket: db.bucket,
+            Key: item.key
+          }));
+
+          console.warn('Deleted existing playback:', jobId);
+        } catch {
+          // Process not running, delete the record from S3
+          console.log('Playback job already running but process not found: jobId=', jobId);
+          await db.s3Client.send(new DeleteObjectCommand({
+            Bucket: db.bucket,
+            Key: item.key
+          }));
         }
       }
     }
@@ -1014,49 +923,34 @@ agentRouter.delete('/playbacks/:jobId', async (req, res) => {
   const { jobId } = req.params;
 
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'agent_playbacks/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
+    // Use the helper function to fetch all agent playbacks with pagination.
+    const items = await db.getS3DataWithKey('agent_playbacks/');
     let found = false;
 
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
+    for (const item of items) {
+      // Check if the jobId matches.
+      if (item.data.jobId === jobId) {
+        found = true;
 
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.jobId === jobId) {
-            found = true;
-
-            if (data.processPid) {
-              try {
-                process.kill(data.processPid, 'SIGTERM');
-              } catch { }
-            }
-
-            await db.s3Client.send(new DeleteObjectCommand({
-              Bucket: db.bucket,
-              Key: obj.Key
-            }));
-
-            // Clear any setTimeout
-            if (activeTimers.playbacks.has(data.id)) {
-              clearTimeout(activeTimers.playbacks.get(data.id));
-              activeTimers.playbacks.delete(data.id);
-            }
+        // If a processPid exists, attempt to terminate the process.
+        if (item.data.processPid) {
+          try {
+            process.kill(item.data.processPid, 'SIGTERM');
+          } catch (err) {
+            console.error(`Error killing process ${item.data.processPid}:`, err);
           }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
+        }
+
+        // Delete the S3 object.
+        await db.s3Client.send(new DeleteObjectCommand({
+          Bucket: db.bucket,
+          Key: item.key
+        }));
+
+        // Clear any active timers associated with this playback.
+        if (activeTimers.playbacks.has(item.data.id)) {
+          clearTimeout(activeTimers.playbacks.get(item.data.id));
+          activeTimers.playbacks.delete(item.data.id);
         }
       }
     }

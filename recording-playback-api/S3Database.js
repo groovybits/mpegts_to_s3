@@ -10,6 +10,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   ListObjectsV2Command,
+  paginateListObjectsV2
 } from '@aws-sdk/client-s3';
 
 const s3endPoint = config.s3endPoint;
@@ -77,6 +78,137 @@ export default class S3Database {
     }
   }
 
+  // Helper to convert a stream to a string
+  async streamToString(stream) {
+    const chunks = [];
+    return new Promise((resolve, reject) => {
+      stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      stream.on('error', (err) => reject(err));
+      stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    });
+  }
+
+  async getS3DataWithKey(prefix) {
+    const listParams = {
+      Bucket: this.bucket,
+      Prefix: prefix,
+      MaxKeys: 1000
+    };
+
+    const paginator = paginateListObjectsV2({ client: this.s3Client }, listParams);
+    const rows = [];
+
+    for await (const page of paginator) {
+      if (page.Contents) {
+        for (const obj of page.Contents) {
+          const getParams = {
+            Bucket: this.bucket,
+            Key: obj.Key
+          };
+          try {
+            const itemResponse = await this.s3Client.send(new GetObjectCommand(getParams));
+            const dataStr = await this.streamToString(itemResponse.Body);
+            const data = JSON.parse(dataStr);
+            rows.push({ key: obj.Key, data });
+          } catch (err) {
+            console.error(`Error reading ${obj.Key}:`, err);
+          }
+        }
+      }
+    }
+    return rows;
+  }
+
+  /**
+   * Looks up pool credentials by profile name/ID
+   * @param {string} profileId - The pool ID or profile name to look up
+   * @returns {Promise<{bucketName: string, accessKey: string, secretKey: string}|null>}
+   */
+  async getPoolCredentials(profileId) {
+    if (!profileId || profileId === 'default') {
+      // Return default credentials
+      return {
+        bucketName: this.bucket,
+        accessKey: this.s3Client.config.credentials.accessKeyId || s3AccessKeyDB,
+        secretKey: this.s3Client.config.credentials.secretAccessKey || s3SecretKeyDB
+      };
+    }
+
+    try {
+      // Lookup the pool in S3
+      const getParams = {
+        Bucket: this.bucket,
+        Key: `pools/${profileId}.json`
+      };
+
+      console.log('getPoolCredentials: Looking up pool:', profileId);
+
+      try {
+        const response = await this.s3Client.send(new GetObjectCommand(getParams));
+        const dataStr = await this.streamToString(response.Body);
+        const poolData = JSON.parse(dataStr);
+
+        if (!poolData || !poolData.bucketName || !poolData.accessKey || !poolData.secretKey) {
+          if (poolData) {
+            console.error(`getPoolCredentials: Pool ${profileId} has missing credentials:`, poolData);
+          } else {
+            if (!poolData.bucketName) console.error(`getPoolCredentials: Pool ${profileId} missing bucketName`);
+            if (!poolData.accessKey) console.error(`getPoolCredentials: Pool ${profileId} missing accessKey`);
+            if (!poolData.secretKey) console.error(`getPoolCredentials: Pool ${profileId} missing secretKey`);
+          }
+          return null;
+        }
+
+        return {
+          bucketName: poolData.bucketName || s3BucketDB,
+          accessKey: poolData.accessKey || s3AccessKeyDB,
+          secretKey: poolData.secretKey || s3SecretKeyDB
+        };
+      } catch (err) {
+        if (err.name === 'NoSuchKey') {
+          console.error(`getPoolCredentials: Error with Pool ${profileId} not found with error:`, err.name, err.message);
+          return null;
+        }
+        throw err;
+      }
+    } catch (err) {
+      console.error(`getPoolCredentials: Error getting pool credentials for ${profileId}:`, err);
+      return null;
+    }
+  }
+
+  // Function to retrieve and process S3 objects given bucket and prefix.
+  async getS3Data(prefix) {
+    const listParams = {
+      Bucket: this.bucket,
+      Prefix: prefix,
+      MaxKeys: 1000
+    };
+
+    const paginator = paginateListObjectsV2({ client: this.s3Client }, listParams);
+    const rows = [];
+
+    for await (const page of paginator) {
+      if (page.Contents) {
+        for (const obj of page.Contents) {
+          const getParams = {
+            Bucket: this.bucket,
+            Key: obj.Key
+          };
+          try {
+            const itemResponse = await this.s3Client.send(new GetObjectCommand(getParams));
+            const dataStr = await this.streamToString(itemResponse.Body);
+            const data = JSON.parse(dataStr);
+            rows.push(data);
+          } catch (err) {
+            console.error(`Error reading ${obj.Key}:`, err);
+          }
+        }
+      }
+    }
+    return rows;
+  }
+
   /**
    * Get a single record by ID
    * @param {string} sql - SQL-like SELECT statement (parsed for table name and WHERE clause)
@@ -111,7 +243,7 @@ export default class S3Database {
 
       try {
         const response = await this.s3Client.send(new GetObjectCommand(getParams));
-        const dataStr = await streamToString(response.Body);
+        const dataStr = await this.streamToString(response.Body);
         const data = JSON.parse(dataStr);
 
         if (callback) callback(null, data);
@@ -184,7 +316,7 @@ export default class S3Database {
 
           try {
             const itemResponse = await this.s3Client.send(new GetObjectCommand(getParams));
-            const dataStr = await streamToString(itemResponse.Body);
+            const dataStr = await this.streamToString(itemResponse.Body);
             const data = JSON.parse(dataStr);
 
             // Apply WHERE filter if needed
@@ -210,74 +342,3 @@ export default class S3Database {
     }
   }
 }
-
-// Helper to convert a stream to a string
-async function streamToString(stream) {
-  const chunks = [];
-  return new Promise((resolve, reject) => {
-    stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-    stream.on('error', (err) => reject(err));
-    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-  });
-}
-
-/**
- * Looks up pool credentials by profile name/ID
- * @param {string} profileId - The pool ID or profile name to look up
- * @returns {Promise<{bucketName: string, accessKey: string, secretKey: string}|null>}
- */
-async function getPoolCredentials(profileId) {
-  if (!profileId || profileId === 'default') {
-    // Return default credentials
-    return {
-      bucketName: s3BucketDB,
-      accessKey: s3AccessKeyDB,
-      secretKey: s3SecretKeyDB
-    };
-  }
-
-  try {
-    // Lookup the pool in S3
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `pools/${profileId}.json`
-    };
-
-    console.log('getPoolCredentials: Looking up pool:', profileId);
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await streamToString(response.Body);
-      const poolData = JSON.parse(dataStr);
-
-      if (!poolData || !poolData.bucketName || !poolData.accessKey || !poolData.secretKey) {
-        if (poolData) {
-          console.error(`getPoolCredentials: Pool ${profileId} has missing credentials:`, poolData);
-        } else {
-          if (!poolData.bucketName) console.error(`getPoolCredentials: Pool ${profileId} missing bucketName`);
-          if (!poolData.accessKey) console.error(`getPoolCredentials: Pool ${profileId} missing accessKey`);
-          if (!poolData.secretKey) console.error(`getPoolCredentials: Pool ${profileId} missing secretKey`);
-        }
-        return null;
-      }
-
-      return {
-        bucketName: poolData.bucketName || s3BucketDB,
-        accessKey: poolData.accessKey || s3AccessKeyDB,
-        secretKey: poolData.secretKey || s3SecretKeyDB
-      };
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        console.error(`getPoolCredentials: Error with Pool ${profileId} not found with error:`, err.name, err.message);
-        return null;
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error(`getPoolCredentials: Error getting pool credentials for ${profileId}:`, err);
-    return null;
-  }
-}
-
-// Export the default class along with named exports
-export { streamToString, getPoolCredentials };
