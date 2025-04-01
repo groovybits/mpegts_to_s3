@@ -9,8 +9,7 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { spawn } from 'child_process';
 import {
-  PutObjectCommand,
-  GetObjectCommand
+  PutObjectCommand
 } from '@aws-sdk/client-s3';
 import fs from 'fs';
 import http from 'http';
@@ -716,15 +715,11 @@ agentRouter.delete('/recordings/:jobId', async (req, res) => {
   const { jobId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `agent_recordings/${jobId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await db.streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`agent_recordings/${jobId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Not found' });
+      }
 
       if (data.processPid) {
         try {
