@@ -166,33 +166,8 @@ managerRouter.post('/recordings', async (req, res) => {
 
 managerRouter.get('/recordings', async (req, res) => {
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'recordings/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await db.streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
+    // Use the S3Database class method for pagination
+    const items = await db.getS3Data('recordings/');
     res.json(items);
   } catch (err) {
     console.error('Error getting recordings:', err);
@@ -299,33 +274,7 @@ managerRouter.post('/pools', async (req, res) => {
 
 managerRouter.get('/pools', async (req, res) => {
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'pools/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await db.streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
+    const items = await db.getS3Data('pools/');
     res.json(items);
   } catch (err) {
     console.error('Error getting pools:', err);
@@ -338,38 +287,9 @@ managerRouter.get('/pools/:poolId/assets', async (req, res) => {
   const { poolId } = req.params;
 
   try {
-    // List all objects for this table
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'assets/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await db.streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.destinationProfile === poolId) {
-            items.push(data);
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
-    res.json(items);
+    const items = await db.getS3Data('assets/');
+    const filtered = items.filter(item => item.destinationProfile === poolId);
+    res.json(filtered);
   } catch (err) {
     console.error('Error getting assets:', err);
     res.status(500).json({ error: err.message });
@@ -508,33 +428,7 @@ managerRouter.post('/playbacks', async (req, res) => {
 
 managerRouter.get('/playbacks', async (req, res) => {
   try {
-    const listParams = {
-      Bucket: db.bucket,
-      Prefix: 'playbacks/',
-      MaxKeys: 1000
-    };
-
-    const response = await db.s3Client.send(new ListObjectsV2Command(listParams));
-    const items = [];
-
-    if (response.Contents) {
-      for (const obj of response.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await db.streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-          items.push(data);
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
-
+    const items = await db.getS3Data('playbacks/');
     res.json(items);
   } catch (err) {
     console.error('Error getting playbacks:', err);
@@ -615,76 +509,22 @@ managerRouter.delete('/playbacks/:playbackId', async (req, res) => {
 managerRouter.get('/admin/stats', async (req, res) => {
   try {
     // Count active recordings
-    const recListParams = {
-      Bucket: db.bucket,
-      Prefix: 'recordings/',
-      MaxKeys: 1000
-    };
-
-    const recResponse = await db.s3Client.send(new ListObjectsV2Command(recListParams));
+    const recItems = await db.getS3Data('recordings/');
     let concurrentRecordings = 0;
-
-    if (recResponse.Contents) {
-      for (const obj of recResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await db.streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.status === 'active') {
-            concurrentRecordings++;
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
+    recItems.forEach(item => {
+      if (item.status === 'active') concurrentRecordings++;
+    });
 
     // Count active playbacks
-    const pbListParams = {
-      Bucket: db.bucket,
-      Prefix: 'playbacks/',
-      MaxKeys: 1000
-    };
-
-    const pbResponse = await db.s3Client.send(new ListObjectsV2Command(pbListParams));
+    const pbItems = await db.getS3Data('playbacks/');
     let concurrentPlaybacks = 0;
-
-    if (pbResponse.Contents) {
-      for (const obj of pbResponse.Contents) {
-        const getParams = {
-          Bucket: db.bucket,
-          Key: obj.Key
-        };
-
-        try {
-          const itemResponse = await db.s3Client.send(new GetObjectCommand(getParams));
-          const dataStr = await db.streamToString(itemResponse.Body);
-          const data = JSON.parse(dataStr);
-
-          if (data.status === 'active') {
-            concurrentPlaybacks++;
-          }
-        } catch (err) {
-          console.error(`Error reading ${obj.Key}:`, err);
-        }
-      }
-    }
+    pbItems.forEach(item => {
+      if (item.status === 'active') concurrentPlaybacks++;
+    });
 
     // Count total assets
-    const asListParams = {
-      Bucket: db.bucket,
-      Prefix: 'assets/',
-      MaxKeys: 1000
-    };
-
-    const asResponse = await db.s3Client.send(new ListObjectsV2Command(asListParams));
-    const totalAssets = asResponse.Contents ? asResponse.Contents.length : 0;
+    const asItems = await db.getS3Data('assets/');
+    const totalAssets = asItems.length;
 
     const systemLoad = 0.2;
     const clusterUsage = { agentCount: 1 };
