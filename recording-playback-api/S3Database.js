@@ -9,7 +9,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
-  ListObjectsV2Command,
+  DeleteObjectCommand,
   paginateListObjectsV2
 } from '@aws-sdk/client-s3';
 
@@ -209,136 +209,60 @@ export default class S3Database {
     return rows;
   }
 
-  /**
-   * Get a single record by ID
-   * @param {string} sql - SQL-like SELECT statement (parsed for table name and WHERE clause)
-   * @param {array} params - Parameters (usually just the ID)
-   * @param {function} callback - Callback function(err, row)
-   */
-  async get(sql, params, callback) {
+  // Function to get data from S3 using a specific key
+  async get(key) {
     try {
-      // Extract table name from SELECT statement
-      const tableMatch = sql.match(/FROM\s+(\w+)/i);
-      if (!tableMatch || !tableMatch[1]) {
-        throw new Error('Could not parse table name from SQL');
-      }
-
-      const tableName = tableMatch[1];
-      await this.ensureTable(tableName);
-
-      // Extract ID field and value from WHERE clause
-      const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
-      if (!whereMatch || !whereMatch[1]) {
-        throw new Error('Could not parse ID field from WHERE clause');
-      }
-
-      const idField = whereMatch[1];
-      const id = params[0];
-
-      // Get the item from S3
       const getParams = {
-        Bucket: this.bucket,
-        Key: `${tableName}/${id}.json`
+        Bucket: db.bucket,
+        Key: key
       };
 
       try {
-        const response = await this.s3Client.send(new GetObjectCommand(getParams));
-        const dataStr = await this.streamToString(response.Body);
+        const response = await db.s3Client.send(new GetObjectCommand(getParams));
+        const dataStr = await db.streamToString(response.Body);
         const data = JSON.parse(dataStr);
-
-        if (callback) callback(null, data);
         return data;
       } catch (err) {
         if (err.name === 'NoSuchKey') {
-          // Item not found
-          if (callback) callback(null, null);
+          console.error(`Error with recording ${recordingId} not found with error:`, err.name, err.message);
           return null;
         }
         throw err;
       }
     } catch (err) {
-      console.error('Error in get operation:', err);
-      if (callback) callback(err, null);
+      console.error(`Error getting recording ${recordingId}:`, err);
       return null;
     }
   }
 
-  /**
-   * Get multiple records, optionally filtered
-   * @param {string} sql - SQL-like SELECT statement
-   * @param {array} params - Parameters for filtering
-   * @param {function} callback - Callback function(err, rows)
-   */
-  async all(sql, params = [], callback) {
+  // Function to put data into S3
+  async put(key, data) {
     try {
-      // Extract table name from SELECT statement
-      const tableMatch = sql.match(/FROM\s+(\w+)/i);
-      if (!tableMatch || !tableMatch[1]) {
-        throw new Error('Could not parse table name from SQL');
-      }
-
-      const tableName = tableMatch[1];
-      await this.ensureTable(tableName);
-
-      // List all objects for this table
-      const listParams = {
+      const putParams = {
         Bucket: this.bucket,
-        Prefix: `${tableName}/`,
-        MaxKeys: 1000 // Adjust as needed
+        Key: key,
+        Body: JSON.stringify(data)
       };
 
-      const response = await this.s3Client.send(new ListObjectsV2Command(listParams));
-      const items = [];
-
-      if (response.Contents) {
-        // Extract WHERE clause if present
-        let whereClause = null;
-        let whereField = null;
-        let whereValue = null;
-
-        if (sql.includes('WHERE') && params.length > 0) {
-          const whereMatch = sql.match(/WHERE\s+(\w+)\s*=\s*\?/i);
-          if (whereMatch && whereMatch[1]) {
-            whereField = whereMatch[1];
-            whereValue = params[0];
-          }
-        }
-
-        // Fetch and filter items
-        for (const obj of response.Contents) {
-          const key = obj.Key;
-          if (key.endsWith('_metadata.json')) continue;
-
-          const getParams = {
-            Bucket: this.bucket,
-            Key: key
-          };
-
-          try {
-            const itemResponse = await this.s3Client.send(new GetObjectCommand(getParams));
-            const dataStr = await this.streamToString(itemResponse.Body);
-            const data = JSON.parse(dataStr);
-
-            // Apply WHERE filter if needed
-            if (whereField && whereValue !== null) {
-              if (data[whereField] === whereValue) {
-                items.push(data);
-              }
-            } else {
-              items.push(data);
-            }
-          } catch (err) {
-            console.error(`Error reading ${key}:`, err);
-          }
-        }
-      }
-
-      if (callback) callback(null, items);
-      return items;
+      await this.s3Client.send(new PutObjectCommand(putParams));
     } catch (err) {
-      console.error('Error in all operation:', err);
-      if (callback) callback(err, []);
-      return [];
+      console.error(`Error putting data into S3 for key ${key}:`, err);
+      throw err;
+    }
+  }
+
+  // Function to delete data from S3
+  async delete(key) {
+    try {
+      const deleteParams = {
+        Bucket: this.bucket,
+        Key: key
+      };
+
+      await this.s3Client.send(new DeleteObjectCommand(deleteParams));
+    } catch (err) {
+      console.error(`Error deleting data from S3 for key ${key}:`, err);
+      throw err;
     }
   }
 }

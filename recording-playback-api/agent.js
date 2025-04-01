@@ -10,8 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { spawn } from 'child_process';
 import {
   PutObjectCommand,
-  GetObjectCommand,
-  DeleteObjectCommand
+  GetObjectCommand
 } from '@aws-sdk/client-s3';
 import fs from 'fs';
 import http from 'http';
@@ -111,11 +110,7 @@ async function storeRecordingUrls(jobId) {
       const key = `recording_urls/${jobId}_${hourString.replace(/\//g, '_')}.json`;
 
       try {
-        await db.s3Client.send(new PutObjectCommand({
-          Bucket: db.bucket,
-          Key: key,
-          Body: JSON.stringify(recordingUrlData)
-        }));
+        await db.put(key, recordingUrlData);
 
         console.log('Inserted recording url', url.trim(), 'into S3 for job:', jobId, 'hour:', hourString);
       } catch (err) {
@@ -683,10 +678,7 @@ agentRouter.post('/jobs/recordings', async (req, res) => {
 
         // Delete from S3
         try {
-          await db.s3Client.send(new DeleteObjectCommand({
-            Bucket: db.bucket,
-            Key: `agent_recordings/${jobId}.json`
-          }));
+          await db.delete(`agent_recordings/${jobId}.json`);
         } catch (err) {
           console.error(`Error deleting recording from S3:`, err);
         }
@@ -703,10 +695,7 @@ agentRouter.post('/jobs/recordings', async (req, res) => {
       try {
         await storeRecordingUrls(jobId);
         // Delete from S3
-        await db.s3Client.send(new DeleteObjectCommand({
-          Bucket: db.bucket,
-          Key: `agent_recordings/${jobId}.json`
-        }));
+        await db.delete(`agent_recordings/${jobId}.json`);
       } catch (err) {
         console.error(`Error deleting recording from S3:`, err);
       }
@@ -743,10 +732,7 @@ agentRouter.delete('/recordings/:jobId', async (req, res) => {
         } catch { }
       }
 
-      await db.s3Client.send(new DeleteObjectCommand({
-        Bucket: db.bucket,
-        Key: `agent_recordings/${jobId}.json`
-      }));
+      await db.delete(`agent_recordings/${jobId}.json`);
 
       // Clear any setTimeout
       if (activeTimers.recordings.has(jobId)) {
@@ -809,20 +795,13 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
             console.log('Error killing existing playback:', killErr);
           }
 
-          // Delete the S3 object for the running playback
-          await db.s3Client.send(new DeleteObjectCommand({
-            Bucket: db.bucket,
-            Key: item.key
-          }));
+          await db.delete(`${item.key}`);
 
           console.warn('Deleted existing playback:', jobId);
         } catch {
           // Process not running, delete the record from S3
           console.log('Playback job already running but process not found: jobId=', jobId);
-          await db.s3Client.send(new DeleteObjectCommand({
-            Bucket: db.bucket,
-            Key: item.key
-          }));
+          await db.delete(`${item.key}`);
         }
       }
     }
@@ -849,11 +828,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
     };
 
     try {
-      await db.s3Client.send(new PutObjectCommand({
-        Bucket: db.bucket,
-        Key: `agent_playbacks/${playbackInstanceId}.json`,
-        Body: JSON.stringify(playbackData)
-      }));
+      await db.put(`agent_playbacks/${playbackInstanceId}.json`, playbackData);
 
       completedInserts++;
 
@@ -867,10 +842,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
           } catch { }
 
           try {
-            await db.s3Client.send(new DeleteObjectCommand({
-              Bucket: db.bucket,
-              Key: `agent_playbacks/${playbackInstanceId}.json`
-            }));
+            await db.delete(`agent_playbacks/${playbackInstanceId}.json`);
           } catch (err) {
             console.error('Error deleting playback from S3:', err);
           }
@@ -889,10 +861,7 @@ agentRouter.post('/jobs/playbacks', async (req, res) => {
         } catch { }
 
         try {
-          await db.s3Client.send(new DeleteObjectCommand({
-            Bucket: db.bucket,
-            Key: `agent_playbacks/${playbackInstanceId}.json`
-          }));
+          await db.delete(`agent_playbacks/${playbackInstanceId}.json`);
         } catch (err) {
           console.error('Error deleting playback from S3:', err);
         }
@@ -941,11 +910,7 @@ agentRouter.delete('/playbacks/:jobId', async (req, res) => {
           }
         }
 
-        // Delete the S3 object.
-        await db.s3Client.send(new DeleteObjectCommand({
-          Bucket: db.bucket,
-          Key: item.key
-        }));
+        await db.delete(`${item.key}`);
 
         // Clear any active timers associated with this playback.
         if (activeTimers.playbacks.has(item.data.id)) {

@@ -7,11 +7,6 @@ import config from './config.js';
 
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import {
-  PutObjectCommand,
-  GetObjectCommand,
-  DeleteObjectCommand
-} from '@aws-sdk/client-s3';
 import fs from 'fs';
 import swaggerUi from 'swagger-ui-express';
 import yaml from 'js-yaml';
@@ -105,12 +100,7 @@ managerRouter.post('/recordings', async (req, res) => {
       processPid: null
     };
 
-    // Store in S3
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`,
-      Body: JSON.stringify(recordingData)
-    }));
+    await db.put(`recordings/${recordingId}.json`, recordingData);
 
     let fetchUrl = agentUrl + "/v1/agent/jobs/recordings";
     console.log('About to call Agent with fetch, recordingId=', recordingId, ' Url=', sourceUrl, ' Duration=', duration, ' DestinationProfile=', destinationProfile, ' FetchUrl=', fetchUrl);
@@ -139,11 +129,7 @@ managerRouter.post('/recordings', async (req, res) => {
           metadata: JSON.stringify(recordingData || {})
         };
 
-        await db.s3Client.send(new PutObjectCommand({
-          Bucket: db.bucket,
-          Key: `assets/${assetId}.json`,
-          Body: JSON.stringify(assetData)
-        }));
+        await db.put(`assets/${assetId}.json`, assetData);
       } catch (err) {
         console.error('Error creating asset:', err);
         res.status(500).json({ error: err.message });
@@ -178,15 +164,11 @@ managerRouter.get('/recordings/:recordingId', async (req, res) => {
   const { recordingId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await db.streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`recordings/${recordingId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Recording not found' });
+      }
       res.json(data);
     } catch (err) {
       if (err.name === 'NoSuchKey') {
@@ -204,42 +186,29 @@ managerRouter.delete('/recordings/:recordingId', async (req, res) => {
   const { recordingId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `recordings/${recordingId}.json`
-    };
-
-    try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await db.streamToString(response.Body);
-      const data = JSON.parse(dataStr);
-
-      // Update status to canceled
-      data.status = 'canceled';
-
-      await db.s3Client.send(new PutObjectCommand({
-        Bucket: db.bucket,
-        Key: `recordings/${recordingId}.json`,
-        Body: JSON.stringify(data)
-      }));
-
-      // Kill process if any
-      if (data.processPid) {
-        try {
-          process.kill(data.processPid, 'SIGTERM');
-        } catch { }
-      }
-
-      return res.sendStatus(204);
-    } catch (err) {
-      if (err.name === 'NoSuchKey') {
-        return res.status(404).json({ message: 'Not found' });
-      }
-      throw err;
+    const data = await db.get(`recordings/${recordingId}.json`);
+    if (!data) {
+      return res.status(404).json({ message: 'Recording not found' });
     }
+
+    // Update status to canceled
+    data.status = 'canceled';
+
+    await db.put(`recordings/${recordingId}.json`, data);
+
+    // Kill process if any
+    if (data.processPid) {
+      try {
+        process.kill(data.processPid, 'SIGTERM');
+      } catch { }
+    }
+
+    return res.sendStatus(204);
   } catch (err) {
-    console.error('Error deleting recording:', err);
-    res.status(500).json({ error: err.message });
+    if (err.name === 'NoSuchKey') {
+      return res.status(404).json({ message: 'Not found' });
+    }
+    throw err;
   }
 });
 
@@ -258,11 +227,7 @@ managerRouter.post('/pools', async (req, res) => {
       secretKey: credentials.secretKey
     };
 
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `pools/${poolId}.json`,
-      Body: JSON.stringify(poolData)
-    }));
+    await db.put(`pools/${poolId}.json`, poolData);
 
     res.status(201).json({ poolId, bucketName });
   } catch (err) {
@@ -300,24 +265,17 @@ managerRouter.delete('/pools/:poolId/assets', async (req, res) => {
   const { assetId } = req.query;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `assets/${assetId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await db.streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`assets/${assetId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Asset not found' });
+      }
 
       if (data.destinationProfile !== poolId) {
         return res.status(404).json({ message: 'Asset not found in this pool' });
       }
 
-      await db.s3Client.send(new DeleteObjectCommand({
-        Bucket: db.bucket,
-        Key: `assets/${assetId}.json`
-      }));
+      await db.put(`assets/${assetId}.json`, data);
 
       res.sendStatus(204);
     } catch (err) {
@@ -336,15 +294,8 @@ managerRouter.get('/assets/:assetId', async (req, res) => {
   const { assetId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `assets/${assetId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await db.streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`assets/${assetId}.json`);
 
       const result = {
         assetId: data.id,
@@ -385,15 +336,10 @@ managerRouter.post('/playbacks', async (req, res) => {
       processPid: null
     };
 
-    await db.s3Client.send(new PutObjectCommand({
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`,
-      Body: JSON.stringify(playbackData)
-    }));
+    await db.put(`playbacks/${playbackId}.json`, playbackData);
 
     // Call the agent to start the playback
     let fetchUrl = agentUrl + "/v1/agent/jobs/playbacks";
-    console.log('About to call Agent with fetch, playbackId=', playbackId, 'RecordingId=', recordingId, ' SourceProfile=', sourceProfile, ' DestinationUrl=', destinationUrl, ' Duration=', duration, ' FetchUrl=', fetchUrl);
 
     try {
       const agentResp = await fetch(fetchUrl, {
@@ -439,15 +385,11 @@ managerRouter.get('/playbacks/:playbackId', async (req, res) => {
   const { playbackId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await db.streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`playbacks/${playbackId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Playback not found' });
+      }
       res.json(data);
     } catch (err) {
       if (err.name === 'NoSuchKey') {
@@ -465,24 +407,16 @@ managerRouter.delete('/playbacks/:playbackId', async (req, res) => {
   const { playbackId } = req.params;
 
   try {
-    const getParams = {
-      Bucket: db.bucket,
-      Key: `playbacks/${playbackId}.json`
-    };
-
     try {
-      const response = await db.s3Client.send(new GetObjectCommand(getParams));
-      const dataStr = await db.streamToString(response.Body);
-      const data = JSON.parse(dataStr);
+      const data = await db.get(`playbacks/${playbackId}.json`);
+      if (!data) {
+        return res.status(404).json({ message: 'Playback not found' });
+      }
 
       // Update status to canceled
       data.status = 'canceled';
 
-      await db.s3Client.send(new PutObjectCommand({
-        Bucket: db.bucket,
-        Key: `playbacks/${playbackId}.json`,
-        Body: JSON.stringify(data)
-      }));
+      await db.put(`playbacks/${playbackId}.json`, data);
 
       // Kill process if any
       if (data.processPid) {
